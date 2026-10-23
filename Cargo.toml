@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oag-mesh",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+# Foundational types/signing from the base project (github.com/webdawg/open-agent-graph) --
+# reused via git dependency rather than vendored, so this repo never drifts from that one's
+# canonical JSON / domain-separated-signing conventions. Pinned to `main`; move to a tagged rev
+# once open-agent-graph starts cutting releases.
+oag-core = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+oag-crypto = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+hex = "0.4"

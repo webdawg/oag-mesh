@@ -1,0 +1,11 @@
+//! `oag-mesh`: the cluster-bridging / federated-trust layer that sits one level above a single
+//! Open Agent Graph peer or peer cluster (see `github.com/webdawg/open-agent-graph`,
+//! `spec/26-peer-clustering.md` there for what a single cluster already is).
+//!
+//! Deliberately a separate repository, separate spec numbering, separate crate -- see this
+//! repo's `README.md` for why. Reuses `oag-core`/`oag-crypto` from the base project (via git
+//! dependency) for identifiers and signing conventions, so a signature produced here verifies
+//! the same way a base-project peer's does, but implements its own protocol rather than
+//! modifying the base project's `oag-sync` in place.
+//!
+//! Nothing is implemented yet -- this is the repository scaffold. See `spec/01-overview.md`.

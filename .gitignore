@@ -1,0 +1,8 @@
+/target/
+**/target/
+/traces/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+identity.key
+.env
