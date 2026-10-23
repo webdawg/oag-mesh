@@ -35,4 +35,7 @@ infrastructure was declined before this repository existed.
 
 ## Status
 
-Scaffold only. Nothing implemented yet. See `spec/01-overview.md`.
+Cluster nesting (`spec/02-cluster-nesting.md`) and the anonymous-event RFC schema
+(`spec/03-anonymous-event-rfc.md`) are implemented. Federated corroboration across clusters
+(mechanism 2 in `spec/01-overview.md`), transport for either mechanism, and anti-spam/sybil
+resistance for anonymous events are not. See `spec/01-overview.md`.
