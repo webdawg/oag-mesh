@@ -1,22 +1,23 @@
 # Overview
 
-**Status: design only, nothing implemented yet.**
+**Status: cluster nesting implemented (`spec/02-cluster-nesting.md`); federated corroboration
+across clusters not yet built.**
 
 ## What this layer is
 
 Two related mechanisms, one level above a single `oag` peer or peer cluster:
 
-1. **Bridge nodes between clusters.** The base project's peer clustering
-   (`spec/26-peer-clustering.md` there) is deliberately one-cluster-per-peer in its first version
-   — a peer declares membership in exactly one cluster, gets a full federation-trust bypass with
-   that cluster's other members, and nothing else. This layer's first piece lifts that constraint:
-   a peer may belong to more than one cluster at once, making it a *bridge* — "a group of these
-   each connected by at least, and at minimum, one node," in the words that started this design.
-   Two clusters stay distinct groups; they are connected *through* whichever peer(s) are members
-   of both, not silently merged into one combined trust domain. Membership bridging is a
-   networking/federation-policy fact, the same as clustering itself already is — it does not by
-   itself make every member of cluster A trust every member of cluster B; that still depends on
-   each receiving peer's own `FederationPolicy`/trust configuration, exactly as it does today.
+1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
+   project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
+   cluster name, by design, in its first version. Rather than lifting that constraint inside the
+   base project's own `oag-sync` (changing working code to fit a new, separate layer's needs),
+   nesting is implemented entirely in *this* repository instead: a peer signs a
+   `BridgeDeclaration` placing a base-layer cluster name — or another mesh-group, recursively —
+   into a named mesh-group, under this crate's own domain-separated message format. The base
+   project is completely untouched; a `[cluster].name` keeps meaning exactly what it already
+   means there. Two base clusters nested under the same mesh-group stay distinct federation
+   domains; nesting is a fact tracked here, not a change to how the base project's own
+   `FederationPolicy`/trust configuration works for either cluster's members.
 2. **Federated corroboration.** Multiple independently-operated nodes (potentially across
    different clusters/organizations) receive or fetch the *same* claim, content, or gateway
    answer, each through its own path. Comparing what they each independently got — do the content
@@ -26,7 +27,15 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
    `future_flood_propagation_and_anonymity.md`/`future_service_announcements_and_audit.md` memory
    entries, and the mechanism `spec/32-verified-internet-gateway.md`'s own quorum fan-out already
    implements for one peer's gateway queries — this layer is the same idea generalized across
-   organizational/cluster boundaries instead of one peer's own configured query_peers.
+   organizational/cluster boundaries instead of one peer's own configured query_peers. Not yet
+   built.
+3. **Anonymous event reporting for life-saving actions, schema implemented — see
+   `spec/03-anonymous-event-rfc.md`.** A deliberately different, identity-*stripped* mechanism
+   from (1) and (2) above, which are both signed-identity-based: an `AnonymousEvent` ("SAW THIS
+   EVENT" — a sighting, a hazard, a medical emergency, a resource need) carries no persistent
+   signature, no precise location or time, and no free-text field that could smuggle an
+   identifying description of a person. Corroboration here means independent reports converging
+   on the same `corroboration_nonce`, not counting distinct signing peers.
 
 ## What this layer explicitly is not
 
@@ -47,13 +56,11 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
 
 ## Open design questions (not yet resolved)
 
-- Exact schema/wire-format change needed in the base project's `oag-sync` to support more than one
-  cluster membership per peer (today: `ClusterDeclaration.cluster: String`, `SyncService.
-  own_cluster: Option<String>`, and `peer_cluster_claims` storage are all single-valued) — this is
-  a change to that repository, not this one, and needs to land there first or alongside this
-  layer's own client code.
 - Whether corroboration findings (agreement/disagreement across paths) get written back into the
   base project's evidence/corroboration model, or live entirely in this layer's own storage.
 - What counts as "independent enough" paths for corroboration to mean anything (two nodes
   operated by the same organization corroborating each other proves less than two genuinely
-  separate ones).
+  separate ones) — applies to both mechanism (2) and the anonymous-event mechanism (3).
+- See `spec/02-cluster-nesting.md`'s and `spec/03-anonymous-event-rfc.md`'s own "open questions"
+  sections for mechanism-specific gaps (no transport yet for either; anonymous events have no
+  anti-spam/sybil-resistance design yet).

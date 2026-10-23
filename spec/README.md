@@ -10,6 +10,8 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | File | Feature |
 |---|---|
 | [01-overview.md](01-overview.md) | Scope, relationship to the base project, and what this layer is not |
+| [02-cluster-nesting.md](02-cluster-nesting.md) | Signed bridge declarations placing a base-layer cluster (or another mesh-group) into a mesh-group, recursively, with corroboration by distinct-peer count |
+| [03-anonymous-event-rfc.md](03-anonymous-event-rfc.md) | Identity-stripped event reports ("SAW THIS EVENT") for life-saving actions — strict schema, coarse location/time, corroboration without identity |
 
 ## Founding context
 
