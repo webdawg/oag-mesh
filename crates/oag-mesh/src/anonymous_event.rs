@@ -23,21 +23,43 @@ pub enum EventKind {
     /// of any person -- identifying a specific individual needs a different, identity-
     /// accountable mechanism, not this one.
     Sighting,
-    /// A hazard was observed (fire, flood, structural collapse, downed power line, ...).
+    /// A hazard was observed (fire, flood, structural collapse, downed power line, ...) --
+    /// about the environment, not about a specific person.
     HazardObserved,
+    /// Someone needs urgent medical attention at this location. Carries no information about
+    /// who they are or what's wrong beyond `Severity` -- the same "no identifying detail"
+    /// constraint as `Sighting`, for the same reason.
     MedicalEmergency,
     /// A need for a resource at a location (water, shelter, medical supplies) during a
-    /// disaster/emergency response.
+    /// disaster/emergency response -- not urgent in the immediate-danger sense `MedicalEmergency`
+    /// or a `Critical` `HazardObserved` is, but still something a responder should act on.
     ResourceNeed,
-    /// The situation this event's `corroboration_nonce` refers to has resolved or ended.
+    /// A *convention*, not an enforced effect: reporters use this to signal that the situation
+    /// identified by this event's `corroboration_nonce` has resolved or ended. Nothing in this
+    /// crate currently acts on it -- `AnonymousEventLog::record` stores it exactly like any other
+    /// event under the same nonce, it does not remove or mark prior reports resolved. A consumer
+    /// reading `reports_for(nonce)` is responsible for noticing an `AllClear` and treating it as
+    /// superseding what came before. See this RFC's "Open questions" (retention/expiry) --
+    /// deliberately not implemented yet, not an oversight.
     AllClear,
 }
 
+/// How urgently a report needs a response -- the base signal a consumer triages on, since there
+/// is no identifying detail in the rest of the payload to go on.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Severity {
+    /// Worth recording, nothing to act on right now (e.g. a hazard that's already contained).
     Low,
+    /// Should be looked at, not an immediate emergency (e.g. a `ResourceNeed` with no urgent
+    /// time pressure).
     Medium,
+    /// Needs a response soon -- a real but not immediately life-threatening situation.
     High,
+    /// Immediate danger to life. The only level that should ever accompany `MedicalEmergency` in
+    /// a well-formed report, though this schema does not enforce that pairing -- see "Open
+    /// questions" in this RFC for why (enforcing it would mean defining, in software, what
+    /// "immediately life-threatening" means across every reporting context, which this schema
+    /// deliberately leaves to the reporter's own judgment rather than guessing at).
     Critical,
 }
 

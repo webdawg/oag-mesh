@@ -24,13 +24,20 @@ has no signature field at all for exactly this reason.
 ```rust
 pub enum EventKind {
     Sighting,          // someone/something matching a life-safety concern -- no name/photo/description
-    HazardObserved,     // fire, flood, structural collapse, downed power line, ...
-    MedicalEmergency,
-    ResourceNeed,        // water, shelter, medical supplies needed at a location
-    AllClear,            // the event a corroboration_nonce refers to has resolved
+    HazardObserved,     // about the environment (fire, flood, collapse, ...), not a specific person
+    MedicalEmergency,   // someone needs urgent attention here -- no identifying detail beyond Severity
+    ResourceNeed,        // water, shelter, medical supplies needed at a location -- not immediate danger
+    AllClear,            // CONVENTION ONLY: signals a nonce's situation has resolved -- see below, nothing enforces this
 }
 
-pub enum Severity { Low, Medium, High, Critical }
+// The base triage signal, since the rest of the payload deliberately carries no identifying
+// detail to triage on instead.
+pub enum Severity {
+    Low,       // worth recording, nothing to act on right now
+    Medium,    // should be looked at, not an immediate emergency
+    High,      // needs a response soon -- real but not immediately life-threatening
+    Critical,  // immediate danger to life -- not enforced to require MedicalEmergency, see below
+}
 
 pub struct CoarseLocation(pub String);  // geohash-style, max 6 chars (MAX_PRECISION_CHARS)
 
@@ -55,6 +62,32 @@ one, precise, is itself identifying information: an exact GPS coordinate narrows
 specific building; an exact timestamp can be correlated against other metadata (e.g. network-level
 timing logs) to the same effect. `AnonymousEvent::validate()` enforces both bounds structurally —
 an over-precise report is rejected, not silently accepted.
+
+## What each event kind means, precisely
+
+- **`Sighting`**, **`HazardObserved`**, **`ResourceNeed`** describe exactly what their name says
+  and nothing more — there is no field anywhere that could add identifying detail about a person
+  (see the closed-enum rationale above).
+- **`MedicalEmergency`** means "someone needs urgent attention at this location." It carries no
+  information about who they are or what's wrong beyond `Severity` — the same "no identifying
+  detail" constraint as `Sighting`, for the same reason.
+- **`AllClear` is a convention, not an enforced effect.** A reporter uses it to signal that the
+  situation identified by a given `corroboration_nonce` has resolved. Nothing in
+  `AnonymousEventLog` currently acts on this: `record()` stores an `AllClear` exactly like any
+  other event under the same nonce — it does not remove or mark prior reports as resolved. A
+  consumer reading `reports_for(nonce)` is responsible for noticing an `AllClear` in the list and
+  treating it as superseding what came before. This is the same gap as this document's
+  "Retention/expiry" open question below, stated here precisely rather than left implicit.
+- **`Severity` is the base triage signal**, since the rest of the payload deliberately carries no
+  identifying detail to triage on instead: `Low` (worth recording, nothing to act on right now),
+  `Medium` (should be looked at, not an emergency), `High` (needs a response soon, real but not
+  immediately life-threatening), `Critical` (immediate danger to life).
+- **The pairing of `EventKind` and `Severity` is not enforced.** A `MedicalEmergency` reported as
+  `Low` severity, or a `HazardObserved` reported as `Critical`, are both accepted by
+  `AnonymousEvent::validate()` — the schema does not require, say, every `MedicalEmergency` to
+  carry `Critical` severity. Enforcing that would mean encoding, in software, what counts as
+  "immediately life-threatening" across every real-world reporting context this schema might be
+  used in — deliberately left to the reporter's own judgment rather than guessed at here.
 
 ## Corroboration without identity
 
