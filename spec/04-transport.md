@@ -45,27 +45,36 @@ doesn't stop the others reaching it). There is **no pull-based anti-entropy** �
 broadcast time simply never receives that message unless something else re-pushes it later. This
 is a real, accepted gap for a first version, not a hidden one.
 
+`POST /oag-mesh/v1/anonymous-event` carries an `AnonymousEventSubmission { event, pow }` --
+`anonymous_event::AnonymousEventLog::record` enforces the escalating proof-of-work check
+(`spec/03-anonymous-event-rfc.md`'s "Anti-spam and anti-replay") before recording anything, so a
+submission with no or insufficient proof-of-work is rejected here with `400` the same way a
+tampered `BridgeDeclaration` is.
+
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (5 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (6 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` is recorded and
 corroborated on the receiving side; a tampered declaration is rejected over the wire with `400`
 and never recorded; `broadcast_bridge_declaration` reaches every one of several independently
-running peers; a pushed `AnonymousEvent` is recorded; an invalid one (unrounded timestamp) is
-rejected over the wire and never recorded.
+running peers; a pushed `AnonymousEvent` (with valid proof-of-work) is recorded; an invalid one
+(unrounded timestamp) is rejected over the wire and never recorded; one with insufficient
+proof-of-work is rejected over the wire and never recorded.
 
 ## Open questions (genuinely unresolved)
 
 - **Network-level anonymity for `AnonymousEvent` submission.** Stated above, repeated here
   because it's the single most important gap in this file: nothing here hides a reporter's
-  source IP from the peer they submit to.
+  source IP from the peer they submit to. Proof-of-work (below) is an orthogonal mechanism and
+  does nothing about this.
 - **No pull-based sync/anti-entropy.** A declaration or event only reaches a peer that was online
   and reachable at broadcast time. The base project's `oag-sync` solves exactly this for its own
   event log (`hello`/`heads` + anti-entropy pull) — whether `oag-mesh` should eventually grow the
   same mechanism, or stay push-only given its different (lower-stakes-per-message, higher-volume)
   traffic pattern, is undecided.
-- **No authentication/rate-limiting on either endpoint.** Anyone who can reach a mesh node's
-  listen address can submit a `BridgeDeclaration` (it's still subject to signature verification,
-  but anyone can mint a fresh `PeerIdentity` for free) or an `AnonymousEvent` (no identity to even
-  check). Both are spammable; see `spec/03`'s own anti-spam/sybil open question for the event
-  side specifically.
+- **No authentication/rate-limiting on `BridgeDeclaration` submission.** Anyone who can reach a
+  mesh node's listen address can submit one — it's still subject to signature verification, but
+  anyone can mint a fresh `PeerIdentity` for free, so verification alone doesn't bound submission
+  volume. `AnonymousEvent` submission now costs real, escalating proof-of-work instead
+  (`spec/03`'s "Anti-spam and anti-replay") — a real mitigation, not a full solution; see that
+  section's own stated limits (doesn't stop a well-resourced attacker).

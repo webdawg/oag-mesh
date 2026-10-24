@@ -23,8 +23,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
-use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog};
+use serde::{Deserialize, Serialize};
+
+use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, MeshTree};
+
+/// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
+/// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
+/// (`anonymous_event.rs`'s own anti-spam/anti-replay mechanism) before it's recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonymousEventSubmission {
+    pub event: AnonymousEvent,
+    pub pow: ProofOfWork,
+}
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -99,7 +110,9 @@ fn bridge_error_response(e: BridgeError) -> Response {
     (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
 }
 
-/// Receives an `AnonymousEvent` and records it into `state.event_log`.
+/// Receives an `AnonymousEventSubmission` (the event plus its proof-of-work) and records it
+/// into `state.event_log` -- which itself enforces the escalating difficulty check, rejecting
+/// insufficient proof-of-work with a `400` naming the `required_bits` a retry would need.
 ///
 /// **Does not, and cannot, hide the submitting connection's source IP from this peer** -- that's
 /// an inherent property of a plain HTTP POST, not a choice this handler makes. The payload
@@ -109,10 +122,13 @@ fn bridge_error_response(e: BridgeError) -> Response {
 /// relaying, or similar) is explicitly not built -- see `spec/04-transport.md`'s open questions.
 /// Treat this endpoint as "gets the (already-anonymous) payload from A to B," not as "hides who
 /// submitted it."
-async fn receive_anonymous_event(State(state): State<MeshState>, Json(event): Json<AnonymousEvent>) -> Response {
+async fn receive_anonymous_event(
+    State(state): State<MeshState>,
+    Json(submission): Json<AnonymousEventSubmission>,
+) -> Response {
     let result = {
         let mut log = state.event_log.write().unwrap();
-        log.record(event)
+        log.record(submission.event, submission.pow)
     };
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -138,10 +154,16 @@ pub async fn push_bridge_declaration(http: &reqwest::Client, address: &str, decl
     Ok(())
 }
 
-pub async fn push_anonymous_event(http: &reqwest::Client, address: &str, event: &AnonymousEvent) -> Result<(), PushError> {
+pub async fn push_anonymous_event(
+    http: &reqwest::Client,
+    address: &str,
+    event: &AnonymousEvent,
+    pow: ProofOfWork,
+) -> Result<(), PushError> {
     let url = format!("{}/oag-mesh/v1/anonymous-event", address.trim_end_matches('/'));
+    let submission = AnonymousEventSubmission { event: event.clone(), pow };
     let response =
-        http.post(&url).json(event).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+        http.post(&url).json(&submission).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
     if !response.status().is_success() {
         return Err(PushError::Rejected(address.to_string(), response.status()));
     }
@@ -163,9 +185,17 @@ pub async fn broadcast_bridge_declaration(state: &MeshState, decl: &BridgeDeclar
 
 /// Same best-effort push, for an anonymous event -- same source-IP caveat as
 /// `receive_anonymous_event` applies at every hop this reaches.
+///
+/// Solves proof-of-work once, at `anonymous_event::BASE_DIFFICULTY_BITS` (the cost for a
+/// *fresh* nonce), and sends the identical `(event, pow)` pair to every configured peer. Each
+/// receiving peer's own log tracks this nonce independently, so if one of them already has
+/// existing reports for it (e.g. relayed from elsewhere) and therefore requires a higher,
+/// escalated difficulty, that specific peer will reject this submission -- logged as a warning,
+/// the same best-effort semantics as every other failure here, not retried with a harder proof.
 pub async fn broadcast_anonymous_event(state: &MeshState, event: &AnonymousEvent) {
+    let pow = ProofOfWork::solve(event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
     for peer in state.peers.iter() {
-        if let Err(e) = push_anonymous_event(&state.http, peer, event).await {
+        if let Err(e) = push_anonymous_event(&state.http, peer, event, pow).await {
             tracing::warn!(peer, error = %e, "failed to push anonymous event to peer");
         }
     }
@@ -257,7 +287,9 @@ mod tests {
     async fn a_pushed_anonymous_event_is_recorded() {
         let (addr_a, state_a) = spawn(vec![]).await;
         let http = reqwest::Client::new();
-        push_anonymous_event(&http, &addr_a, &valid_event("transport-test-nonce")).await.unwrap();
+        let event = valid_event("transport-test-nonce");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap();
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("transport-test-nonce"), 1);
     }
 
@@ -266,9 +298,20 @@ mod tests {
         let (addr_a, state_a) = spawn(vec![]).await;
         let mut event = valid_event("transport-test-nonce-2");
         event.observed_at += 1; // not rounded -- invalid
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
         let http = reqwest::Client::new();
-        let err = push_anonymous_event(&http, &addr_a, &event).await.unwrap_err();
+        let err = push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("transport-test-nonce-2"), 0);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_event_with_insufficient_proof_of_work_is_rejected_over_the_wire() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let event = valid_event("transport-test-nonce-pow");
+        let http = reqwest::Client::new();
+        let err = push_anonymous_event(&http, &addr_a, &event, ProofOfWork { nonce: 0 }).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
+        assert_eq!(state_a.event_log.read().unwrap().corroboration_for("transport-test-nonce-pow"), 0);
     }
 }

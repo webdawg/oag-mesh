@@ -64,6 +64,8 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
   separate ones) — applies to both mechanism (2) and the anonymous-event mechanism (3).
 - A real HTTP transport exists now for both mechanisms (`spec/04-transport.md`), push-only with
   no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent` submissions any
-  network-level anonymity on top of their already-anonymous payload. See `spec/02`'s, `spec/03`'s,
-  and `spec/04`'s own "open questions" sections for what's still unresolved there (anonymous
-  events still have no anti-spam/sybil-resistance design).
+  network-level anonymity on top of their already-anonymous payload. Anonymous events now also
+  require escalating proof-of-work (`spec/03`'s "Anti-spam and anti-replay") -- a real mitigation
+  against spam/self-replay-inflation, not a full solution (doesn't stop a well-resourced
+  attacker). See `spec/02`'s, `spec/03`'s, and `spec/04`'s own "open questions" sections for what
+  else is still unresolved.

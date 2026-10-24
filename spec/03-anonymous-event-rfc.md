@@ -1,9 +1,10 @@
 # RFC: Anonymous Event Sharing for Life-Saving Actions
 
-**Status: schema and local corroboration bookkeeping implemented (`crates/oag-mesh/src/
-anonymous_event.rs`). Transport, anti-spam/sybil resistance, and dispatch-to-a-responder are not
-designed yet — this RFC defines the one thing it can define precisely today: the wire format,
-and the hard constraints that keep it anonymous.**
+**Status: schema, local corroboration bookkeeping, a proof-of-work anti-spam/anti-replay check,
+and a real transport (`spec/04-transport.md`) are all implemented. Dispatch-to-a-responder is
+not designed. Proof-of-work raises the cost of spam/self-replay; it does not, and cannot, stop a
+well-resourced attacker — see "Anti-spam and anti-replay" below for exactly what it does and
+doesn't achieve.**
 
 ## Why this is a separate mechanism from `spec/02-cluster-nesting.md`
 
@@ -55,6 +56,8 @@ pub struct AnonymousEvent {
     pub location: CoarseLocation,
     pub corroboration_nonce: String, // computed identically by independent observers of the same real event
 }
+
+pub struct ProofOfWork { pub nonce: u64 }  // see "Anti-spam and anti-replay" below
 ```
 
 **The closed `EventKind` enum is the schema's main anonymity safeguard, not an afterthought.**
@@ -112,19 +115,53 @@ facts of the event) would make every report "unique" and defeat corroboration en
 a real failure mode a transport/client implementation must guard against, not something the
 schema itself can enforce.
 
+**A sharper version of the same problem, found and fixed, not just theorized**: before
+proof-of-work existed, `corroboration_for` was literally `Vec::len()` on whatever was pushed
+under a nonce, with *zero* deduplication of any kind. One actor submitting the identical event
+(or a trivially varied one — only `event_id` needs to differ, and that field is supposed to vary
+per report anyway) under one nonce, repeatedly, inflated its own corroboration count for free.
+That's not a theoretical spam concern, it's a direct break of the one signal this mechanism
+exists to provide. See "Anti-spam and anti-replay" below for the fix.
+
+## Anti-spam and anti-replay: escalating proof-of-work
+
+`AnonymousEventLog::record` now requires a `ProofOfWork { nonce: u64 }` alongside the event.
+`ProofOfWork::solve`/the log's internal check work the same way Hashcash does: a submission is
+only accepted if `blake3("OAG-MESH:ANONYMOUS_EVENT_POW:v1:" || event fields || pow.nonce)` has at
+least some number of leading zero bits — found by brute-force search, so producing a valid one
+costs real, unavoidable computation, without the submission needing to prove who's making it.
+
+**The difficulty escalates per additional report under the same nonce**
+(`difficulty_bits_for_report_number`: `BASE_DIFFICULTY_BITS` (16) for the first report under a
+fresh nonce, `+ DIFFICULTY_STEP_BITS` (4) for each one after that) — this is the direct fix for
+the self-replay-inflation problem above. A handful of genuinely independent witnesses reporting
+the same real event over time each pay only a modest, roughly-fixed cost (whatever the current
+count happens to require when they submit). One actor trying to inflate a *single* event's own
+corroboration count alone faces cost that grows exponentially with each additional fake report —
+4 extra bits of required difficulty means roughly 16× more expected work per step.
+
+**What this does not achieve, stated as plainly as everywhere else in this document uses "not
+solved" or "flagged, not resolved"**: proof-of-work does not identify or exclude anyone. A
+well-resourced attacker (a botnet, dedicated hardware) mints valid proofs exactly as fast as
+anyone else, just at a real dollar cost instead of a free one. This mechanism raises the floor
+from "free" to "costs something, and costs more the more you try to inflate one event alone" — it
+does not raise it to "impossible," and claiming otherwise would overstate what a schema-level,
+identity-free check can ever guarantee.
+
 ## Open questions (genuinely unresolved, flagged rather than guessed at)
 
-- **Anti-spam/sybil resistance with no identity.** The classic problem with anonymous reporting:
-  nothing here stops one actor from submitting many fabricated reports. Proof-of-work per report,
-  a resource-bounded submission channel, or accepting the risk and relying on corroboration
-  (one report alone proves nothing; many independent ones are harder to fabricate) are all named,
-  none designed.
-- **Transport-level anonymity.** A real transport exists now (`spec/04-transport.md`,
-  `POST /oag-mesh/v1/anonymous-event`), and it is explicit about not solving this: the payload
-  carries no identifying field, but a plain HTTP POST still reveals the submitting connection's
-  source IP to the receiving peer. The same unresolved gap as the base project's own "never
-  ending morphing encryption"/traffic-analysis-resistance entry in `spec/22-future-work.md` there.
-  Still not solved here.
+- **Proof-of-work difficulty is untuned.** `BASE_DIFFICULTY_BITS`/`DIFFICULTY_STEP_BITS` are
+  reasonable-sounding defaults, not derived from any real deployment's actual hardware/traffic
+  profile. A real deployment under real load should expect to retune these, and there's no
+  mechanism here for a network to agree on or adjust a shared difficulty over time.
+- **No defense against a well-resourced attacker.** Named plainly in "Anti-spam and anti-replay"
+  above — proof-of-work raises cost, it does not stop anyone with enough compute.
+- **Transport-level anonymity.** The payload carries no identifying field and now costs real
+  work to submit, but a plain HTTP POST (`spec/04-transport.md`,
+  `POST /oag-mesh/v1/anonymous-event`) still reveals the submitting connection's source IP to the
+  receiving peer — proof-of-work does nothing about this, it's an orthogonal property. The same
+  unresolved gap as the base project's own "never ending morphing encryption"/traffic-analysis-
+  resistance entry in `spec/22-future-work.md` there. Still not solved here.
 - **Reaching a responder.** A `MedicalEmergency` report is only useful for "life-saving actions"
   if it reaches someone who can act on it — and *that* delivery mechanism needs its own answer for
   "how does this happen without identifying the reporter or the responder," which this RFC does
@@ -135,8 +172,13 @@ schema itself can enforce.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (6 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (9 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
-recorded into the log; independent reports sharing a `corroboration_nonce` corroborate each other
-while an unrelated nonce stays separate; a `MedicalEmergency(HeartIssue)` report validates and
-round-trips through the log correctly.
+recorded into the log (checked before any proof-of-work is even considered); independent reports
+sharing a `corroboration_nonce` corroborate each other while an unrelated nonce stays separate; a
+`MedicalEmergency(HeartIssue)` report validates and round-trips through the log correctly; a
+report with no proof-of-work is rejected; required difficulty escalates with each additional
+report under one nonce (and a proof solved for an earlier, lower difficulty is correctly rejected
+against the new, higher one); a proof-of-work solved for one event cannot be reused for a
+different one. `crates/oag-mesh/src/transport.rs` adds one more over the wire: a submission with
+insufficient proof-of-work is rejected with `400`, never recorded.
