@@ -26,10 +26,11 @@ pub enum EventKind {
     /// A hazard was observed (fire, flood, structural collapse, downed power line, ...) --
     /// about the environment, not about a specific person.
     HazardObserved,
-    /// Someone needs urgent medical attention at this location. Carries no information about
-    /// who they are or what's wrong beyond `Severity` -- the same "no identifying detail"
-    /// constraint as `Sighting`, for the same reason.
-    MedicalEmergency,
+    /// Someone needs urgent medical attention at this location. `MedicalEmergencyKind` is a
+    /// closed sub-classification for routing to the right kind of medical team -- still no
+    /// information about who they are beyond that, the same "no identifying detail" constraint
+    /// as `Sighting`, for the same reason.
+    MedicalEmergency(MedicalEmergencyKind),
     /// A need for a resource at a location (water, shelter, medical supplies) during a
     /// disaster/emergency response -- not urgent in the immediate-danger sense `MedicalEmergency`
     /// or a `Critical` `HazardObserved` is, but still something a responder should act on.
@@ -42,6 +43,17 @@ pub enum EventKind {
     /// superseding what came before. See this RFC's "Open questions" (retention/expiry) --
     /// deliberately not implemented yet, not an oversight.
     AllClear,
+}
+
+/// Closed sub-classification for `EventKind::MedicalEmergency`, so a response can be routed to
+/// the right kind of medical team without any free-text description -- the same "no identifying
+/// detail, closed enum only" constraint as the rest of this schema. Add more variants here, not
+/// a free-text field, when another specific category is needed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MedicalEmergencyKind {
+    /// A suspected cardiac event (heart attack, cardiac arrest, ...) -- for routing to a medical
+    /// team equipped to respond to one specifically.
+    HeartIssue,
 }
 
 /// How urgently a report needs a response -- the base signal a consumer triages on, since there
@@ -215,5 +227,21 @@ mod tests {
         log.record(valid_event("different-event-entirely")).unwrap();
         assert_eq!(log.corroboration_for("wildfire-ridge-rd-2026-10-23t14"), 2);
         assert_eq!(log.reports_for("wildfire-ridge-rd-2026-10-23t14").len(), 2);
+    }
+
+    #[test]
+    fn a_heart_issue_medical_emergency_validates_and_carries_no_identifying_detail() {
+        let mut event = valid_event("heart-issue-report-1");
+        event.kind = EventKind::MedicalEmergency(MedicalEmergencyKind::HeartIssue);
+        event.severity = Severity::Critical;
+        assert!(event.validate().is_ok());
+
+        let mut log = AnonymousEventLog::new();
+        log.record(event).unwrap();
+        assert_eq!(log.corroboration_for("heart-issue-report-1"), 1);
+        assert!(matches!(
+            log.reports_for("heart-issue-report-1")[0].kind,
+            EventKind::MedicalEmergency(MedicalEmergencyKind::HeartIssue)
+        ));
     }
 }

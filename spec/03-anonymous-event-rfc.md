@@ -25,9 +25,15 @@ has no signature field at all for exactly this reason.
 pub enum EventKind {
     Sighting,          // someone/something matching a life-safety concern -- no name/photo/description
     HazardObserved,     // about the environment (fire, flood, collapse, ...), not a specific person
-    MedicalEmergency,   // someone needs urgent attention here -- no identifying detail beyond Severity
+    MedicalEmergency(MedicalEmergencyKind),  // closed sub-kind for routing, no identifying detail beyond it + Severity
     ResourceNeed,        // water, shelter, medical supplies needed at a location -- not immediate danger
     AllClear,            // CONVENTION ONLY: signals a nonce's situation has resolved -- see below, nothing enforces this
+}
+
+// Closed sub-classification of MedicalEmergency, for routing to the right kind of medical team --
+// add more variants here, never a free-text field, when another specific category is needed.
+pub enum MedicalEmergencyKind {
+    HeartIssue,  // a suspected cardiac event
 }
 
 // The base triage signal, since the rest of the payload deliberately carries no identifying
@@ -68,9 +74,12 @@ an over-precise report is rejected, not silently accepted.
 - **`Sighting`**, **`HazardObserved`**, **`ResourceNeed`** describe exactly what their name says
   and nothing more — there is no field anywhere that could add identifying detail about a person
   (see the closed-enum rationale above).
-- **`MedicalEmergency`** means "someone needs urgent attention at this location." It carries no
-  information about who they are or what's wrong beyond `Severity` — the same "no identifying
-  detail" constraint as `Sighting`, for the same reason.
+- **`MedicalEmergency(MedicalEmergencyKind)`** means "someone needs urgent attention at this
+  location." `MedicalEmergencyKind` is a closed sub-classification letting a response get routed
+  to the right kind of medical team — currently just `HeartIssue` (a suspected cardiac event);
+  add more variants there, never a free-text field, when another specific category is needed.
+  Beyond that sub-kind and `Severity`, it carries no information about who the person is — the
+  same "no identifying detail" constraint as `Sighting`, for the same reason.
 - **`AllClear` is a convention, not an enforced effect.** A reporter uses it to signal that the
   situation identified by a given `corroboration_nonce` has resolved. Nothing in
   `AnonymousEventLog` currently acts on this: `record()` stores an `AllClear` exactly like any
@@ -125,7 +134,8 @@ schema itself can enforce.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (5 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (6 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
 recorded into the log; independent reports sharing a `corroboration_nonce` corroborate each other
-while an unrelated nonce stays separate.
+while an unrelated nonce stays separate; a `MedicalEmergency(HeartIssue)` report validates and
+round-trips through the log correctly.

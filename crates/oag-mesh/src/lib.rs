@@ -14,5 +14,7 @@
 pub mod anonymous_event;
 pub mod bridge;
 
-pub use anonymous_event::{AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventKind, Severity};
+pub use anonymous_event::{
+    AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventKind, MedicalEmergencyKind, Severity,
+};
 pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
