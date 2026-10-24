@@ -13,3 +13,5 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 hex.workspace = true
+axum.workspace = true
+reqwest.workspace = true

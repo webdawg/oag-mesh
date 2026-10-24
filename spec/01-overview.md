@@ -1,7 +1,8 @@
 # Overview
 
-**Status: cluster nesting implemented (`spec/02-cluster-nesting.md`); federated corroboration
-across clusters not yet built.**
+**Status: cluster nesting (`spec/02-cluster-nesting.md`), the anonymous-event schema
+(`spec/03-anonymous-event-rfc.md`), and a real HTTP transport for both (`spec/04-transport.md`)
+are implemented. Federated corroboration across clusters (mechanism 2 below) is not yet built.**
 
 ## What this layer is
 
@@ -61,6 +62,8 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
 - What counts as "independent enough" paths for corroboration to mean anything (two nodes
   operated by the same organization corroborating each other proves less than two genuinely
   separate ones) — applies to both mechanism (2) and the anonymous-event mechanism (3).
-- See `spec/02-cluster-nesting.md`'s and `spec/03-anonymous-event-rfc.md`'s own "open questions"
-  sections for mechanism-specific gaps (no transport yet for either; anonymous events have no
-  anti-spam/sybil-resistance design yet).
+- A real HTTP transport exists now for both mechanisms (`spec/04-transport.md`), push-only with
+  no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent` submissions any
+  network-level anonymity on top of their already-anonymous payload. See `spec/02`'s, `spec/03`'s,
+  and `spec/04`'s own "open questions" sections for what's still unresolved there (anonymous
+  events still have no anti-spam/sybil-resistance design).

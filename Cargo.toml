@@ -23,3 +23,5 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 hex = "0.4"
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

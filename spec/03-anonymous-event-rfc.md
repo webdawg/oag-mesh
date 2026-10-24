@@ -119,11 +119,12 @@ schema itself can enforce.
   a resource-bounded submission channel, or accepting the risk and relying on corroboration
   (one report alone proves nothing; many independent ones are harder to fabricate) are all named,
   none designed.
-- **Transport-level anonymity.** The payload itself carries no identifying field, but relaying it
-  through any real network (this layer's own, or the base project's `oag-sync`/`oag-reticulum`)
-  can still leak sender identity at the connection/timing level even with a clean payload — the
-  same unresolved gap as the base project's own "never ending morphing encryption"/traffic-
-  analysis-resistance entry in `spec/22-future-work.md` there. Not solved here either.
+- **Transport-level anonymity.** A real transport exists now (`spec/04-transport.md`,
+  `POST /oag-mesh/v1/anonymous-event`), and it is explicit about not solving this: the payload
+  carries no identifying field, but a plain HTTP POST still reveals the submitting connection's
+  source IP to the receiving peer. The same unresolved gap as the base project's own "never
+  ending morphing encryption"/traffic-analysis-resistance entry in `spec/22-future-work.md` there.
+  Still not solved here.
 - **Reaching a responder.** A `MedicalEmergency` report is only useful for "life-saving actions"
   if it reaches someone who can act on it — and *that* delivery mechanism needs its own answer for
   "how does this happen without identifying the reporter or the responder," which this RFC does

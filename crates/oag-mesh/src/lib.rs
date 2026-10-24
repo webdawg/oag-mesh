@@ -8,13 +8,16 @@
 //! the same way a base-project peer's does, but implements its own protocol rather than
 //! modifying the base project's `oag-sync` in place.
 //!
-//! See `spec/01-overview.md` (base repo link above), `spec/02-cluster-nesting.md`, and
-//! `spec/03-anonymous-event-rfc.md` (this repo) for the design this crate implements.
+//! See `spec/01-overview.md` (base repo link above), `spec/02-cluster-nesting.md`,
+//! `spec/03-anonymous-event-rfc.md`, and `spec/04-transport.md` (this repo) for the design this
+//! crate implements.
 
 pub mod anonymous_event;
 pub mod bridge;
+pub mod transport;
 
 pub use anonymous_event::{
     AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventKind, MedicalEmergencyKind, Severity,
 };
 pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
+pub use transport::{MeshState, PushError};

@@ -43,10 +43,12 @@ accidentally).
 
 ## What this explicitly is not (yet)
 
-- **No transport.** Nothing here sends a `BridgeDeclaration` anywhere or gossips it between
-  peers — this is the signed message shape and the in-memory resolution logic only. A caller
-  currently has to get declarations from somewhere itself.
-- **No persistence.** `MeshTree` is in-memory, rebuilt from whatever declarations are fed to it.
+- **Transport exists now (`spec/04-transport.md`), but is push-only.** A declaration reaches
+  other mesh nodes by being pushed to a static, operator-configured peer list
+  (`broadcast_bridge_declaration`) — there is no pull-based anti-entropy, so a peer offline at
+  broadcast time simply never gets it unless something else re-pushes it later.
+- **No persistence.** `MeshTree` is in-memory, rebuilt from whatever declarations are fed to it
+  (including over the transport above) each time a process starts.
 - **No interaction with the base project's `FederationPolicy`/trust machinery.** A base cluster
   being nested under a mesh-group does not, by itself, change how the base project's own peers
   federate with each other — see `spec/01-overview.md`'s "not a trust merger" note.
