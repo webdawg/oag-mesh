@@ -39,6 +39,10 @@ All three mechanisms are implemented: cluster nesting (`spec/02-cluster-nesting.
 anonymous-event RFC schema with escalating proof-of-work anti-spam/anti-replay protection
 (`spec/03-anonymous-event-rfc.md`), and federated corroboration weighted by distinct cluster
 rather than distinct peer (`spec/05-federated-corroboration.md`) — all three over a real HTTP
-transport (`spec/04-transport.md`). Still open: cross-checking a `ClaimReport`'s self-asserted
-cluster against real cluster-nesting data, anti-sybil resistance for claim reports, and
+transport (`spec/04-transport.md`). A `ClaimReport`'s self-asserted cluster can now be
+cross-checked against real cluster-nesting data (`best_corroborated_value_cross_checked`,
+`GET .../best-cross-checked`) — confirming the claimed cluster *name* was really attested by a
+`BridgeDeclaration`, though not that the reporting peer actually belongs to it; see `spec/05`'s
+own section on where that line is drawn. Still open: confirming a reporting peer's actual
+standing in the cluster it claims, anti-sybil resistance for claim reports, and
 dispatch-to-a-responder for anonymous events. See `spec/01-overview.md`.

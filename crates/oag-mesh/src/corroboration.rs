@@ -25,6 +25,8 @@ use std::collections::{HashMap, HashSet};
 use oag_crypto::{sign_with_domain, verify_with_domain, PeerId, PeerIdentity, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::MeshTree;
+
 pub const CLAIM_REPORT_DOMAIN: &str = "OAG-MESH:CLAIM_REPORT:v1:";
 
 /// Same tolerance every other signed message in this crate (and the base project) uses.
@@ -146,6 +148,19 @@ pub struct ClaimAgreement {
     pub distinct_peers: usize,
 }
 
+/// The result of `ClaimCorroboration::best_corroborated_value_cross_checked` -- the same kind
+/// of `ClaimAgreement` `best_corroborated_value` would return, but computed only from reports
+/// whose `reporter_cluster` is attested in a `bridge::MeshTree`, plus how many reports were
+/// dropped for failing that check. `best` is `None` exactly when every report recorded for the
+/// claim got dropped by the cross-check -- in which case `reports_dropped_unattested_cluster`
+/// is always greater than `0`, since a claim with zero reports ever recorded returns `None`
+/// from the method itself rather than `Some(CrossCheckedAgreement { best: None, .. })`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossCheckedAgreement {
+    pub best: Option<ClaimAgreement>,
+    pub reports_dropped_unattested_cluster: usize,
+}
+
 /// Collects verified `ClaimReport`s, grouped by `claim_id`, and aggregates them weighted by
 /// distinct reporting *cluster* -- the mechanism-level answer to `spec/01-overview.md`'s "what
 /// counts as independent enough" question: two reports from the same self-asserted cluster
@@ -196,6 +211,58 @@ impl ClaimCorroboration {
                 distinct_peers: peers.len(),
             })
             .max_by_key(|agreement| (agreement.distinct_clusters, agreement.distinct_peers))
+    }
+
+    /// Like `best_corroborated_value`, but first drops every recorded report whose self-asserted
+    /// `reporter_cluster` is not attested anywhere in `mesh_tree` as a real base-layer cluster
+    /// (`bridge::MeshTree::is_attested_base_cluster`, requiring at least
+    /// `min_bridge_corroboration` distinct `BridgeDeclaration`s). This closes half of
+    /// `spec/05-federated-corroboration.md`'s "no cross-check against real cluster nesting" gap:
+    /// a report claiming a cluster name that was never attested by any bridge declaration no
+    /// longer counts toward corroboration at all.
+    ///
+    /// It does **not** close the other half. Nothing in this crate -- not `BridgeDeclaration`,
+    /// not anything else -- records which peers actually belong to a given base-layer cluster;
+    /// a `BridgeDeclaration` only ever asserts that a cluster *name* is nested under some
+    /// mesh-group, signed by whichever peer felt like asserting it, not by every member of that
+    /// cluster. So a reporting peer that picks a real, attested cluster name it has no actual
+    /// standing in still passes this check. Fully closing that gap would need a new kind of
+    /// signed fact this crate doesn't have yet -- something like "I attest peer X is a genuine
+    /// member of cluster C," itself signed by other members of C -- which is a real, separate,
+    /// unbuilt mechanism, not a refinement of this one.
+    ///
+    /// Returns `None` only if nothing has ever been reported for `claim_id` at all (same as
+    /// `best_corroborated_value`). If every report for a known `claim_id` gets dropped for an
+    /// unattested cluster claim, returns `Some` with `best: None` and a non-zero
+    /// `reports_dropped_unattested_cluster`, so a caller can tell "nothing survived the
+    /// cross-check" apart from "nothing was ever reported."
+    pub fn best_corroborated_value_cross_checked(
+        &self,
+        claim_id: &str,
+        mesh_tree: &MeshTree,
+        min_bridge_corroboration: usize,
+    ) -> Option<CrossCheckedAgreement> {
+        let reports = self.reports.get(claim_id)?;
+        let mut by_value: HashMap<&str, (HashSet<&str>, HashSet<PeerId>)> = HashMap::new();
+        let mut reports_dropped_unattested_cluster = 0usize;
+        for r in reports {
+            if !mesh_tree.is_attested_base_cluster(&r.reporter_cluster, min_bridge_corroboration) {
+                reports_dropped_unattested_cluster += 1;
+                continue;
+            }
+            let entry = by_value.entry(&r.observed_value_hash).or_default();
+            entry.0.insert(&r.reporter_cluster);
+            entry.1.insert(r.peer_id);
+        }
+        let best = by_value
+            .into_iter()
+            .map(|(value, (clusters, peers))| ClaimAgreement {
+                observed_value_hash: value.to_string(),
+                distinct_clusters: clusters.len(),
+                distinct_peers: peers.len(),
+            })
+            .max_by_key(|agreement| (agreement.distinct_clusters, agreement.distinct_peers));
+        Some(CrossCheckedAgreement { best, reports_dropped_unattested_cluster })
     }
 
     /// The distinct-cluster corroboration count for one specific `(claim_id,
@@ -323,6 +390,66 @@ mod tests {
         let corroboration = ClaimCorroboration::new();
         assert!(corroboration.best_corroborated_value("never-reported").is_none());
         assert_eq!(corroboration.cluster_corroboration_for("never-reported", "blake3:abc"), 0);
+    }
+
+    #[test]
+    fn cross_check_drops_reports_claiming_an_unattested_cluster() {
+        use crate::bridge::{self, MeshMember};
+
+        let peer_a = PeerIdentity::generate();
+        let peer_b = PeerIdentity::generate();
+        let bridge_signer = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+        let mut tree = bridge::MeshTree::new();
+
+        // Only "cluster-a" is ever attested by a real BridgeDeclaration.
+        tree.add(
+            &bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("cluster-a".into()), now())
+                .unwrap(),
+            now(),
+        )
+        .unwrap();
+
+        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        // cluster-b is never attested anywhere in the tree -- a fabricated cluster claim.
+        corroboration.add(&build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
+
+        // Without the cross-check, both reports count -- two distinct clusters.
+        let uncross_checked = corroboration.best_corroborated_value("claim-1").unwrap();
+        assert_eq!(uncross_checked.distinct_clusters, 2);
+
+        // With the cross-check, only cluster-a's report survives.
+        let cross_checked = corroboration.best_corroborated_value_cross_checked("claim-1", &tree, 1).unwrap();
+        let best = cross_checked.best.unwrap();
+        assert_eq!(best.distinct_clusters, 1);
+        assert_eq!(best.distinct_peers, 1);
+        assert_eq!(cross_checked.reports_dropped_unattested_cluster, 1);
+    }
+
+    #[test]
+    fn cross_check_returns_none_best_when_every_report_is_unattested() {
+        use crate::bridge;
+
+        let peer_a = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+        let empty_tree = bridge::MeshTree::new();
+
+        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+
+        let cross_checked = corroboration.best_corroborated_value_cross_checked("claim-1", &empty_tree, 1).unwrap();
+        assert!(cross_checked.best.is_none());
+        assert_eq!(cross_checked.reports_dropped_unattested_cluster, 1);
+    }
+
+    #[test]
+    fn cross_check_against_an_unknown_claim_returns_none() {
+        use crate::bridge;
+
+        let corroboration = ClaimCorroboration::new();
+        let empty_tree = bridge::MeshTree::new();
+        assert!(corroboration
+            .best_corroborated_value_cross_checked("never-reported", &empty_tree, 1)
+            .is_none());
     }
 
     #[test]

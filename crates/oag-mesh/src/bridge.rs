@@ -188,6 +188,21 @@ impl MeshTree {
             .collect()
     }
 
+    /// Whether `name` is attested anywhere in this tree as a real base-layer cluster -- i.e.
+    /// some `BridgeDeclaration` placed `MeshMember::BaseCluster(name)` into *some* mesh-group,
+    /// with at least `min_corroboration` distinct declaring peers. This only confirms the
+    /// cluster *name* is a real, nested entity in the mesh; it says nothing about whether any
+    /// particular reporting peer actually belongs to that cluster -- a `BridgeDeclaration` only
+    /// ever asserts that a cluster name is nested under a mesh-group, never which peers are
+    /// members of the cluster itself, so that half of "is this claim real" is a gap this method
+    /// cannot close. See `corroboration.rs`'s `best_corroborated_value_cross_checked` for where
+    /// this is used, and its own doc comment for that remaining gap stated plainly.
+    pub fn is_attested_base_cluster(&self, name: &str, min_corroboration: usize) -> bool {
+        self.edges.iter().any(|((_, member), peers)| {
+            matches!(member, MeshMember::BaseCluster(n) if n == name) && peers.len() >= min_corroboration
+        })
+    }
+
     /// Every base-layer cluster name reachable from `mesh_group` by following `MeshGroup`
     /// members recursively -- "clusters within clusters," flattened. A cycle (group A contains
     /// group B which contains group A) terminates instead of looping forever; a cyclical mesh
@@ -375,6 +390,30 @@ mod tests {
 
         let result = tree.base_clusters_under("group-a", 1);
         assert_eq!(result, HashSet::from(["leaf1".to_string()]));
+    }
+
+    #[test]
+    fn is_attested_base_cluster_checks_existence_and_minimum_corroboration() {
+        let a = PeerIdentity::generate();
+        let b = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+
+        tree.add(
+            &build_and_sign(&a, "global", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        assert!(tree.is_attested_base_cluster("ny-dc1", 1));
+        assert!(!tree.is_attested_base_cluster("ny-dc1", 2));
+        assert!(!tree.is_attested_base_cluster("made-up-cluster", 1));
+
+        tree.add(
+            &build_and_sign(&b, "global", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+        assert!(tree.is_attested_base_cluster("ny-dc1", 2));
     }
 
     #[test]

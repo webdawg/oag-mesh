@@ -21,6 +21,11 @@ protocol entirely. Nothing in the base project needs to know this exists.
   `BridgeDeclaration` -- signed, nothing to hide, `POST /oag-mesh/v1/claim-report` just verifies
   and records it. `GET /oag-mesh/v1/claim-report/{claim_id}/best` reads back this node's own
   current view (not a network-wide fan-out -- see `spec/05`'s own "what this is not" section).
+  `GET /oag-mesh/v1/claim-report/{claim_id}/best-cross-checked?min_bridge_corroboration=N` reads
+  back the same thing, but cross-checked against this node's own `bridge::MeshTree` -- dropping
+  any report whose `reporter_cluster` isn't attested by a real `BridgeDeclaration` first. Same
+  node-local scope as the plain `.../best` endpoint; see `spec/05`'s "Cross-checking against
+  real cluster nesting" section for exactly what that cross-check does and does not confirm.
 - **`AnonymousEvent`** (`spec/03-anonymous-event-rfc.md`) is a different story, and this is the
   important part of this file: **`POST /oag-mesh/v1/anonymous-event` does not, and cannot, hide
   the submitting connection's source IP from the receiving peer.** That's an inherent property of
@@ -58,7 +63,7 @@ tampered `BridgeDeclaration` is.
 
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (10 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (12 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` is recorded and
 corroborated on the receiving side; a tampered declaration is rejected over the wire with `400`
 and never recorded; `broadcast_bridge_declaration` reaches every one of several independently
@@ -67,7 +72,9 @@ running peers; a pushed `AnonymousEvent` (with valid proof-of-work) is recorded;
 proof-of-work is rejected over the wire and never recorded; a pushed `ClaimReport` is recorded
 and readable back over `GET .../best`; a tampered one is rejected over the wire;
 `broadcast_claim_report` reaches every configured peer and each independently corroborates it;
-querying an unknown claim returns `null`.
+querying an unknown claim returns `null`; `GET .../best-cross-checked` drops a report claiming a
+fabricated cluster name while the plain `.../best` endpoint still counts it, over the wire;
+`.../best-cross-checked` against an unknown claim returns a `null` result.
 
 ## Open questions (genuinely unresolved)
 
@@ -89,8 +96,9 @@ querying an unknown claim returns `null`.
   anti-replay") — a real mitigation, not a full solution; see that section's own stated limits
   (doesn't stop a well-resourced attacker). No equivalent exists for `ClaimReport` yet
   (`spec/05`'s own open question).
-- **The `GET .../best` read endpoint has no auth at all.** Anyone who can reach the listen
-  address can read any node's current corroboration view for any `claim_id` -- whether that's
-  fine (mirroring `GET /metrics`'s "aggregate, nothing sensitive" posture in the base project) or
-  needs gating depends on what real `claim_id`/`observed_value_hash` content ends up flowing
-  through a real deployment, which isn't decided yet.
+- **The `GET .../best` and `GET .../best-cross-checked` read endpoints have no auth at all.**
+  Anyone who can reach the listen address can read any node's current corroboration view for any
+  `claim_id` -- whether that's fine (mirroring `GET /metrics`'s "aggregate, nothing sensitive"
+  posture in the base project) or needs gating depends on what real `claim_id`/
+  `observed_value_hash` content ends up flowing through a real deployment, which isn't decided
+  yet.

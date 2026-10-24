@@ -22,5 +22,7 @@ pub use anonymous_event::{
     ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
 };
 pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
-pub use corroboration::{ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, UnsignedClaimReport};
+pub use corroboration::{
+    ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, CrossCheckedAgreement, UnsignedClaimReport,
+};
 pub use transport::{MeshState, PushError};

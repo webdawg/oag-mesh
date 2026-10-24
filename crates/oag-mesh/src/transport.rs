@@ -20,7 +20,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -77,6 +77,10 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
+        .route(
+            "/oag-mesh/v1/claim-report/{claim_id}/best-cross-checked",
+            get(get_best_corroborated_value_cross_checked),
+        )
         .with_state(state)
 }
 
@@ -184,6 +188,35 @@ fn claim_report_error_response(e: ClaimReportError) -> Response {
 async fn get_best_corroborated_value(State(state): State<MeshState>, Path(claim_id): Path<String>) -> Response {
     let corroboration = state.claim_corroboration.read().unwrap();
     Json(serde_json::json!({ "best": corroboration.best_corroborated_value(&claim_id) })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossCheckQuery {
+    /// How many distinct `BridgeDeclaration`s must attest a `reporter_cluster` name before a
+    /// report claiming it counts. Defaults to `1` -- any real attestation at all, the weakest
+    /// bar `bridge::MeshTree::is_attested_base_cluster` supports.
+    #[serde(default = "default_min_bridge_corroboration")]
+    min_bridge_corroboration: usize,
+}
+
+fn default_min_bridge_corroboration() -> usize {
+    1
+}
+
+/// Read-only, same node-local-only scope as `get_best_corroborated_value`, but cross-checked
+/// against this node's own `state.tree` -- see `corroboration::ClaimCorroboration::
+/// best_corroborated_value_cross_checked` for exactly what that does and does not verify (the
+/// cluster *name* being real, never the reporting peer's actual standing in it).
+async fn get_best_corroborated_value_cross_checked(
+    State(state): State<MeshState>,
+    Path(claim_id): Path<String>,
+    Query(query): Query<CrossCheckQuery>,
+) -> Response {
+    let corroboration = state.claim_corroboration.read().unwrap();
+    let tree = state.tree.read().unwrap();
+    let result =
+        corroboration.best_corroborated_value_cross_checked(&claim_id, &tree, query.min_bridge_corroboration);
+    Json(serde_json::json!({ "result": result })).into_response()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -445,6 +478,73 @@ mod tests {
             state_b.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-broadcast-test", "blake3:abc"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn best_cross_checked_drops_a_report_claiming_an_unattested_cluster() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+
+        // Attest "cluster-real" via a real BridgeDeclaration first.
+        let bridge_signer = PeerIdentity::generate();
+        let decl = crate::bridge::build_and_sign(
+            &bridge_signer,
+            "global",
+            MeshMember::BaseCluster("cluster-real".into()),
+            now_unix(),
+        )
+        .unwrap();
+        push_bridge_declaration(&reqwest::Client::new(), &addr_a, &decl).await.unwrap();
+
+        // One report from the attested cluster, one from a fabricated cluster name.
+        let real_reporter = PeerIdentity::generate();
+        let fake_reporter = PeerIdentity::generate();
+        let real_report = crate::corroboration::build_and_sign(
+            &real_reporter,
+            "claim-cross-check-test",
+            "cluster-real",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+        let fake_report = crate::corroboration::build_and_sign(
+            &fake_reporter,
+            "claim-cross-check-test",
+            "cluster-fabricated",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+        push_claim_report(&reqwest::Client::new(), &addr_a, &real_report).await.unwrap();
+        push_claim_report(&reqwest::Client::new(), &addr_a, &fake_report).await.unwrap();
+
+        // The uncross-checked view still sees both clusters.
+        assert_eq!(
+            state_a.claim_corroboration.read().unwrap().best_corroborated_value("claim-cross-check-test").unwrap().distinct_clusters,
+            2
+        );
+
+        let response = reqwest::get(format!(
+            "{addr_a}/oag-mesh/v1/claim-report/claim-cross-check-test/best-cross-checked"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["best"]["distinct_clusters"], 1);
+        assert_eq!(body["result"]["reports_dropped_unattested_cluster"], 1);
+    }
+
+    #[tokio::test]
+    async fn best_cross_checked_against_an_unknown_claim_returns_null_result() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let response = reqwest::get(format!(
+            "{addr_a}/oag-mesh/v1/claim-report/never-reported/best-cross-checked"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["result"].is_null());
     }
 
     #[tokio::test]

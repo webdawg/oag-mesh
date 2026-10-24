@@ -1,9 +1,11 @@
 # Overview
 
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), with a
-real HTTP transport for all of them (`spec/04-transport.md`). Dispatch-to-a-responder for
-anonymous events, and cross-checking claim-report cluster claims against real cluster nesting,
-are not.**
+real HTTP transport for all of them (`spec/04-transport.md`). `spec/05`'s claim-report cluster
+claims are now cross-checked against real cluster nesting for half the gap that mattered (the
+cluster *name* being real) -- see `spec/05`'s own "Cross-checking against real cluster nesting"
+section for exactly what that does and does not cover. Dispatch-to-a-responder for anonymous
+events, and confirming a reporting peer's actual *standing* in the cluster it claims, are not.**
 
 ## What this layer is
 
@@ -27,7 +29,12 @@ Three related mechanisms, one level above a single `oag` peer or peer cluster:
    verification signal: agreement across independent, *differently-clustered* paths is real
    corroboration; a self-asserted `reporter_cluster` is what makes "differently-clustered"
    checkable at all (weighted by distinct cluster, not just distinct peer — see `spec/05`'s own
-   "why weight by cluster" section for why that distinction matters). This is the witness/audit
+   "why weight by cluster" section for why that distinction matters). `reporter_cluster` can
+   now also be cross-checked against mechanism (1)'s real `bridge::MeshTree` data
+   (`best_corroborated_value_cross_checked`) — confirming the claimed cluster *name* was really
+   attested by a `BridgeDeclaration` somewhere, though not that the reporting peer actually
+   belongs to it (see `spec/05`'s own section on exactly where that line is drawn). This is the
+   witness/audit
    mechanism named in the base project's `spec/22-future-work.md` and its
    `future_flood_propagation_and_anonymity.md`/`future_service_announcements_and_audit.md` memory
    entries, and the mechanism `spec/32-verified-internet-gateway.md`'s own quorum fan-out already
@@ -75,6 +82,9 @@ Three related mechanisms, one level above a single `oag` peer or peer cluster:
   real mitigation against spam/self-replay-inflation, not a full solution (doesn't stop a
   well-resourced attacker); `ClaimReport` has no equivalent anti-sybil mechanism at all yet
   (`spec/05`'s own open question — proof-of-work doesn't transfer there either, since a fabricated
-  `reporter_cluster` is the thing to guard against, not raw submission volume). See `spec/02`'s,
-  `spec/03`'s, `spec/04`'s, and `spec/05`'s own "open questions" sections for what else is still
-  unresolved.
+  `reporter_cluster` is the thing to guard against, not raw submission volume). A fabricated
+  cluster *name* is now caught by the cross-check against `bridge::MeshTree`, but a fabricated
+  claim of *membership* in a real cluster is not — minting fresh `PeerIdentity`s that each claim
+  a real, attested cluster name they have no actual standing in still inflates a claim's apparent
+  cluster diversity for free. See `spec/02`'s, `spec/03`'s, `spec/04`'s, and `spec/05`'s own
+  "open questions" sections for what else is still unresolved.
