@@ -9,11 +9,12 @@
 //! modifying the base project's `oag-sync` in place.
 //!
 //! See `spec/01-overview.md` (base repo link above), `spec/02-cluster-nesting.md`,
-//! `spec/03-anonymous-event-rfc.md`, and `spec/04-transport.md` (this repo) for the design this
-//! crate implements.
+//! `spec/03-anonymous-event-rfc.md`, `spec/04-transport.md`, and
+//! `spec/05-federated-corroboration.md` (this repo) for the design this crate implements.
 
 pub mod anonymous_event;
 pub mod bridge;
+pub mod corroboration;
 pub mod transport;
 
 pub use anonymous_event::{
@@ -21,4 +22,5 @@ pub use anonymous_event::{
     ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
 };
 pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
+pub use corroboration::{ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, UnsignedClaimReport};
 pub use transport::{MeshState, PushError};

@@ -35,8 +35,10 @@ infrastructure was declined before this repository existed.
 
 ## Status
 
-Cluster nesting (`spec/02-cluster-nesting.md`), the anonymous-event RFC schema with escalating
-proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`), and a real HTTP
-transport for both (`spec/04-transport.md`) are implemented. Federated corroboration across
-clusters (mechanism 2 in `spec/01-overview.md`) is not. See
-`spec/01-overview.md`.
+All three mechanisms are implemented: cluster nesting (`spec/02-cluster-nesting.md`), the
+anonymous-event RFC schema with escalating proof-of-work anti-spam/anti-replay protection
+(`spec/03-anonymous-event-rfc.md`), and federated corroboration weighted by distinct cluster
+rather than distinct peer (`spec/05-federated-corroboration.md`) — all three over a real HTTP
+transport (`spec/04-transport.md`). Still open: cross-checking a `ClaimReport`'s self-asserted
+cluster against real cluster-nesting data, anti-sybil resistance for claim reports, and
+dispatch-to-a-responder for anonymous events. See `spec/01-overview.md`.

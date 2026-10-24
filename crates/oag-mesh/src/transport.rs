@@ -5,7 +5,7 @@
 //! query protocol, one layer up: this is `oag-mesh`'s own Layer-3-equivalent, structurally
 //! parallel to the base project's `oag-sync`, not a part of it.
 //!
-//! The two message types get genuinely different transport treatment, because they have
+//! The three message types get genuinely different transport treatment, because they have
 //! genuinely different requirements:
 //!
 //! - `BridgeDeclaration` is signed by a real identity and loses nothing by ordinary propagation
@@ -14,19 +14,23 @@
 //!   the submitting connection's source IP to whoever receives it. **This transport does not
 //!   hide that.** See `receive_anonymous_event`'s doc comment and `spec/04-transport.md` for
 //!   exactly what is, and is not, achieved here -- this is a real, open gap, not an oversight.
+//! - `ClaimReport` is signed by a real identity, same as `BridgeDeclaration` -- it needs to be,
+//!   since `corroboration::ClaimCorroboration` weighs reports by the reporter's self-asserted
+//!   cluster, which only means anything if the reporter is identified at all.
 
 use std::sync::{Arc, RwLock};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use serde::{Deserialize, Serialize};
 
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, MeshTree};
+use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError};
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -46,7 +50,8 @@ pub struct MeshState {
     pub identity: Arc<oag_crypto::PeerIdentity>,
     pub tree: Arc<RwLock<MeshTree>>,
     pub event_log: Arc<RwLock<AnonymousEventLog>>,
-    /// Other mesh nodes this one pushes its own declarations/events to -- static,
+    pub claim_corroboration: Arc<RwLock<ClaimCorroboration>>,
+    /// Other mesh nodes this one pushes its own declarations/events/reports to -- static,
     /// operator-configured, the same "hand-written topology, no automatic discovery" posture as
     /// the base project's own `[transfer].relay_peers`/`[gateway].query_peers`.
     pub peers: Arc<Vec<String>>,
@@ -59,6 +64,7 @@ impl MeshState {
             identity: Arc::new(identity),
             tree: Arc::new(RwLock::new(MeshTree::new())),
             event_log: Arc::new(RwLock::new(AnonymousEventLog::new())),
+            claim_corroboration: Arc::new(RwLock::new(ClaimCorroboration::new())),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
         }
@@ -69,6 +75,8 @@ pub fn router(state: MeshState) -> Router {
     Router::new()
         .route("/oag-mesh/v1/bridge-declaration", post(receive_bridge_declaration))
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
+        .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
+        .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
         .with_state(state)
 }
 
@@ -136,6 +144,48 @@ async fn receive_anonymous_event(
     }
 }
 
+/// Receives a `ClaimReport`, verifies it, and records it into `state.claim_corroboration` --
+/// same signature/pairing/clock-skew checks as a `BridgeDeclaration`, nothing about
+/// `reporter_cluster` is checked here (see `corroboration.rs`'s own doc comment on why that's a
+/// bare self-assertion, by design).
+async fn receive_claim_report(State(state): State<MeshState>, Json(report): Json<ClaimReport>) -> Response {
+    let now = now_unix();
+    let result = {
+        let mut corroboration = state.claim_corroboration.write().unwrap();
+        corroboration.add(&report, now)
+    };
+    match result {
+        Ok(peer_id) => {
+            tracing::info!(%peer_id, claim_id = %report.unsigned.claim_id, "claim report recorded");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => claim_report_error_response(e),
+    }
+}
+
+fn claim_report_error_response(e: ClaimReportError) -> Response {
+    let status = match &e {
+        ClaimReportError::PeerId(_)
+        | ClaimReportError::InvalidPublicKey
+        | ClaimReportError::PeerIdKeyMismatch
+        | ClaimReportError::BadSignatureEncoding
+        | ClaimReportError::BadSignature
+        | ClaimReportError::ClockSkew => StatusCode::BAD_REQUEST,
+        ClaimReportError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+}
+
+/// Read-only: this node's own current view of `corroboration::ClaimCorroboration::
+/// best_corroborated_value` for `claim_id`, from whatever `ClaimReport`s it has received so far
+/// (its own, and anything pushed to it). `null` if nothing has been reported for this claim to
+/// *this* node yet -- there is no cross-node query fan-out here, a caller wanting a network-wide
+/// view has to ask multiple mesh nodes itself.
+async fn get_best_corroborated_value(State(state): State<MeshState>, Path(claim_id): Path<String>) -> Response {
+    let corroboration = state.claim_corroboration.read().unwrap();
+    Json(serde_json::json!({ "best": corroboration.best_corroborated_value(&claim_id) })).into_response()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("request to {0} failed: {1}")]
@@ -197,6 +247,28 @@ pub async fn broadcast_anonymous_event(state: &MeshState, event: &AnonymousEvent
     for peer in state.peers.iter() {
         if let Err(e) = push_anonymous_event(&state.http, peer, event, pow).await {
             tracing::warn!(peer, error = %e, "failed to push anonymous event to peer");
+        }
+    }
+}
+
+pub async fn push_claim_report(http: &reqwest::Client, address: &str, report: &ClaimReport) -> Result<(), PushError> {
+    let url = format!("{}/oag-mesh/v1/claim-report", address.trim_end_matches('/'));
+    let response =
+        http.post(&url).json(report).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PushError::Rejected(address.to_string(), response.status()));
+    }
+    Ok(())
+}
+
+/// Same best-effort push, for a claim report -- a cluster's own corroboration signal only
+/// strengthens across the mesh once its reports actually reach nodes in *other* clusters, which
+/// is exactly what broadcasting to every configured peer does (and, same as the other two
+/// broadcast functions, all it does -- no pull-based anti-entropy here either).
+pub async fn broadcast_claim_report(state: &MeshState, report: &ClaimReport) {
+    for peer in state.peers.iter() {
+        if let Err(e) = push_claim_report(&state.http, peer, report).await {
+            tracing::warn!(peer, error = %e, "failed to push claim report to peer");
         }
     }
 }
@@ -313,5 +385,74 @@ mod tests {
         let err = push_anonymous_event(&http, &addr_a, &event, ProofOfWork { nonce: 0 }).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("transport-test-nonce-pow"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pushed_claim_report_is_recorded_and_queryable_over_the_wire() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let identity = PeerIdentity::generate();
+        let report =
+            crate::corroboration::build_and_sign(&identity, "claim-transport-test", "cluster-a", "blake3:abc", now_unix())
+                .unwrap();
+
+        push_claim_report(&reqwest::Client::new(), &addr_a, &report).await.unwrap();
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/claim-report/claim-transport-test/best"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["best"]["observed_value_hash"], "blake3:abc");
+        assert_eq!(body["best"]["distinct_clusters"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_claim_report_is_rejected_over_the_wire() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let identity = PeerIdentity::generate();
+        let mut report =
+            crate::corroboration::build_and_sign(&identity, "claim-tamper-test", "cluster-a", "blake3:abc", now_unix())
+                .unwrap();
+        report.unsigned.observed_value_hash = "blake3:tampered".to_string();
+
+        let err = push_claim_report(&reqwest::Client::new(), &addr_a, &report).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn broadcast_claim_report_reaches_every_configured_peer_and_corroborates() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_sender, sender_state) = spawn(vec![addr_a.clone(), addr_b.clone()]).await;
+
+        let identity = PeerIdentity::generate();
+        let report = crate::corroboration::build_and_sign(
+            &identity,
+            "claim-broadcast-test",
+            "cluster-sender",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+
+        broadcast_claim_report(&sender_state, &report).await;
+
+        assert_eq!(
+            state_a.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-broadcast-test", "blake3:abc"),
+            1
+        );
+        assert_eq!(
+            state_b.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-broadcast-test", "blake3:abc"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn querying_an_unknown_claim_returns_null() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/claim-report/never-reported/best")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["best"].is_null());
     }
 }

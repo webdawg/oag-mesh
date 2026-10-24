@@ -1,12 +1,13 @@
 # Overview
 
-**Status: cluster nesting (`spec/02-cluster-nesting.md`), the anonymous-event schema
-(`spec/03-anonymous-event-rfc.md`), and a real HTTP transport for both (`spec/04-transport.md`)
-are implemented. Federated corroboration across clusters (mechanism 2 below) is not yet built.**
+**Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), with a
+real HTTP transport for all of them (`spec/04-transport.md`). Dispatch-to-a-responder for
+anonymous events, and cross-checking claim-report cluster claims against real cluster nesting,
+are not.**
 
 ## What this layer is
 
-Two related mechanisms, one level above a single `oag` peer or peer cluster:
+Three related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -19,17 +20,19 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
    means there. Two base clusters nested under the same mesh-group stay distinct federation
    domains; nesting is a fact tracked here, not a change to how the base project's own
    `FederationPolicy`/trust configuration works for either cluster's members.
-2. **Federated corroboration.** Multiple independently-operated nodes (potentially across
-   different clusters/organizations) receive or fetch the *same* claim, content, or gateway
-   answer, each through its own path. Comparing what they each independently got — do the content
-   hashes agree? — is a verification signal: agreement across independent paths is corroboration;
-   disagreement localizes which path (or which node on it) diverged. This is the witness/audit
+2. **Federated corroboration, implemented — see `spec/05-federated-corroboration.md`.** Multiple
+   independently-operated nodes (potentially across different clusters/organizations) receive or
+   fetch the *same* claim, content, or gateway answer, each through its own path, and sign a
+   `ClaimReport` of what they got. Comparing those — do the content hashes agree? — is a
+   verification signal: agreement across independent, *differently-clustered* paths is real
+   corroboration; a self-asserted `reporter_cluster` is what makes "differently-clustered"
+   checkable at all (weighted by distinct cluster, not just distinct peer — see `spec/05`'s own
+   "why weight by cluster" section for why that distinction matters). This is the witness/audit
    mechanism named in the base project's `spec/22-future-work.md` and its
    `future_flood_propagation_and_anonymity.md`/`future_service_announcements_and_audit.md` memory
    entries, and the mechanism `spec/32-verified-internet-gateway.md`'s own quorum fan-out already
    implements for one peer's gateway queries — this layer is the same idea generalized across
-   organizational/cluster boundaries instead of one peer's own configured query_peers. Not yet
-   built.
+   organizational/cluster boundaries instead of one peer's own configured query_peers.
 3. **Anonymous event reporting for life-saving actions, schema implemented — see
    `spec/03-anonymous-event-rfc.md`.** A deliberately different, identity-*stripped* mechanism
    from (1) and (2) above, which are both signed-identity-based: an `AnonymousEvent` ("SAW THIS
@@ -59,13 +62,19 @@ Two related mechanisms, one level above a single `oag` peer or peer cluster:
 
 - Whether corroboration findings (agreement/disagreement across paths) get written back into the
   base project's evidence/corroboration model, or live entirely in this layer's own storage.
-- What counts as "independent enough" paths for corroboration to mean anything (two nodes
-  operated by the same organization corroborating each other proves less than two genuinely
-  separate ones) — applies to both mechanism (2) and the anonymous-event mechanism (3).
-- A real HTTP transport exists now for both mechanisms (`spec/04-transport.md`), push-only with
-  no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent` submissions any
-  network-level anonymity on top of their already-anonymous payload. Anonymous events now also
-  require escalating proof-of-work (`spec/03`'s "Anti-spam and anti-replay") -- a real mitigation
-  against spam/self-replay-inflation, not a full solution (doesn't stop a well-resourced
-  attacker). See `spec/02`'s, `spec/03`'s, and `spec/04`'s own "open questions" sections for what
-  else is still unresolved.
+- **"Independent enough" is answered for mechanism (2), not for (3).** `spec/05`'s
+  distinct-cluster weighting is the concrete answer for `ClaimReport` corroboration (two reports
+  from the same self-asserted cluster count as one). The anonymous-event mechanism (3) has no
+  identity at all to attach a cluster claim to, so the same fix doesn't transfer — it still just
+  counts raw report volume under a nonce, mitigated only by proof-of-work's escalating cost, a
+  different (and weaker) kind of "independent enough."
+- A real HTTP transport exists now for all three mechanisms (`spec/04-transport.md`), push-only
+  with no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent`
+  submissions any network-level anonymity on top of their already-anonymous payload. Anonymous
+  events also require escalating proof-of-work (`spec/03`'s "Anti-spam and anti-replay") -- a
+  real mitigation against spam/self-replay-inflation, not a full solution (doesn't stop a
+  well-resourced attacker); `ClaimReport` has no equivalent anti-sybil mechanism at all yet
+  (`spec/05`'s own open question — proof-of-work doesn't transfer there either, since a fabricated
+  `reporter_cluster` is the thing to guard against, not raw submission volume). See `spec/02`'s,
+  `spec/03`'s, `spec/04`'s, and `spec/05`'s own "open questions" sections for what else is still
+  unresolved.
