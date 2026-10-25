@@ -32,6 +32,29 @@ pub const CLAIM_REPORT_DOMAIN: &str = "OAG-MESH:CLAIM_REPORT:v1:";
 /// Same tolerance every other signed message in this crate (and the base project) uses.
 pub const MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 
+/// The difficulty (in required leading zero bits, same `blake3`-based scheme as
+/// `anonymous_event::ProofOfWork`) for the *first* report under a fresh `reporter_cluster` for a
+/// given `claim_id` -- i.e. the cost of being the cluster that establishes a brand-new
+/// `distinct_clusters` count of `1` for this claim. See `ClaimCorroboration::required_difficulty_bits`
+/// for why every other report (same cluster re-reporting, or a different peer within an
+/// already-counted cluster) costs nothing at all.
+pub const BASE_CLAIM_REPORT_DIFFICULTY_BITS: u32 = 16;
+
+/// How much the required difficulty grows for each *additional distinct cluster* already
+/// corroborating a claim before this one. Mirrors `anonymous_event::DIFFICULTY_STEP_BITS`'s
+/// escalation shape, but keyed to distinct-cluster count rather than raw report count -- the
+/// resource this mechanism actually needs to tax, see `ClaimCorroboration::required_difficulty_bits`.
+pub const CLAIM_REPORT_DIFFICULTY_STEP_BITS: u32 = 4;
+
+/// The difficulty required to be the `existing_distinct_clusters`-th *new* cluster to corroborate
+/// a claim (0-indexed) -- the first new cluster needs `BASE_CLAIM_REPORT_DIFFICULTY_BITS`, each
+/// one after that needs `CLAIM_REPORT_DIFFICULTY_STEP_BITS` more. Mirrors
+/// `anonymous_event::difficulty_bits_for_report_number`'s shape exactly, substituting "distinct
+/// cluster already on this claim" for "report already under this nonce".
+pub fn difficulty_bits_for_new_cluster_number(existing_distinct_clusters: usize) -> u32 {
+    BASE_CLAIM_REPORT_DIFFICULTY_BITS + (existing_distinct_clusters as u32) * CLAIM_REPORT_DIFFICULTY_STEP_BITS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsignedClaimReport {
     pub peer_id: String,
@@ -70,8 +93,74 @@ pub enum ClaimReportError {
     BadSignature,
     #[error("timestamp is too far from now")]
     ClockSkew,
+    #[error("proof of work does not meet the required {required_bits} leading zero bits for this (claim_id, reporter_cluster)")]
+    InsufficientProofOfWork { required_bits: u32 },
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// Anti-sybil proof-of-work for a `ClaimReport` -- unlike `anonymous_event::ProofOfWork` (which
+/// exists *because* that schema has no identity to lean on), this mechanism already has a real,
+/// signed `PeerIdentity` behind every report. What identity alone does **not** stop is an actor
+/// minting many fresh `PeerIdentity`s, each self-asserting a different fabricated
+/// `reporter_cluster`, to inflate a claim's apparent `distinct_clusters` count for free --
+/// `spec/05-federated-corroboration.md`'s own previously-open anti-sybil question. Signature
+/// verification alone doesn't bound this because minting a new identity costs nothing; what this
+/// proof-of-work taxes instead is the specific resource being counted: becoming a *new* distinct
+/// cluster on a claim. It does **not**, and cannot, stop a well-resourced attacker -- same
+/// "raises cost, doesn't eliminate" caveat as `anonymous_event::ProofOfWork`'s own doc comment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClaimReportProofOfWork {
+    pub nonce: u64,
+}
+
+/// Binds the proof to this specific `(peer_id, claim_id, reporter_cluster, observed_value_hash)`
+/// combination -- a solved proof for one report cannot be replayed for a different claim,
+/// cluster, value, or reporting peer, mirroring `anonymous_event::proof_of_work_hash`'s binding
+/// of a proof to one event's exact content.
+fn claim_report_pow_hash(report: &UnsignedClaimReport, pow: &ClaimReportProofOfWork) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"OAG-MESH:CLAIM_REPORT_POW:v1:");
+    hasher.update(report.peer_id.as_bytes());
+    hasher.update(report.claim_id.as_bytes());
+    hasher.update(report.reporter_cluster.as_bytes());
+    hasher.update(report.observed_value_hash.as_bytes());
+    hasher.update(&pow.nonce.to_le_bytes());
+    hasher.finalize()
+}
+
+fn leading_zero_bits(hash: &blake3::Hash) -> u32 {
+    let mut count = 0;
+    for &byte in hash.as_bytes() {
+        if byte == 0 {
+            count += 8;
+        } else {
+            count += byte.leading_zeros();
+            break;
+        }
+    }
+    count
+}
+
+impl ClaimReportProofOfWork {
+    /// The client-side work: searches for a `nonce` whose `claim_report_pow_hash` has at least
+    /// `difficulty_bits` leading zero bits. A real submitting client calls
+    /// `ClaimCorroboration::required_difficulty_bits` first to know what to solve for --
+    /// over-solving wastes work, under-solving gets rejected.
+    pub fn solve(report: &UnsignedClaimReport, difficulty_bits: u32) -> Self {
+        let mut nonce = 0u64;
+        loop {
+            let candidate = ClaimReportProofOfWork { nonce };
+            if leading_zero_bits(&claim_report_pow_hash(report, &candidate)) >= difficulty_bits {
+                return candidate;
+            }
+            nonce += 1;
+        }
+    }
+
+    fn satisfies(&self, report: &UnsignedClaimReport, difficulty_bits: u32) -> bool {
+        leading_zero_bits(&claim_report_pow_hash(report, self)) >= difficulty_bits
+    }
 }
 
 fn decode_32(s: &str) -> Option<[u8; 32]> {
@@ -175,12 +264,39 @@ impl ClaimCorroboration {
         Self::default()
     }
 
-    /// Verifies `report` and, if valid, records it. A peer re-reporting the same
-    /// `(claim_id, observed_value_hash)` more than once does not inflate anything further --
-    /// see `best_corroborated_value`'s distinct-peer/distinct-cluster counting, which
-    /// deduplicates by peer regardless of how many times that peer reported the same value.
-    pub fn add(&mut self, report: &ClaimReport, now: i64) -> Result<PeerId, ClaimReportError> {
+    /// The proof-of-work difficulty a `ClaimReport` for `(claim_id, reporter_cluster)` must
+    /// currently meet, per `difficulty_bits_for_new_cluster_number`. **Free (`0` bits, always
+    /// satisfied) if `reporter_cluster` has already reported for `claim_id` at all** -- a repeat
+    /// report from an already-counted cluster (the same peer, or a different peer within that
+    /// same self-asserted cluster) does not increase `distinct_clusters`, so there is nothing to
+    /// tax. Otherwise, the cost of becoming the next *new* distinct cluster on this claim, scaled
+    /// by how many distinct clusters already corroborate it. A submitting client should call this
+    /// before spending work solving a `ClaimReportProofOfWork`.
+    pub fn required_difficulty_bits(&self, claim_id: &str, reporter_cluster: &str) -> u32 {
+        let Some(reports) = self.reports.get(claim_id) else {
+            return BASE_CLAIM_REPORT_DIFFICULTY_BITS;
+        };
+        if reports.iter().any(|r| r.reporter_cluster == reporter_cluster) {
+            return 0;
+        }
+        let distinct_clusters = reports.iter().map(|r| r.reporter_cluster.as_str()).collect::<HashSet<_>>().len();
+        difficulty_bits_for_new_cluster_number(distinct_clusters)
+    }
+
+    /// Verifies `report`, checks `pow` against `required_difficulty_bits` for this report's
+    /// `(claim_id, reporter_cluster)` *at the moment this is called* (the escalation means this
+    /// must happen here, inside the struct, not in a standalone validation function -- only this
+    /// struct knows how many distinct clusters already corroborate the claim), and if both pass,
+    /// records it. A peer re-reporting the same `(claim_id, observed_value_hash)` more than once
+    /// does not inflate anything further -- see `best_corroborated_value`'s distinct-peer/
+    /// distinct-cluster counting, which deduplicates by peer regardless of how many times that
+    /// peer reported the same value.
+    pub fn add(&mut self, report: &ClaimReport, pow: ClaimReportProofOfWork, now: i64) -> Result<PeerId, ClaimReportError> {
         let peer_id = verify(report, now)?;
+        let required_bits = self.required_difficulty_bits(&report.unsigned.claim_id, &report.unsigned.reporter_cluster);
+        if !pow.satisfies(&report.unsigned, required_bits) {
+            return Err(ClaimReportError::InsufficientProofOfWork { required_bits });
+        }
         self.reports.entry(report.unsigned.claim_id.clone()).or_default().push(RecordedReport {
             peer_id,
             reporter_cluster: report.unsigned.reporter_cluster.clone(),
@@ -290,6 +406,20 @@ mod tests {
         1_700_000_000
     }
 
+    /// Solves whatever proof-of-work `corroboration` currently requires for `report`'s
+    /// `(claim_id, reporter_cluster)`, then adds it -- the test-side equivalent of a real client
+    /// calling `required_difficulty_bits` before submitting (mirrors `anonymous_event.rs`'s own
+    /// `record_with_fresh_pow` test helper).
+    fn add_with_fresh_pow(
+        corroboration: &mut ClaimCorroboration,
+        report: &ClaimReport,
+        now: i64,
+    ) -> Result<PeerId, ClaimReportError> {
+        let required = corroboration.required_difficulty_bits(&report.unsigned.claim_id, &report.unsigned.reporter_cluster);
+        let pow = ClaimReportProofOfWork::solve(&report.unsigned, required);
+        corroboration.add(report, pow, now)
+    }
+
     #[test]
     fn report_sign_and_verify_round_trip() {
         let identity = PeerIdentity::generate();
@@ -335,11 +465,9 @@ mod tests {
         let peer_a2 = PeerIdentity::generate();
         let mut corroboration = ClaimCorroboration::new();
 
-        corroboration
-            .add(&build_and_sign(&peer_a1, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now())
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a1, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now())
             .unwrap();
-        corroboration
-            .add(&build_and_sign(&peer_a2, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now())
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a2, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now())
             .unwrap();
 
         // Two different peers, but the same self-asserted cluster -- one cluster's worth of
@@ -357,10 +485,10 @@ mod tests {
         let peer_c = PeerIdentity::generate();
         let mut corroboration = ClaimCorroboration::new();
 
-        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
-        corroboration.add(&build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
         // A lone dissenting report from a third cluster, on a different value -- must not win.
-        corroboration.add(&build_and_sign(&peer_c, "claim-1", "cluster-c", "blake3:xyz", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_c, "claim-1", "cluster-c", "blake3:xyz", now()).unwrap(), now()).unwrap();
 
         assert_eq!(corroboration.cluster_corroboration_for("claim-1", "blake3:abc"), 2);
         assert_eq!(corroboration.cluster_corroboration_for("claim-1", "blake3:xyz"), 1);
@@ -375,10 +503,13 @@ mod tests {
         let peer_a = PeerIdentity::generate();
         let mut corroboration = ClaimCorroboration::new();
 
-        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
-        corroboration
-            .add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now() + 1).unwrap(), now() + 1)
-            .unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(
+            &mut corroboration,
+            &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now() + 1).unwrap(),
+            now() + 1,
+        )
+        .unwrap();
 
         let best = corroboration.best_corroborated_value("claim-1").unwrap();
         assert_eq!(best.distinct_peers, 1);
@@ -410,9 +541,9 @@ mod tests {
         )
         .unwrap();
 
-        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
         // cluster-b is never attested anywhere in the tree -- a fabricated cluster claim.
-        corroboration.add(&build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
 
         // Without the cross-check, both reports count -- two distinct clusters.
         let uncross_checked = corroboration.best_corroborated_value("claim-1").unwrap();
@@ -434,7 +565,7 @@ mod tests {
         let mut corroboration = ClaimCorroboration::new();
         let empty_tree = bridge::MeshTree::new();
 
-        corroboration.add(&build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
 
         let cross_checked = corroboration.best_corroborated_value_cross_checked("claim-1", &empty_tree, 1).unwrap();
         assert!(cross_checked.best.is_none());
@@ -458,7 +589,79 @@ mod tests {
         let mut report = build_and_sign(&identity, "claim-1", "cluster-a", "blake3:abc", now()).unwrap();
         report.unsigned.claim_id = "tampered".to_string();
         let mut corroboration = ClaimCorroboration::new();
-        assert!(corroboration.add(&report, now()).is_err());
+        // A tampered report fails signature verification before proof-of-work is even checked,
+        // so an unsolved (zero) nonce is fine here -- it must never be reached.
+        assert!(corroboration.add(&report, ClaimReportProofOfWork { nonce: 0 }, now()).is_err());
         assert_eq!(corroboration.cluster_corroboration_for("tampered", "blake3:abc"), 0);
+    }
+
+    #[test]
+    fn a_report_with_no_proof_of_work_is_rejected() {
+        let identity = PeerIdentity::generate();
+        let report = build_and_sign(&identity, "claim-pow-test", "cluster-a", "blake3:abc", now()).unwrap();
+        let mut corroboration = ClaimCorroboration::new();
+        // Difficulty 0 is never a real solution against BASE_CLAIM_REPORT_DIFFICULTY_BITS = 16
+        // for a brand-new claim/cluster pair.
+        let err = corroboration.add(&report, ClaimReportProofOfWork { nonce: 0 }, now()).unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimReportError::InsufficientProofOfWork { required_bits } if required_bits == BASE_CLAIM_REPORT_DIFFICULTY_BITS
+        ));
+        assert_eq!(corroboration.cluster_corroboration_for("claim-pow-test", "blake3:abc"), 0);
+    }
+
+    #[test]
+    fn a_second_report_from_an_already_counted_cluster_requires_no_proof_of_work() {
+        let peer_a1 = PeerIdentity::generate();
+        let peer_a2 = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a1, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        // A second peer, but the SAME already-counted cluster -- required difficulty is 0, so
+        // even a completely unsolved proof is accepted.
+        assert_eq!(corroboration.required_difficulty_bits("claim-1", "cluster-a"), 0);
+        let report = build_and_sign(&peer_a2, "claim-1", "cluster-a", "blake3:abc", now()).unwrap();
+        corroboration.add(&report, ClaimReportProofOfWork { nonce: 0 }, now()).unwrap();
+        assert_eq!(corroboration.cluster_corroboration_for("claim-1", "blake3:abc"), 1);
+    }
+
+    #[test]
+    fn required_difficulty_escalates_with_each_additional_distinct_cluster_on_one_claim() {
+        let peer_a = PeerIdentity::generate();
+        let peer_b = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+
+        assert_eq!(corroboration.required_difficulty_bits("claim-1", "cluster-a"), BASE_CLAIM_REPORT_DIFFICULTY_BITS);
+
+        add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        // A brand-new cluster now costs one extra step -- one distinct cluster already exists.
+        assert_eq!(
+            corroboration.required_difficulty_bits("claim-1", "cluster-b"),
+            BASE_CLAIM_REPORT_DIFFICULTY_BITS + CLAIM_REPORT_DIFFICULTY_STEP_BITS
+        );
+
+        // A stale proof solved at the base difficulty is no longer enough for this new cluster.
+        let report_b = build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap();
+        let stale_pow = ClaimReportProofOfWork::solve(&report_b.unsigned, BASE_CLAIM_REPORT_DIFFICULTY_BITS);
+        let err = corroboration.add(&report_b, stale_pow, now()).unwrap_err();
+        let expected_bits = BASE_CLAIM_REPORT_DIFFICULTY_BITS + CLAIM_REPORT_DIFFICULTY_STEP_BITS;
+        assert!(matches!(err, ClaimReportError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));
+    }
+
+    #[test]
+    fn a_claim_report_proof_of_work_is_bound_to_its_own_report_and_cannot_be_reused() {
+        let peer_a = PeerIdentity::generate();
+        let peer_b = PeerIdentity::generate();
+        let report_a = build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap();
+        let report_b = build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap();
+        let pow_for_a = ClaimReportProofOfWork::solve(&report_a.unsigned, BASE_CLAIM_REPORT_DIFFICULTY_BITS);
+
+        let mut corroboration = ClaimCorroboration::new();
+        // Reusing report_a's proof for report_b's (different peer/cluster) must not satisfy it.
+        let err = corroboration.add(&report_b, pow_for_a, now()).unwrap_err();
+        assert!(matches!(
+            err,
+            ClaimReportError::InsufficientProofOfWork { required_bits } if required_bits == BASE_CLAIM_REPORT_DIFFICULTY_BITS
+        ));
     }
 }

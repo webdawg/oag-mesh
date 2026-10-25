@@ -17,13 +17,17 @@ protocol entirely. Nothing in the base project needs to know this exists.
   nothing from hiding who sent it — `POST /oag-mesh/v1/bridge-declaration` just verifies and
   records it (`bridge::MeshTree::add`), the same way the base project's own signed-declaration
   endpoints work.
-- **`ClaimReport`** (`spec/05-federated-corroboration.md`) is the same shape as
-  `BridgeDeclaration` -- signed, nothing to hide, `POST /oag-mesh/v1/claim-report` just verifies
-  and records it. `GET /oag-mesh/v1/claim-report/{claim_id}/best` reads back this node's own
-  current view (not a network-wide fan-out -- see `spec/05`'s own "what this is not" section).
-  `GET /oag-mesh/v1/claim-report/{claim_id}/best-cross-checked?min_bridge_corroboration=N` reads
-  back the same thing, but cross-checked against this node's own `bridge::MeshTree` -- dropping
-  any report whose `reporter_cluster` isn't attested by a real `BridgeDeclaration` first. Same
+- **`ClaimReport`** (`spec/05-federated-corroboration.md`) is signed, same as `BridgeDeclaration`
+  -- nothing about who sent it needs hiding. `POST /oag-mesh/v1/claim-report` carries a
+  `ClaimReportSubmission { report, pow }`; it verifies the signature *and* checks the
+  `ClaimReportProofOfWork` against `ClaimCorroboration::required_difficulty_bits` (spec/05's
+  "Anti-sybil resistance" section) before recording anything, rejecting an insufficient proof
+  with `400` the same way an insufficient `AnonymousEvent` proof is. `GET
+  /oag-mesh/v1/claim-report/{claim_id}/best` reads back this node's own current view (not a
+  network-wide fan-out -- see `spec/05`'s own "what this is not" section). `GET
+  /oag-mesh/v1/claim-report/{claim_id}/best-cross-checked?min_bridge_corroboration=N` reads back
+  the same thing, but cross-checked against this node's own `bridge::MeshTree` -- dropping any
+  report whose `reporter_cluster` isn't attested by a real `BridgeDeclaration` first. Same
   node-local scope as the plain `.../best` endpoint; see `spec/05`'s "Cross-checking against
   real cluster nesting" section for exactly what that cross-check does and does not confirm.
 - **`AnonymousEvent`** (`spec/03-anonymous-event-rfc.md`) is a different story, and this is the
@@ -87,15 +91,18 @@ fabricated cluster name while the plain `.../best` endpoint still counts it, ove
   for its own event log (`hello`/`heads` + anti-entropy pull) — whether `oag-mesh` should
   eventually grow the same mechanism, or stay push-only given its different
   (lower-stakes-per-message, higher-volume) traffic pattern, is undecided.
-- **No authentication/rate-limiting on `BridgeDeclaration`/`ClaimReport` submission.** Anyone who
-  can reach a mesh node's listen address can submit either — both are still subject to signature
-  verification, but anyone can mint a fresh `PeerIdentity` for free, so verification alone
-  doesn't bound submission volume, and for `ClaimReport` specifically doesn't bound how many
-  distinct (fabricated) `reporter_cluster` values one actor can claim either. `AnonymousEvent`
-  submission costs real, escalating proof-of-work instead (`spec/03`'s "Anti-spam and
-  anti-replay") — a real mitigation, not a full solution; see that section's own stated limits
-  (doesn't stop a well-resourced attacker). No equivalent exists for `ClaimReport` yet
-  (`spec/05`'s own open question).
+- **No authentication/rate-limiting on `BridgeDeclaration` submission.** Anyone who can reach a
+  mesh node's listen address can submit one — still subject to signature verification, but
+  anyone can mint a fresh `PeerIdentity` for free, so verification alone doesn't bound submission
+  volume. `AnonymousEvent` submission costs real, escalating proof-of-work instead (`spec/03`'s
+  "Anti-spam and anti-replay"), and `ClaimReport` submission now does too (`spec/05`'s
+  "Anti-sybil resistance") — a real mitigation in both cases, not a full solution; see each
+  section's own stated limits (doesn't stop a well-resourced attacker). `BridgeDeclaration` has
+  no equivalent yet, and the gap matters more now than it did before `ClaimReport`'s cross-check
+  existed: a `BridgeDeclaration` attesting a fabricated base cluster is still free to produce,
+  which is exactly what `best_corroborated_value_cross_checked`'s "real cluster name" check relies
+  on *not* being trivially gameable at scale (`spec/05`'s own "Cross-checking against real
+  cluster nesting" section notes this directly).
 - **The `GET .../best` and `GET .../best-cross-checked` read endpoints have no auth at all.**
   Anyone who can reach the listen address can read any node's current corroboration view for any
   `claim_id` -- whether that's fine (mirroring `GET /metrics`'s "aggregate, nothing sensitive"

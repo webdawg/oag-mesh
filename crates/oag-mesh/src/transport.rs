@@ -16,7 +16,10 @@
 //!   exactly what is, and is not, achieved here -- this is a real, open gap, not an oversight.
 //! - `ClaimReport` is signed by a real identity, same as `BridgeDeclaration` -- it needs to be,
 //!   since `corroboration::ClaimCorroboration` weighs reports by the reporter's self-asserted
-//!   cluster, which only means anything if the reporter is identified at all.
+//!   cluster, which only means anything if the reporter is identified at all. Identity alone
+//!   doesn't bound how many distinct (fabricated) clusters one actor can claim, though, so a
+//!   `ClaimReport` submission also carries a `corroboration::ClaimReportProofOfWork` -- see
+//!   `receive_claim_report`'s doc comment.
 
 use std::sync::{Arc, RwLock};
 
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, MeshTree};
-use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError};
+use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -39,6 +42,16 @@ use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError};
 pub struct AnonymousEventSubmission {
     pub event: AnonymousEvent,
     pub pow: ProofOfWork,
+}
+
+/// The wire shape for `POST /oag-mesh/v1/claim-report` -- the report plus the proof-of-work that
+/// must satisfy `corroboration::ClaimCorroboration::required_difficulty_bits` for this report's
+/// `(claim_id, reporter_cluster)` (`corroboration.rs`'s own anti-sybil mechanism) before it's
+/// recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimReportSubmission {
+    pub report: ClaimReport,
+    pub pow: ClaimReportProofOfWork,
 }
 
 fn now_unix() -> i64 {
@@ -148,19 +161,28 @@ async fn receive_anonymous_event(
     }
 }
 
-/// Receives a `ClaimReport`, verifies it, and records it into `state.claim_corroboration` --
-/// same signature/pairing/clock-skew checks as a `BridgeDeclaration`, nothing about
-/// `reporter_cluster` is checked here (see `corroboration.rs`'s own doc comment on why that's a
-/// bare self-assertion, by design).
-async fn receive_claim_report(State(state): State<MeshState>, Json(report): Json<ClaimReport>) -> Response {
+/// Receives a `ClaimReportSubmission` (the report plus its proof-of-work) and records it into
+/// `state.claim_corroboration` -- same signature/pairing/clock-skew checks as a
+/// `BridgeDeclaration`, plus the escalating proof-of-work check
+/// (`corroboration::ClaimCorroboration::required_difficulty_bits`) that taxes becoming a *new*
+/// distinct cluster on a claim, rejecting an insufficient proof with `400` the same way an
+/// insufficient `AnonymousEvent` proof is. `reporter_cluster` itself is still never verified
+/// against anything (see `corroboration.rs`'s own doc comment on why that's a bare
+/// self-assertion, by design) -- proof-of-work taxes *how many* distinct clusters an actor can
+/// claim for free, not *which* cluster names are real (that's `best_corroborated_value_cross_checked`'s
+/// job, a separate check against `bridge::MeshTree`).
+async fn receive_claim_report(
+    State(state): State<MeshState>,
+    Json(submission): Json<ClaimReportSubmission>,
+) -> Response {
     let now = now_unix();
     let result = {
         let mut corroboration = state.claim_corroboration.write().unwrap();
-        corroboration.add(&report, now)
+        corroboration.add(&submission.report, submission.pow, now)
     };
     match result {
         Ok(peer_id) => {
-            tracing::info!(%peer_id, claim_id = %report.unsigned.claim_id, "claim report recorded");
+            tracing::info!(%peer_id, claim_id = %submission.report.unsigned.claim_id, "claim report recorded");
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => claim_report_error_response(e),
@@ -174,7 +196,8 @@ fn claim_report_error_response(e: ClaimReportError) -> Response {
         | ClaimReportError::PeerIdKeyMismatch
         | ClaimReportError::BadSignatureEncoding
         | ClaimReportError::BadSignature
-        | ClaimReportError::ClockSkew => StatusCode::BAD_REQUEST,
+        | ClaimReportError::ClockSkew
+        | ClaimReportError::InsufficientProofOfWork { .. } => StatusCode::BAD_REQUEST,
         ClaimReportError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
@@ -284,10 +307,16 @@ pub async fn broadcast_anonymous_event(state: &MeshState, event: &AnonymousEvent
     }
 }
 
-pub async fn push_claim_report(http: &reqwest::Client, address: &str, report: &ClaimReport) -> Result<(), PushError> {
+pub async fn push_claim_report(
+    http: &reqwest::Client,
+    address: &str,
+    report: &ClaimReport,
+    pow: ClaimReportProofOfWork,
+) -> Result<(), PushError> {
     let url = format!("{}/oag-mesh/v1/claim-report", address.trim_end_matches('/'));
+    let submission = ClaimReportSubmission { report: report.clone(), pow };
     let response =
-        http.post(&url).json(report).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+        http.post(&url).json(&submission).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
     if !response.status().is_success() {
         return Err(PushError::Rejected(address.to_string(), response.status()));
     }
@@ -298,9 +327,21 @@ pub async fn push_claim_report(http: &reqwest::Client, address: &str, report: &C
 /// strengthens across the mesh once its reports actually reach nodes in *other* clusters, which
 /// is exactly what broadcasting to every configured peer does (and, same as the other two
 /// broadcast functions, all it does -- no pull-based anti-entropy here either).
+///
+/// Solves proof-of-work once, against *this sending node's own* `state.claim_corroboration`
+/// view of `(claim_id, reporter_cluster)`, and sends the identical `(report, pow)` pair to every
+/// configured peer -- same caveat `broadcast_anonymous_event` documents for its own proof-of-work:
+/// a receiving peer with more existing distinct clusters already recorded for this claim may
+/// require a higher difficulty than this node did, and will reject this submission if so, logged
+/// as a warning like any other per-peer push failure, not retried with a harder proof.
 pub async fn broadcast_claim_report(state: &MeshState, report: &ClaimReport) {
+    let required = {
+        let corroboration = state.claim_corroboration.read().unwrap();
+        corroboration.required_difficulty_bits(&report.unsigned.claim_id, &report.unsigned.reporter_cluster)
+    };
+    let pow = ClaimReportProofOfWork::solve(&report.unsigned, required);
     for peer in state.peers.iter() {
-        if let Err(e) = push_claim_report(&state.http, peer, report).await {
+        if let Err(e) = push_claim_report(&state.http, peer, report, pow).await {
             tracing::warn!(peer, error = %e, "failed to push claim report to peer");
         }
     }
@@ -377,6 +418,18 @@ mod tests {
         assert_eq!(state_b.tree.read().unwrap().corroboration_for("global", &member), 1);
     }
 
+    /// Solves whatever proof-of-work `state`'s own `claim_corroboration` currently requires for
+    /// `report`'s `(claim_id, reporter_cluster)` -- the test-side equivalent of a real client
+    /// asking the node it's about to push to what it needs, before spending the work.
+    fn solve_claim_pow(state: &MeshState, report: &ClaimReport) -> ClaimReportProofOfWork {
+        let required = state
+            .claim_corroboration
+            .read()
+            .unwrap()
+            .required_difficulty_bits(&report.unsigned.claim_id, &report.unsigned.reporter_cluster);
+        ClaimReportProofOfWork::solve(&report.unsigned, required)
+    }
+
     fn valid_event(nonce: &str) -> AnonymousEvent {
         AnonymousEvent {
             event_id: "evt-1".to_string(),
@@ -422,13 +475,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_pushed_claim_report_is_recorded_and_queryable_over_the_wire() {
-        let (addr_a, _state_a) = spawn(vec![]).await;
+        let (addr_a, state_a) = spawn(vec![]).await;
         let identity = PeerIdentity::generate();
         let report =
             crate::corroboration::build_and_sign(&identity, "claim-transport-test", "cluster-a", "blake3:abc", now_unix())
                 .unwrap();
 
-        push_claim_report(&reqwest::Client::new(), &addr_a, &report).await.unwrap();
+        let pow = solve_claim_pow(&state_a, &report);
+        push_claim_report(&reqwest::Client::new(), &addr_a, &report, pow).await.unwrap();
 
         let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/claim-report/claim-transport-test/best"))
             .await
@@ -441,14 +495,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_tampered_claim_report_is_rejected_over_the_wire() {
-        let (addr_a, _state_a) = spawn(vec![]).await;
+        let (addr_a, state_a) = spawn(vec![]).await;
         let identity = PeerIdentity::generate();
         let mut report =
             crate::corroboration::build_and_sign(&identity, "claim-tamper-test", "cluster-a", "blake3:abc", now_unix())
                 .unwrap();
+        // Solve against the (still-untampered) report -- tampering happens after, matching a
+        // real attacker who can't re-solve a proof bound to the content they're about to change.
+        let pow = solve_claim_pow(&state_a, &report);
         report.unsigned.observed_value_hash = "blake3:tampered".to_string();
 
-        let err = push_claim_report(&reqwest::Client::new(), &addr_a, &report).await.unwrap_err();
+        let err = push_claim_report(&reqwest::Client::new(), &addr_a, &report, pow).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
     }
 
@@ -514,8 +571,10 @@ mod tests {
             now_unix(),
         )
         .unwrap();
-        push_claim_report(&reqwest::Client::new(), &addr_a, &real_report).await.unwrap();
-        push_claim_report(&reqwest::Client::new(), &addr_a, &fake_report).await.unwrap();
+        let real_pow = solve_claim_pow(&state_a, &real_report);
+        push_claim_report(&reqwest::Client::new(), &addr_a, &real_report, real_pow).await.unwrap();
+        let fake_pow = solve_claim_pow(&state_a, &fake_report);
+        push_claim_report(&reqwest::Client::new(), &addr_a, &fake_report, fake_pow).await.unwrap();
 
         // The uncross-checked view still sees both clusters.
         assert_eq!(

@@ -23,6 +23,7 @@ pub use anonymous_event::{
 };
 pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
 pub use corroboration::{
-    ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, CrossCheckedAgreement, UnsignedClaimReport,
+    ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork, CrossCheckedAgreement,
+    UnsignedClaimReport, BASE_CLAIM_REPORT_DIFFICULTY_BITS, CLAIM_REPORT_DIFFICULTY_STEP_BITS,
 };
-pub use transport::{MeshState, PushError};
+pub use transport::{ClaimReportSubmission, MeshState, PushError};

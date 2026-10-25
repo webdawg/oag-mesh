@@ -16,7 +16,8 @@ A peer that independently observes, fetches, or computes something for a `claim_
 string callers agree on out of band -- a URL, a gateway query key, a content identifier) signs a
 `ClaimReport`: "I, as a member of `reporter_cluster`, observed `observed_value_hash` for this
 claim." Signed with the same `oag_crypto::PeerIdentity` every other mechanism in this crate
-reuses, under this file's own domain string.
+reuses, under this file's own domain string. A submission also carries a `ClaimReportProofOfWork`
+-- see "Anti-sybil resistance" below for why.
 
 `reporter_cluster` is a **bare self-assertion** -- not verified against anything, not cross-checked
 against `bridge::MeshTree`'s actual cluster-nesting data. Exactly the same trust shape the base
@@ -40,6 +41,40 @@ report alone does; agreement across *different* clusters is the real signal.
 `observed_value_hash`, counts distinct clusters and distinct peers behind each value, and returns
 whichever value has the most distinct corroborating clusters (ties broken by distinct peer
 count). `cluster_corroboration_for` answers the same question for one specific value directly.
+
+## Anti-sybil resistance
+
+Signature verification alone doesn't bound how many distinct `reporter_cluster` values one actor
+can claim, because minting a fresh `PeerIdentity` costs nothing -- the exact gap this section
+previously left open. Unlike `anonymous_event.rs`, this mechanism can't lean on proof-of-work
+*instead of* identity, since `reporter_cluster` weighting only means anything if the reporter is
+identified at all. What it can do is tax the specific resource an attacker actually wants: adding
+a *new distinct cluster* to a claim's corroboration count.
+
+`ClaimReportProofOfWork` (`corroboration.rs`) mirrors `anonymous_event::ProofOfWork`'s
+blake3-based, Hashcash-style leading-zero-bit search, bound to one specific
+`(peer_id, claim_id, reporter_cluster, observed_value_hash)` combination so a solved proof can't
+be replayed for a different report. The difficulty it must meet, though, is keyed differently
+from `anonymous_event`'s per-nonce escalation:
+
+- **Free (`0` bits) if `reporter_cluster` already has a report recorded for this `claim_id`.** A
+  second peer from an already-counted cluster, or the same peer re-reporting, doesn't move
+  `distinct_clusters` at all -- there's nothing to tax, so nothing is charged.
+- **Otherwise, `BASE_CLAIM_REPORT_DIFFICULTY_BITS` plus `CLAIM_REPORT_DIFFICULTY_STEP_BITS` for
+  every distinct cluster already corroborating this claim.** Becoming the claim's first
+  corroborating cluster is cheap (so a lone genuine reporter from a brand-new claim isn't
+  deterred); becoming its fifth costs real, escalating work.
+
+`ClaimCorroboration::required_difficulty_bits(claim_id, reporter_cluster)` tells a submitting
+client what to solve for before it spends the work; `add` enforces it, rejecting an
+under-difficulty submission with `ClaimReportError::InsufficientProofOfWork` and never recording
+it -- the same "verify before you record anything" posture `AnonymousEventLog::record` uses.
+
+This raises the cost of inflating a claim's apparent cluster diversity from free to real, exactly
+like `anonymous_event.rs`'s proof-of-work does for raw report volume -- and has the identical
+limit, stated plainly rather than implied away: **it does not, and cannot, stop a well-resourced
+attacker.** A botnet solves proof-of-work exactly as fast as anyone else; what changes is that
+doing so now costs something at all, instead of nothing.
 
 ## Cross-checking against real cluster nesting
 
@@ -68,6 +103,15 @@ this over the wire (`spec/04-transport.md`), reading from the same node-local `s
 `state.claim_corroboration` the plain `.../best` endpoint does -- same "this node's own view,
 no network fan-out" scope.
 
+Worth being honest about: this cross-check's real-world value is currently bounded by
+`BridgeDeclaration` submission having no anti-sybil protection of its own (unlike `ClaimReport`,
+as of this file's "Anti-sybil resistance" section above). An attacker can still mint a
+`BridgeDeclaration` attesting a fabricated base cluster for free, satisfying
+`is_attested_base_cluster` at `min_bridge_corroboration = 1` just as easily as a real cluster
+would. Raising `min_bridge_corroboration` raises the cost (more free-but-independent-looking
+declarations needed), but doesn't close the gap -- see `spec/04-transport.md`'s open questions
+for this noted against `BridgeDeclaration` directly.
+
 ## What this explicitly is not (yet)
 
 - **No cross-check of reporting-peer standing in a cluster.** Stated above: the cross-check
@@ -76,12 +120,10 @@ no network fan-out" scope.
 - **No weighting by how deeply nested/large a cluster is.** A report from a cluster with one
   member counts exactly the same as one from a cluster with a thousand -- "distinct cluster"
   is binary, not a richer trust score.
-- **No anti-spam/sybil resistance.** Unlike `anonymous_event.rs`'s proof-of-work, there's nothing
-  here stopping one actor from minting many `PeerIdentity`s, each self-asserting a different
-  fabricated `reporter_cluster`, to inflate a claim's apparent cluster diversity for free. This
-  mechanism needs real identity (to make `reporter_cluster` meaningful at all), which rules out
-  `anonymous_event.rs`'s identity-free proof-of-work approach directly -- a different anti-sybil
-  mechanism (if any) would need to target fake *cluster* diversity specifically, not spam volume.
+- **Proof-of-work raises the cost of fake cluster diversity, it does not eliminate it.** See
+  "Anti-sybil resistance" above for what `ClaimReportProofOfWork` does and does not achieve --
+  stated there as plainly as `anonymous_event.rs`'s own identical caveat: a well-resourced
+  attacker is not stopped, only taxed.
 - **No persistence, no pull-based anti-entropy.** Same gaps as every other mechanism in this
   crate -- `ClaimCorroboration` is in-memory, and `broadcast_claim_report` is push-only.
 - **The read endpoint is node-local, not network-wide.** `GET /oag-mesh/v1/claim-report/{claim_id}/best`
@@ -92,17 +134,21 @@ no network fan-out" scope.
 
 ## Tests
 
-`crates/oag-mesh/src/corroboration.rs` (12 unit tests): sign/verify round trip and the usual
+`crates/oag-mesh/src/corroboration.rs` (16 unit tests): sign/verify round trip and the usual
 tamper/mismatched-key/stale-timestamp rejections; two reports from the same cluster count as one
 cluster's worth of corroboration; reports from different clusters corroborate more strongly than
 a lone dissenter; a peer re-reporting the same value doesn't inflate its own count; an unknown
-claim has no best value; an invalid report is never recorded; the cross-check drops a report
-claiming an unattested cluster while leaving an attested one's corroboration intact; the
-cross-check returns a `None` best value (with a non-zero drop count) when every report for a
-known claim is unattested; the cross-check against a genuinely unknown claim still returns
-`None`. `crates/oag-mesh/src/transport.rs` adds 6 more: a pushed report is recorded and
-queryable over the wire; a tampered one is rejected; `broadcast_claim_report` reaches every
-configured peer and each one independently corroborates it; querying an unknown claim returns
-`null`; `.../best-cross-checked` drops a report from a fabricated cluster while the plain
-`.../best` endpoint still counts it; `.../best-cross-checked` against an unknown claim returns a
-`null` result.
+claim has no best value; an invalid report is never recorded (proof-of-work never even checked,
+since signature verification fails first); the cross-check drops a report claiming an unattested
+cluster while leaving an attested one's corroboration intact; the cross-check returns a `None`
+best value (with a non-zero drop count) when every report for a known claim is unattested; the
+cross-check against a genuinely unknown claim still returns `None`; a report with no
+proof-of-work is rejected; a second report from an already-counted cluster requires no
+proof-of-work at all; required difficulty escalates with each additional distinct cluster on one
+claim, and a proof solved for an earlier difficulty is no longer enough; a proof-of-work is bound
+to its own report and can't be reused for a different one. `crates/oag-mesh/src/transport.rs`
+adds 6 more: a pushed report (with valid proof-of-work) is recorded and queryable over the wire;
+a tampered one is rejected; `broadcast_claim_report` reaches every configured peer and each one
+independently corroborates it; querying an unknown claim returns `null`; `.../best-cross-checked`
+drops a report from a fabricated cluster while the plain `.../best` endpoint still counts it;
+`.../best-cross-checked` against an unknown claim returns a `null` result.
