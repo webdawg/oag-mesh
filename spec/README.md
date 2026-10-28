@@ -15,6 +15,21 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | [04-transport.md](04-transport.md) | A real HTTP transport for all three mechanisms, on its own layer/port — explicit that it gives `AnonymousEvent` submission no network-level anonymity on top of its already-anonymous payload |
 | [05-federated-corroboration.md](05-federated-corroboration.md) | Signed claim reports, weighted by distinct self-asserted cluster rather than distinct peer — generalizes the base project's gateway quorum fan-out across organizational boundaries |
 
+## Proposed research-data extension (not implemented)
+
+| File | Proposal |
+|---|---|
+| [06-owner-controlled-cancer-research-data-rfc.md](06-owner-controlled-cancer-research-data-rfc.md) | Voluntary small-data collection for cancer research; the person the data concerns is its creator/owner; public dedication or encrypted vault storage with owner-selected scheduled release |
+
+This proposal is separate from anonymous emergency reports and does not add personal health
+or genetic records to `AnonymousEvent`.
+
+## Proposed object-history and audit extension (not implemented)
+
+| File | Proposal |
+|---|---|
+| [07-object-history-and-ownership-rfc.md](07-object-history-and-ownership-rfc.md) | Global object IDs and histories, ownership-gated exchange, data partnerships, documentary/distributed storage, and gated audits of movements and data correctness |
+
 ## Founding context
 
 See the base repository's `USER_INPUT_RECORD.md` Entry 24 (the verified-internet-gateway request)

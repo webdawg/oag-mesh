@@ -33,6 +33,23 @@ load-bearing, not incidental: see `USER_INPUT_RECORD.md` Entry 25 in the base re
 exact exchange that drew this line, and why a request to build this layer as mass-surveillance
 infrastructure was declined before this repository existed.
 
+## Proposed research-data extension
+
+[Owner-controlled cancer research data RFC](spec/06-owner-controlled-cancer-research-data-rfc.md)
+records a proposed, **not implemented**, opt-in mechanism for small environmental, lifestyle,
+and genetic observations. The person the data concerns is its creator and owner, choosing
+public research dedication, private encrypted vault storage, or release at an owner-selected
+date/time. This is separate from anonymous emergency messaging, not permission for passive
+population monitoring. No collector, health-data vault, or scheduled-release service exists yet.
+
+## Proposed object-history and audit extension
+
+[Object identity, ownership-gated exchange, and gated auditability](spec/07-object-history-and-ownership-rfc.md)
+is a **not implemented** protocol direction for globally addressable histories of houses,
+cars, marbles, rocks, and other objects. It covers proof of ownership, renewable data
+partnerships, documentary/distributed storage, and evidence-based audits of movements and
+record correctness. Global coverage does not grant unrestricted access or authorize tracking people.
+
 ## Status
 
 All three mechanisms are implemented: cluster nesting (`spec/02-cluster-nesting.md`), the

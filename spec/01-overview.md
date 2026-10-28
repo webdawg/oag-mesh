@@ -69,6 +69,14 @@ Three related mechanisms, one level above a single `oag` peer or peer cluster:
   independent of it — if built, it's a new `GatewayService` variant in the base project's
   `spec/32-verified-internet-gateway.md`, not part of this repository.
 
+## Proposed research-data extension (not implemented)
+
+[Owner-controlled small-data contributions for cancer research](06-owner-controlled-cancer-research-data-rfc.md)
+is a separate draft for voluntary environmental, lifestyle, and genetic observations, with
+subject-as-creator ownership and explicit public/private/scheduled-release choices. It does
+not widen `AnonymousEvent`, authorize population monitoring, or represent an implemented
+collection, vault, or release capability. See that RFC for current requirements and open decisions.
+
 ## Open design questions (not yet resolved)
 
 - Whether corroboration findings (agreement/disagreement across paths) get written back into the

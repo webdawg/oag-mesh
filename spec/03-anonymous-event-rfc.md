@@ -20,6 +20,18 @@ any public key that signs *anything* else non-anonymous anywhere (a `BridgeDecla
 project cluster declaration, a transfer receipt) links back to a real operator. This file's schema
 has no signature field at all for exactly this reason.
 
+## Related object-event and storage proposal
+
+[Global object identity, history, ownership-gated exchange, and auditability](07-object-history-and-ownership-rfc.md)
+is a separate proposed event family for houses, cars, marbles, rocks, and other uniquely
+identified objects. It includes ownership proof as part of access, bidirectional data
+partnerships, object movement/history verification, and gated audit workflows. The companion
+[Data Roads storage RFC](https://github.com/webdawg/data-roads/blob/main/rfc/0001-data-roads.md)
+adds vault, distributed, attached-tag, and deed/document storage proposals.
+
+These are **not implemented** and do not add identities, ownership documents, movement
+histories, or audit evidence to `AnonymousEvent`. The anonymity constraints below still apply.
+
 ## The strict event definition
 
 ```rust
