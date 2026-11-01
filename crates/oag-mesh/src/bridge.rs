@@ -28,6 +28,27 @@ pub const BRIDGE_DOMAIN: &str = "OAG-MESH:BRIDGE_DECLARATION:v1:";
 /// rejected just for taking an unusually long time in flight.
 pub const MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 
+/// The difficulty (in required leading zero bits, same `blake3` scheme as
+/// `anonymous_event::ProofOfWork` and `corroboration::ClaimReportProofOfWork`) for the *first*
+/// peer to declare a given `(mesh_group, member)` edge. See `MeshTree::required_difficulty_bits`
+/// for why every other declaration of the same edge -- by a peer that already declared it --
+/// costs nothing at all.
+pub const BASE_BRIDGE_DIFFICULTY_BITS: u32 = 16;
+
+/// How much the required difficulty grows for each additional distinct peer already declaring
+/// a given edge before this one. Mirrors `corroboration::CLAIM_REPORT_DIFFICULTY_STEP_BITS`'s
+/// shape exactly, substituting "distinct peer already corroborating this edge" for "distinct
+/// cluster already corroborating this claim" -- here, distinct peer *is* the resource being
+/// counted (`corroboration_for`), so that's what gets taxed directly.
+pub const BRIDGE_DIFFICULTY_STEP_BITS: u32 = 4;
+
+/// The difficulty required to be the `existing_corroboration`-th peer (0-indexed) to declare one
+/// edge -- the first peer needs `BASE_BRIDGE_DIFFICULTY_BITS`, each one after that needs
+/// `BRIDGE_DIFFICULTY_STEP_BITS` more.
+pub fn difficulty_bits_for_corroboration_number(existing_corroboration: usize) -> u32 {
+    BASE_BRIDGE_DIFFICULTY_BITS + (existing_corroboration as u32) * BRIDGE_DIFFICULTY_STEP_BITS
+}
+
 /// What's being placed into a mesh-group: either a base-layer `spec/26` cluster, referenced by
 /// its plain `[cluster].name` string (a leaf), or another mesh-group, referenced by name
 /// (an interior node) -- this recursion is what "clusters within clusters" means concretely.
@@ -72,8 +93,73 @@ pub enum BridgeError {
     ClockSkew,
     #[error("a mesh-group cannot declare itself as its own member (direct self-reference)")]
     SelfReference,
+    #[error("proof of work does not meet the required {required_bits} leading zero bits for this (mesh_group, member) edge")]
+    InsufficientProofOfWork { required_bits: u32 },
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// Anti-sybil proof-of-work for a `BridgeDeclaration` -- same motivation as
+/// `corroboration::ClaimReportProofOfWork`: signature verification alone doesn't bound how many
+/// fresh `PeerIdentity`s one actor can mint to independently "declare" the same
+/// `(mesh_group, member)` edge, inflating `MeshTree::corroboration_for`'s distinct-peer count for
+/// free. This matters more than it might otherwise, because `corroboration::ClaimCorroboration::
+/// best_corroborated_value_cross_checked` leans on `MeshTree::is_attested_base_cluster` to decide
+/// whether a claimed cluster name is "real" -- a sybil-inflated or freely-fabricated edge here
+/// would have let that cross-check be gamed just as cheaply as the thing it was built to catch.
+/// Same "raises cost, doesn't eliminate" caveat as every other proof-of-work in this crate: a
+/// well-resourced attacker is not stopped, only taxed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeProofOfWork {
+    pub nonce: u64,
+}
+
+/// Binds the proof to this specific `(peer_id, mesh_group, member)` combination -- a solved
+/// proof for one peer's declaration of one edge cannot be replayed for a different peer, group,
+/// or member.
+fn bridge_pow_hash(unsigned: &UnsignedBridgeDeclaration, pow: &BridgeProofOfWork) -> Result<blake3::Hash, BridgeError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"OAG-MESH:BRIDGE_DECLARATION_POW:v1:");
+    hasher.update(unsigned.peer_id.as_bytes());
+    hasher.update(unsigned.mesh_group.as_bytes());
+    let member_bytes =
+        oag_core::canonical_json_bytes(&unsigned.member).map_err(|e| BridgeError::Internal(e.to_string()))?;
+    hasher.update(&member_bytes);
+    hasher.update(&pow.nonce.to_le_bytes());
+    Ok(hasher.finalize())
+}
+
+fn leading_zero_bits(hash: &blake3::Hash) -> u32 {
+    let mut count = 0;
+    for &byte in hash.as_bytes() {
+        if byte == 0 {
+            count += 8;
+        } else {
+            count += byte.leading_zeros();
+            break;
+        }
+    }
+    count
+}
+
+impl BridgeProofOfWork {
+    /// The client-side work: searches for a `nonce` whose `bridge_pow_hash` has at least
+    /// `difficulty_bits` leading zero bits. A real submitting client calls
+    /// `MeshTree::required_difficulty_bits` first to know what to solve for.
+    pub fn solve(unsigned: &UnsignedBridgeDeclaration, difficulty_bits: u32) -> Self {
+        let mut nonce = 0u64;
+        loop {
+            let candidate = BridgeProofOfWork { nonce };
+            match bridge_pow_hash(unsigned, &candidate) {
+                Ok(hash) if leading_zero_bits(&hash) >= difficulty_bits => return candidate,
+                _ => nonce += 1,
+            }
+        }
+    }
+
+    fn satisfies(&self, unsigned: &UnsignedBridgeDeclaration, difficulty_bits: u32) -> Result<bool, BridgeError> {
+        Ok(leading_zero_bits(&bridge_pow_hash(unsigned, self)?) >= difficulty_bits)
+    }
 }
 
 fn decode_32(s: &str) -> Option<[u8; 32]> {
@@ -157,11 +243,36 @@ impl MeshTree {
         Self::default()
     }
 
-    /// Verifies `declaration` and, if valid, records it. Returns the declaring peer's `PeerId`
-    /// on success. A declaration that fails verification is never recorded -- same "verify
-    /// before you trust it at all" posture as everything else in this family of protocols.
-    pub fn add(&mut self, declaration: &BridgeDeclaration, now: i64) -> Result<PeerId, BridgeError> {
+    /// The proof-of-work difficulty a declaration of `(mesh_group, member)` by `peer_id` must
+    /// currently meet, per `difficulty_bits_for_corroboration_number`. **Free (`0` bits, always
+    /// satisfied) if `peer_id` has already declared this edge** -- re-declaring it doesn't
+    /// increase `corroboration_for`, so there is nothing to tax. Otherwise, the cost of becoming
+    /// the next *new* distinct peer corroborating this edge, scaled by how many already have. A
+    /// submitting client should call this before spending work solving a `BridgeProofOfWork`.
+    pub fn required_difficulty_bits(&self, mesh_group: &str, member: &MeshMember, peer_id: &PeerId) -> u32 {
+        let Some(peers) = self.edges.get(&(mesh_group.to_string(), member.clone())) else {
+            return BASE_BRIDGE_DIFFICULTY_BITS;
+        };
+        if peers.contains(peer_id) {
+            return 0;
+        }
+        difficulty_bits_for_corroboration_number(peers.len())
+    }
+
+    /// Verifies `declaration`, checks `pow` against `required_difficulty_bits` for this
+    /// declaration's `(mesh_group, member, peer_id)` *at the moment this is called* -- same
+    /// reasoning as `corroboration::ClaimCorroboration::add`, only this struct knows how many
+    /// distinct peers already corroborate the edge -- and if both pass, records it. Returns the
+    /// declaring peer's `PeerId` on success. A declaration that fails verification, or whose
+    /// proof-of-work is insufficient, is never recorded -- same "verify before you trust it at
+    /// all" posture as everything else in this family of protocols.
+    pub fn add(&mut self, declaration: &BridgeDeclaration, pow: BridgeProofOfWork, now: i64) -> Result<PeerId, BridgeError> {
         let peer_id = verify(declaration, now)?;
+        let required_bits =
+            self.required_difficulty_bits(&declaration.unsigned.mesh_group, &declaration.unsigned.member, &peer_id);
+        if !pow.satisfies(&declaration.unsigned, required_bits)? {
+            return Err(BridgeError::InsufficientProofOfWork { required_bits });
+        }
         self.edges
             .entry((declaration.unsigned.mesh_group.clone(), declaration.unsigned.member.clone()))
             .or_default()
@@ -242,6 +353,17 @@ impl MeshTree {
 mod tests {
     use super::*;
 
+    /// Solves whatever proof-of-work `tree` currently requires for `decl`'s
+    /// `(mesh_group, member, peer_id)`, then adds it -- the test-side equivalent of a real
+    /// client calling `required_difficulty_bits` before submitting (mirrors
+    /// `anonymous_event.rs`'s and `corroboration.rs`'s own identical test helpers).
+    fn add_with_fresh_pow(tree: &mut MeshTree, decl: &BridgeDeclaration, now: i64) -> Result<PeerId, BridgeError> {
+        let peer_id: PeerId = decl.unsigned.peer_id.parse().unwrap();
+        let required = tree.required_difficulty_bits(&decl.unsigned.mesh_group, &decl.unsigned.member, &peer_id);
+        let pow = BridgeProofOfWork::solve(&decl.unsigned, required);
+        tree.add(decl, pow, now)
+    }
+
     #[test]
     fn declaration_sign_and_verify_round_trip() {
         let identity = PeerIdentity::generate();
@@ -299,19 +421,19 @@ mod tests {
 
         let decl_a =
             build_and_sign(&a, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap();
-        tree.add(&decl_a, 1_010).unwrap();
+        add_with_fresh_pow(&mut tree, &decl_a, 1_010).unwrap();
         assert_eq!(tree.corroboration_for("north-america", &MeshMember::BaseCluster("ny-dc1".into())), 1);
 
         // The same peer re-declaring the identical fact must not inflate corroboration.
         let decl_a_again =
             build_and_sign(&a, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_001).unwrap();
-        tree.add(&decl_a_again, 1_011).unwrap();
+        add_with_fresh_pow(&mut tree, &decl_a_again, 1_011).unwrap();
         assert_eq!(tree.corroboration_for("north-america", &MeshMember::BaseCluster("ny-dc1".into())), 1);
 
         // A genuinely different peer declaring the same fact does.
         let decl_b =
             build_and_sign(&b, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap();
-        tree.add(&decl_b, 1_010).unwrap();
+        add_with_fresh_pow(&mut tree, &decl_b, 1_010).unwrap();
         assert_eq!(tree.corroboration_for("north-america", &MeshMember::BaseCluster("ny-dc1".into())), 2);
     }
 
@@ -322,7 +444,9 @@ mod tests {
             build_and_sign(&identity, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap();
         decl.unsigned.mesh_group = "tampered".to_string();
         let mut tree = MeshTree::new();
-        assert!(tree.add(&decl, 1_010).is_err());
+        // A tampered declaration fails signature verification before proof-of-work is even
+        // checked, so an unsolved (zero) nonce is fine here -- it must never be reached.
+        assert!(tree.add(&decl, BridgeProofOfWork { nonce: 0 }, 1_010).is_err());
         assert_eq!(tree.corroboration_for("tampered", &MeshMember::BaseCluster("ny-dc1".into())), 0);
     }
 
@@ -333,27 +457,32 @@ mod tests {
 
         // "clusters within clusters": global contains north-america and europe (mesh-groups);
         // north-america contains two base clusters.
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "global", MeshMember::MeshGroup("north-america".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "global", MeshMember::MeshGroup("europe".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "north-america", MeshMember::BaseCluster("sf-dc1".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "europe", MeshMember::BaseCluster("fra-dc1".into()), 1_000).unwrap(),
             1_010,
         )
@@ -372,17 +501,20 @@ mod tests {
         let mut tree = MeshTree::new();
         // group-a contains group-b, group-b contains group-a -- a cyclical topology, caller
         // error, must not infinite-loop.
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "group-a", MeshMember::MeshGroup("group-b".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "group-b", MeshMember::MeshGroup("group-a".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "group-b", MeshMember::BaseCluster("leaf1".into()), 1_000).unwrap(),
             1_010,
         )
@@ -398,7 +530,8 @@ mod tests {
         let b = PeerIdentity::generate();
         let mut tree = MeshTree::new();
 
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "global", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
             1_010,
         )
@@ -408,7 +541,8 @@ mod tests {
         assert!(!tree.is_attested_base_cluster("ny-dc1", 2));
         assert!(!tree.is_attested_base_cluster("made-up-cluster", 1));
 
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&b, "global", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
             1_010,
         )
@@ -422,17 +556,20 @@ mod tests {
         let b = PeerIdentity::generate();
         let mut tree = MeshTree::new();
 
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "global", MeshMember::BaseCluster("weakly-claimed".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&a, "global", MeshMember::BaseCluster("strongly-claimed".into()), 1_000).unwrap(),
             1_010,
         )
         .unwrap();
-        tree.add(
+        add_with_fresh_pow(
+            &mut tree,
             &build_and_sign(&b, "global", MeshMember::BaseCluster("strongly-claimed".into()), 1_000).unwrap(),
             1_010,
         )
@@ -443,5 +580,87 @@ mod tests {
 
         let both = tree.members_of("global", 1);
         assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn a_declaration_with_no_proof_of_work_is_rejected() {
+        let identity = PeerIdentity::generate();
+        let decl = build_and_sign(&identity, "global", MeshMember::BaseCluster("pow-test".into()), 1_000).unwrap();
+        let mut tree = MeshTree::new();
+        // Difficulty 0 is never a real solution against BASE_BRIDGE_DIFFICULTY_BITS = 16 for a
+        // brand-new edge.
+        let err = tree.add(&decl, BridgeProofOfWork { nonce: 0 }, 1_010).unwrap_err();
+        assert!(matches!(
+            err,
+            BridgeError::InsufficientProofOfWork { required_bits } if required_bits == BASE_BRIDGE_DIFFICULTY_BITS
+        ));
+        assert_eq!(tree.corroboration_for("global", &MeshMember::BaseCluster("pow-test".into())), 0);
+    }
+
+    #[test]
+    fn a_peer_re_declaring_an_edge_it_already_declared_requires_no_proof_of_work() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+
+        let decl = build_and_sign(&a, "global", MeshMember::BaseCluster("re-declare-test".into()), 1_000).unwrap();
+        add_with_fresh_pow(&mut tree, &decl, 1_010).unwrap();
+
+        // The same peer declaring the same edge again (e.g. a fresh timestamp) costs nothing --
+        // it can't increase corroboration_for, which is already counting this peer.
+        let decl_again =
+            build_and_sign(&a, "global", MeshMember::BaseCluster("re-declare-test".into()), 1_001).unwrap();
+        let peer_id = a.peer_id();
+        assert_eq!(
+            tree.required_difficulty_bits("global", &MeshMember::BaseCluster("re-declare-test".into()), &peer_id),
+            0
+        );
+        tree.add(&decl_again, BridgeProofOfWork { nonce: 0 }, 1_011).unwrap();
+        assert_eq!(tree.corroboration_for("global", &MeshMember::BaseCluster("re-declare-test".into())), 1);
+    }
+
+    #[test]
+    fn required_difficulty_escalates_with_each_additional_distinct_peer_on_one_edge() {
+        let a = PeerIdentity::generate();
+        let b = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+        let member = MeshMember::BaseCluster("escalation-test".into());
+
+        assert_eq!(
+            tree.required_difficulty_bits("global", &member, &a.peer_id()),
+            BASE_BRIDGE_DIFFICULTY_BITS
+        );
+
+        add_with_fresh_pow(&mut tree, &build_and_sign(&a, "global", member.clone(), 1_000).unwrap(), 1_010).unwrap();
+
+        // A second, genuinely new peer now costs one extra step -- one distinct peer already
+        // corroborates this edge.
+        assert_eq!(
+            tree.required_difficulty_bits("global", &member, &b.peer_id()),
+            BASE_BRIDGE_DIFFICULTY_BITS + BRIDGE_DIFFICULTY_STEP_BITS
+        );
+
+        // A stale proof solved at the base difficulty is no longer enough for peer b.
+        let decl_b = build_and_sign(&b, "global", member.clone(), 1_000).unwrap();
+        let stale_pow = BridgeProofOfWork::solve(&decl_b.unsigned, BASE_BRIDGE_DIFFICULTY_BITS);
+        let err = tree.add(&decl_b, stale_pow, 1_010).unwrap_err();
+        let expected_bits = BASE_BRIDGE_DIFFICULTY_BITS + BRIDGE_DIFFICULTY_STEP_BITS;
+        assert!(matches!(err, BridgeError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));
+    }
+
+    #[test]
+    fn a_bridge_proof_of_work_is_bound_to_its_own_declaration_and_cannot_be_reused() {
+        let a = PeerIdentity::generate();
+        let b = PeerIdentity::generate();
+        let decl_a = build_and_sign(&a, "global", MeshMember::BaseCluster("binding-test-a".into()), 1_000).unwrap();
+        let decl_b = build_and_sign(&b, "global", MeshMember::BaseCluster("binding-test-b".into()), 1_000).unwrap();
+        let pow_for_a = BridgeProofOfWork::solve(&decl_a.unsigned, BASE_BRIDGE_DIFFICULTY_BITS);
+
+        let mut tree = MeshTree::new();
+        // Reusing decl_a's proof for decl_b's (different peer/group/member) must not satisfy it.
+        let err = tree.add(&decl_b, pow_for_a, 1_010).unwrap_err();
+        assert!(matches!(
+            err,
+            BridgeError::InsufficientProofOfWork { required_bits } if required_bits == BASE_BRIDGE_DIFFICULTY_BITS
+        ));
     }
 }

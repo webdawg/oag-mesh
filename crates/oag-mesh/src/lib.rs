@@ -21,9 +21,12 @@ pub use anonymous_event::{
     AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventKind, MedicalEmergencyKind,
     ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
 };
-pub use bridge::{BridgeDeclaration, BridgeError, MeshMember, MeshTree, UnsignedBridgeDeclaration};
+pub use bridge::{
+    BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree, UnsignedBridgeDeclaration,
+    BASE_BRIDGE_DIFFICULTY_BITS, BRIDGE_DIFFICULTY_STEP_BITS,
+};
 pub use corroboration::{
     ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork, CrossCheckedAgreement,
     UnsignedClaimReport, BASE_CLAIM_REPORT_DIFFICULTY_BITS, CLAIM_REPORT_DIFFICULTY_STEP_BITS,
 };
-pub use transport::{ClaimReportSubmission, MeshState, PushError};
+pub use transport::{BridgeDeclarationSubmission, ClaimReportSubmission, MeshState, PushError};

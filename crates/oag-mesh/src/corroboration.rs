@@ -534,12 +534,11 @@ mod tests {
         let mut tree = bridge::MeshTree::new();
 
         // Only "cluster-a" is ever attested by a real BridgeDeclaration.
-        tree.add(
-            &bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("cluster-a".into()), now())
-                .unwrap(),
-            now(),
-        )
-        .unwrap();
+        let bridge_decl =
+            bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("cluster-a".into()), now())
+                .unwrap();
+        let bridge_pow = bridge::BridgeProofOfWork::solve(&bridge_decl.unsigned, bridge::BASE_BRIDGE_DIFFICULTY_BITS);
+        tree.add(&bridge_decl, bridge_pow, now()).unwrap();
 
         add_with_fresh_pow(&mut corroboration, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
         // cluster-b is never attested anywhere in the tree -- a fabricated cluster claim.

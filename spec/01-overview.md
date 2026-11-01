@@ -1,12 +1,14 @@
 # Overview
 
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), with a
-real HTTP transport for all of them (`spec/04-transport.md`). `spec/05`'s claim reports now carry
-their own escalating proof-of-work ("Anti-sybil resistance") and are cross-checked against real
-cluster nesting for half the gap that mattered (the cluster *name* being real) -- see `spec/05`'s
-own sections for exactly what each does and does not cover. Dispatch-to-a-responder for
-anonymous events, confirming a reporting peer's actual *standing* in the cluster it claims, and
-any anti-sybil protection on `BridgeDeclaration` submission itself, are not.**
+real HTTP transport for all of them (`spec/04-transport.md`). All three now require escalating
+proof-of-work before recording a submission (`spec/02`'s, `spec/03`'s, and `spec/05`'s own
+"Anti-sybil"/"Anti-spam" sections), and `spec/05`'s claim reports are cross-checked against real
+cluster nesting for half the gap that mattered (the cluster *name* being real) -- see `spec/02`'s
+and `spec/05`'s own sections for exactly what each does and does not cover. Dispatch-to-a-
+responder for anonymous events, confirming a reporting peer's actual *standing* in the cluster it
+claims, and verifying that distinct `PeerIdentity`s are genuinely different organizations (not
+just different keys), are not.**
 
 ## What this layer is
 
@@ -22,7 +24,11 @@ Three related mechanisms, one level above a single `oag` peer or peer cluster:
    project is completely untouched; a `[cluster].name` keeps meaning exactly what it already
    means there. Two base clusters nested under the same mesh-group stay distinct federation
    domains; nesting is a fact tracked here, not a change to how the base project's own
-   `FederationPolicy`/trust configuration works for either cluster's members.
+   `FederationPolicy`/trust configuration works for either cluster's members. A declaration now
+   also carries escalating proof-of-work (`spec/02`'s "Anti-sybil resistance") taxing the cost of
+   becoming a *new* distinct peer corroborating an edge — this matters beyond mechanism (1) on
+   its own, since mechanism (2)'s cross-check (below) leans on this mechanism's data to decide
+   whether a claimed cluster name is real.
 2. **Federated corroboration, implemented — see `spec/05-federated-corroboration.md`.** Multiple
    independently-operated nodes (potentially across different clusters/organizations) receive or
    fetch the *same* claim, content, or gateway answer, each through its own path, and sign a
@@ -89,17 +95,23 @@ collection, vault, or release capability. See that RFC for current requirements 
   different (and weaker) kind of "independent enough."
 - A real HTTP transport exists now for all three mechanisms (`spec/04-transport.md`), push-only
   with no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent`
-  submissions any network-level anonymity on top of their already-anonymous payload. Both
-  `AnonymousEvent` (`spec/03`'s "Anti-spam and anti-replay") and `ClaimReport` (`spec/05`'s
-  "Anti-sybil resistance") now require escalating proof-of-work before being recorded -- real
-  mitigations, not full solutions, and each says so explicitly: neither stops a well-resourced
-  attacker, only taxes the specific thing each mechanism's corroboration count depends on (raw
-  report volume under a nonce, vs. a new distinct cluster on a claim). `BridgeDeclaration`
-  submission has no equivalent protection at all yet -- see `spec/04-transport.md`'s open
-  questions for why that specifically limits `ClaimReport`'s cross-check against real cluster
-  nesting (`spec/05`'s own section on that). And even with proof-of-work, a fabricated claim of
-  *membership* in a real, already-attested cluster is still not caught by anything here --
-  minting fresh `PeerIdentity`s that each pay the escalating proof-of-work to claim a real
+  submissions any network-level anonymity on top of their already-anonymous payload. All three
+  message types now require escalating proof-of-work before being recorded --
+  `BridgeDeclaration` (`spec/02`'s "Anti-sybil resistance"), `AnonymousEvent` (`spec/03`'s
+  "Anti-spam and anti-replay"), and `ClaimReport` (`spec/05`'s "Anti-sybil resistance") -- real
+  mitigations, not full solutions, and each says so explicitly: none stops a well-resourced
+  attacker, each only taxes the specific thing its own mechanism's corroboration count depends on
+  (a new distinct peer on a mesh edge, raw report volume under a nonce, or a new distinct cluster
+  on a claim, respectively).
+- **Proof-of-work bounds cost, not identity.** Across all three mechanisms, a well-resourced
+  single operator can still pay the escalating cost to mint several real, distinct
+  `PeerIdentity`s and have each independently corroborate the same fact -- proof-of-work makes
+  that cost something instead of nothing, it does not verify the identities behind it are
+  genuinely different organizations. This is the same "independent enough" gap as the bullet
+  above, now stated once for all three mechanisms rather than per-mechanism: no amount of
+  proof-of-work alone, as designed here, resolves it. And even with proof-of-work, a fabricated
+  claim of *membership* in a real, already-attested cluster is still not caught by anything here
+  -- minting fresh `PeerIdentity`s that each pay the escalating proof-of-work to claim a real
   cluster name they have no actual standing in still works, just no longer for free. See
   `spec/02`'s, `spec/03`'s, `spec/04`'s, and `spec/05`'s own "open questions" sections for what
   else is still unresolved.

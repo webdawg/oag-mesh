@@ -14,9 +14,11 @@ protocol entirely. Nothing in the base project needs to know this exists.
 ## Three message types, different transport guarantees
 
 - **`BridgeDeclaration`** (`spec/02-cluster-nesting.md`) is signed by a real identity and gains
-  nothing from hiding who sent it — `POST /oag-mesh/v1/bridge-declaration` just verifies and
-  records it (`bridge::MeshTree::add`), the same way the base project's own signed-declaration
-  endpoints work.
+  nothing from hiding who sent it. `POST /oag-mesh/v1/bridge-declaration` carries a
+  `BridgeDeclarationSubmission { declaration, pow }`; it verifies the signature *and* checks the
+  `BridgeProofOfWork` against `MeshTree::required_difficulty_bits` (`spec/02`'s "Anti-sybil
+  resistance" section) before recording anything, rejecting an insufficient proof with `400` the
+  same way the other two mechanisms' proofs are.
 - **`ClaimReport`** (`spec/05-federated-corroboration.md`) is signed, same as `BridgeDeclaration`
   -- nothing about who sent it needs hiding. `POST /oag-mesh/v1/claim-report` carries a
   `ClaimReportSubmission { report, pow }`; it verifies the signature *and* checks the
@@ -63,22 +65,26 @@ hidden one.
 `anonymous_event::AnonymousEventLog::record` enforces the escalating proof-of-work check
 (`spec/03-anonymous-event-rfc.md`'s "Anti-spam and anti-replay") before recording anything, so a
 submission with no or insufficient proof-of-work is rejected here with `400` the same way a
-tampered `BridgeDeclaration` is.
+tampered `BridgeDeclaration` or an under-difficulty `ClaimReportSubmission` is. All three message
+types now carry a proof-of-work alongside their payload over the wire -- the one difference left
+between them is what each proof is actually bound to and what resource it taxes (see each
+mechanism's own "Anti-spam"/"Anti-sybil resistance" section).
 
 ## Tests
 
 `crates/oag-mesh/src/transport.rs` (12 integration tests, real axum servers bound to real
-loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` is recorded and
-corroborated on the receiving side; a tampered declaration is rejected over the wire with `400`
-and never recorded; `broadcast_bridge_declaration` reaches every one of several independently
-running peers; a pushed `AnonymousEvent` (with valid proof-of-work) is recorded; an invalid one
-(unrounded timestamp) is rejected over the wire and never recorded; one with insufficient
-proof-of-work is rejected over the wire and never recorded; a pushed `ClaimReport` is recorded
-and readable back over `GET .../best`; a tampered one is rejected over the wire;
-`broadcast_claim_report` reaches every configured peer and each independently corroborates it;
-querying an unknown claim returns `null`; `GET .../best-cross-checked` drops a report claiming a
-fabricated cluster name while the plain `.../best` endpoint still counts it, over the wire;
-`.../best-cross-checked` against an unknown claim returns a `null` result.
+loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` (with valid
+proof-of-work) is recorded and corroborated on the receiving side; a tampered declaration is
+rejected over the wire with `400` and never recorded; `broadcast_bridge_declaration` reaches
+every one of several independently running peers; a pushed `AnonymousEvent` (with valid
+proof-of-work) is recorded; an invalid one (unrounded timestamp) is rejected over the wire and
+never recorded; one with insufficient proof-of-work is rejected over the wire and never recorded;
+a pushed `ClaimReport` (with valid proof-of-work) is recorded and readable back over
+`GET .../best`; a tampered one is rejected over the wire; `broadcast_claim_report` reaches every
+configured peer and each independently corroborates it; querying an unknown claim returns `null`;
+`GET .../best-cross-checked` drops a report claiming a fabricated cluster name while the plain
+`.../best` endpoint still counts it, over the wire; `.../best-cross-checked` against an unknown
+claim returns a `null` result.
 
 ## Open questions (genuinely unresolved)
 
@@ -91,18 +97,20 @@ fabricated cluster name while the plain `.../best` endpoint still counts it, ove
   for its own event log (`hello`/`heads` + anti-entropy pull) — whether `oag-mesh` should
   eventually grow the same mechanism, or stay push-only given its different
   (lower-stakes-per-message, higher-volume) traffic pattern, is undecided.
-- **No authentication/rate-limiting on `BridgeDeclaration` submission.** Anyone who can reach a
-  mesh node's listen address can submit one — still subject to signature verification, but
-  anyone can mint a fresh `PeerIdentity` for free, so verification alone doesn't bound submission
-  volume. `AnonymousEvent` submission costs real, escalating proof-of-work instead (`spec/03`'s
-  "Anti-spam and anti-replay"), and `ClaimReport` submission now does too (`spec/05`'s
-  "Anti-sybil resistance") — a real mitigation in both cases, not a full solution; see each
-  section's own stated limits (doesn't stop a well-resourced attacker). `BridgeDeclaration` has
-  no equivalent yet, and the gap matters more now than it did before `ClaimReport`'s cross-check
-  existed: a `BridgeDeclaration` attesting a fabricated base cluster is still free to produce,
-  which is exactly what `best_corroborated_value_cross_checked`'s "real cluster name" check relies
-  on *not* being trivially gameable at scale (`spec/05`'s own "Cross-checking against real
-  cluster nesting" section notes this directly).
+- **All three submission types now cost real, escalating proof-of-work, but none of them stop a
+  well-resourced attacker.** `AnonymousEvent` (`spec/03`'s "Anti-spam and anti-replay"),
+  `ClaimReport` (`spec/05`'s "Anti-sybil resistance"), and `BridgeDeclaration` (`spec/02`'s
+  "Anti-sybil resistance") each tax a different specific resource -- raw report volume under a
+  nonce, a new distinct cluster on a claim, and a new distinct peer on a mesh edge, respectively
+  -- and each says so plainly: a botnet solves proof-of-work exactly as fast as anyone else, so
+  this raises cost from free to real, it does not bound submission volume outright. Minting many
+  real `PeerIdentity`s and paying for each one is still a working (if no longer free) attack on
+  every mechanism here.
+- **Proof-of-work doesn't verify *who* a peer really is, only that solving a puzzle cost
+  something.** A well-resourced single operator can solve enough proof-of-work to mint several
+  real, distinct `PeerIdentity`s and look just as independent as genuinely separate
+  organizations -- across all three mechanisms. See `spec/01-overview.md`'s open questions for
+  this stated as the remaining "independent enough" gap.
 - **The `GET .../best` and `GET .../best-cross-checked` read endpoints have no auth at all.**
   Anyone who can reach the listen address can read any node's current corroboration view for any
   `claim_id` -- whether that's fine (mirroring `GET /metrics`'s "aggregate, nothing sensitive"

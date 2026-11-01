@@ -103,14 +103,15 @@ this over the wire (`spec/04-transport.md`), reading from the same node-local `s
 `state.claim_corroboration` the plain `.../best` endpoint does -- same "this node's own view,
 no network fan-out" scope.
 
-Worth being honest about: this cross-check's real-world value is currently bounded by
-`BridgeDeclaration` submission having no anti-sybil protection of its own (unlike `ClaimReport`,
-as of this file's "Anti-sybil resistance" section above). An attacker can still mint a
-`BridgeDeclaration` attesting a fabricated base cluster for free, satisfying
-`is_attested_base_cluster` at `min_bridge_corroboration = 1` just as easily as a real cluster
-would. Raising `min_bridge_corroboration` raises the cost (more free-but-independent-looking
-declarations needed), but doesn't close the gap -- see `spec/04-transport.md`'s open questions
-for this noted against `BridgeDeclaration` directly.
+Worth being honest about: `BridgeDeclaration` submission now also costs escalating proof-of-work
+(`spec/02-cluster-nesting.md`'s "Anti-sybil resistance"), closing the specific gap this section
+used to flag -- fabricating a `BridgeDeclaration` to feed this cross-check is no longer free.
+That raises the cost, it does not eliminate it: a well-resourced attacker can still pay the
+escalating cost to mint several real, distinct `PeerIdentity`s and have each declare the same
+fabricated cluster, satisfying `is_attested_base_cluster` at a higher `min_bridge_corroboration`
+than before, just not for free anymore. Proof-of-work bounds *how cheaply* an edge's
+corroboration can be inflated; it does not verify that the declaring peers are genuinely
+different organizations (see `spec/01-overview.md`'s open questions for that remaining gap).
 
 ## What this explicitly is not (yet)
 

@@ -29,10 +29,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use oag_crypto::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
-use crate::bridge::{BridgeDeclaration, BridgeError, MeshTree};
+use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
@@ -52,6 +53,16 @@ pub struct AnonymousEventSubmission {
 pub struct ClaimReportSubmission {
     pub report: ClaimReport,
     pub pow: ClaimReportProofOfWork,
+}
+
+/// The wire shape for `POST /oag-mesh/v1/bridge-declaration` -- the declaration plus the
+/// proof-of-work that must satisfy `bridge::MeshTree::required_difficulty_bits` for this
+/// declaration's `(mesh_group, member, peer_id)` (`bridge.rs`'s own anti-sybil mechanism)
+/// before it's recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeDeclarationSubmission {
+    pub declaration: BridgeDeclaration,
+    pub pow: BridgeProofOfWork,
 }
 
 fn now_unix() -> i64 {
@@ -106,15 +117,23 @@ pub async fn run(state: MeshState, listen_addr: &str) -> std::io::Result<()> {
     axum::serve(listener, router(state)).await
 }
 
-async fn receive_bridge_declaration(State(state): State<MeshState>, Json(decl): Json<BridgeDeclaration>) -> Response {
+/// Receives a `BridgeDeclarationSubmission` (the declaration plus its proof-of-work) and
+/// records it into `state.tree` -- same signature/pairing/clock-skew checks as before, plus the
+/// escalating proof-of-work check (`bridge::MeshTree::required_difficulty_bits`) that taxes
+/// becoming a *new* distinct peer corroborating a `(mesh_group, member)` edge, rejecting an
+/// insufficient proof with `400` the same way the other two mechanisms' proofs are.
+async fn receive_bridge_declaration(
+    State(state): State<MeshState>,
+    Json(submission): Json<BridgeDeclarationSubmission>,
+) -> Response {
     let now = now_unix();
     let result = {
         let mut tree = state.tree.write().unwrap();
-        tree.add(&decl, now)
+        tree.add(&submission.declaration, submission.pow, now)
     };
     match result {
         Ok(peer_id) => {
-            tracing::info!(%peer_id, mesh_group = %decl.unsigned.mesh_group, "bridge declaration recorded");
+            tracing::info!(%peer_id, mesh_group = %submission.declaration.unsigned.mesh_group, "bridge declaration recorded");
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => bridge_error_response(e),
@@ -129,7 +148,8 @@ fn bridge_error_response(e: BridgeError) -> Response {
         | BridgeError::BadSignatureEncoding
         | BridgeError::BadSignature
         | BridgeError::ClockSkew
-        | BridgeError::SelfReference => StatusCode::BAD_REQUEST,
+        | BridgeError::SelfReference
+        | BridgeError::InsufficientProofOfWork { .. } => StatusCode::BAD_REQUEST,
         BridgeError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
@@ -250,10 +270,16 @@ pub enum PushError {
     Rejected(String, StatusCode),
 }
 
-pub async fn push_bridge_declaration(http: &reqwest::Client, address: &str, decl: &BridgeDeclaration) -> Result<(), PushError> {
+pub async fn push_bridge_declaration(
+    http: &reqwest::Client,
+    address: &str,
+    decl: &BridgeDeclaration,
+    pow: BridgeProofOfWork,
+) -> Result<(), PushError> {
     let url = format!("{}/oag-mesh/v1/bridge-declaration", address.trim_end_matches('/'));
+    let submission = BridgeDeclarationSubmission { declaration: decl.clone(), pow };
     let response =
-        http.post(&url).json(decl).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+        http.post(&url).json(&submission).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
     if !response.status().is_success() {
         return Err(PushError::Rejected(address.to_string(), response.status()));
     }
@@ -281,9 +307,24 @@ pub async fn push_anonymous_event(
 /// there is no pull-based anti-entropy here yet (see `spec/04-transport.md`'s open questions), so
 /// a peer that's offline when this runs simply never gets it unless something else re-pushes it
 /// later.
+///
+/// Solves proof-of-work once, against *this sending node's own* `state.tree` view of
+/// `(mesh_group, member, peer_id)`, and sends the identical `(decl, pow)` pair to every
+/// configured peer -- same caveat `broadcast_claim_report` documents for its own proof-of-work:
+/// a receiving peer with more existing distinct peers already corroborating this edge may
+/// require a higher difficulty than this node did, and will reject this submission if so.
 pub async fn broadcast_bridge_declaration(state: &MeshState, decl: &BridgeDeclaration) {
+    let peer_id: PeerId = match decl.unsigned.peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return, // malformed peer_id -- nothing to broadcast, verify() will reject it anyway
+    };
+    let required = {
+        let tree = state.tree.read().unwrap();
+        tree.required_difficulty_bits(&decl.unsigned.mesh_group, &decl.unsigned.member, &peer_id)
+    };
+    let pow = BridgeProofOfWork::solve(&decl.unsigned, required);
     for peer in state.peers.iter() {
-        if let Err(e) = push_bridge_declaration(&state.http, peer, decl).await {
+        if let Err(e) = push_bridge_declaration(&state.http, peer, decl, pow).await {
             tracing::warn!(peer, error = %e, "failed to push bridge declaration to peer");
         }
     }
@@ -375,7 +416,8 @@ mod tests {
             crate::bridge::build_and_sign(&identity, "global", MeshMember::BaseCluster("ny-dc1".into()), now_unix())
                 .unwrap();
 
-        push_bridge_declaration(&state_b.http, &addr_a, &decl).await.unwrap();
+        let pow = solve_bridge_pow(&_state_a, &decl);
+        push_bridge_declaration(&state_b.http, &addr_a, &decl, pow).await.unwrap();
 
         let tree = _state_a.tree.read().unwrap();
         assert_eq!(tree.corroboration_for("global", &MeshMember::BaseCluster("ny-dc1".into())), 1);
@@ -388,10 +430,13 @@ mod tests {
         let mut decl =
             crate::bridge::build_and_sign(&identity, "global", MeshMember::BaseCluster("ny-dc1".into()), now_unix())
                 .unwrap();
+        // Solve against the (still-untampered) declaration -- tampering happens after, matching
+        // a real attacker who can't re-solve a proof bound to the content they're about to change.
+        let pow = solve_bridge_pow(&state_a, &decl);
         decl.unsigned.mesh_group = "tampered".to_string();
 
         let http = reqwest::Client::new();
-        let err = push_bridge_declaration(&http, &addr_a, &decl).await.unwrap_err();
+        let err = push_bridge_declaration(&http, &addr_a, &decl, pow).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
         assert_eq!(state_a.tree.read().unwrap().corroboration_for("tampered", &MeshMember::BaseCluster("ny-dc1".into())), 0);
     }
@@ -416,6 +461,19 @@ mod tests {
         let member = MeshMember::BaseCluster("broadcast-test".into());
         assert_eq!(state_a.tree.read().unwrap().corroboration_for("global", &member), 1);
         assert_eq!(state_b.tree.read().unwrap().corroboration_for("global", &member), 1);
+    }
+
+    /// Solves whatever proof-of-work `state`'s own `tree` currently requires for `decl`'s
+    /// `(mesh_group, member, peer_id)` -- the test-side equivalent of a real client asking the
+    /// node it's about to push to what it needs, before spending the work.
+    fn solve_bridge_pow(state: &MeshState, decl: &BridgeDeclaration) -> BridgeProofOfWork {
+        let peer_id: PeerId = decl.unsigned.peer_id.parse().unwrap();
+        let required = state
+            .tree
+            .read()
+            .unwrap()
+            .required_difficulty_bits(&decl.unsigned.mesh_group, &decl.unsigned.member, &peer_id);
+        BridgeProofOfWork::solve(&decl.unsigned, required)
     }
 
     /// Solves whatever proof-of-work `state`'s own `claim_corroboration` currently requires for
@@ -550,7 +608,8 @@ mod tests {
             now_unix(),
         )
         .unwrap();
-        push_bridge_declaration(&reqwest::Client::new(), &addr_a, &decl).await.unwrap();
+        let bridge_pow = solve_bridge_pow(&state_a, &decl);
+        push_bridge_declaration(&reqwest::Client::new(), &addr_a, &decl, bridge_pow).await.unwrap();
 
         // One report from the attested cluster, one from a fabricated cluster name.
         let real_reporter = PeerIdentity::generate();
