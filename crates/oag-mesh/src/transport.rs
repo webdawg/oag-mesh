@@ -1,11 +1,11 @@
-//! A real peer-to-peer transport for both of this crate's message types -- its own HTTP wire
+//! A real peer-to-peer transport for all four of this crate's message types -- its own HTTP wire
 //! protocol, on its own listen address/port, separate from the base project's
 //! `/oag/sync/v1/*` or `/oag/gateway/v1/query` entirely. Same "separate concern, separate
 //! endpoint" posture the base repo's `spec/32-verified-internet-gateway.md` used for its own
 //! query protocol, one layer up: this is `oag-mesh`'s own Layer-3-equivalent, structurally
 //! parallel to the base project's `oag-sync`, not a part of it.
 //!
-//! The three message types get genuinely different transport treatment, because they have
+//! The four message types get genuinely different transport treatment, because they have
 //! genuinely different requirements:
 //!
 //! - `BridgeDeclaration` is signed by a real identity and loses nothing by ordinary propagation
@@ -20,6 +20,10 @@
 //!   doesn't bound how many distinct (fabricated) clusters one actor can claim, though, so a
 //!   `ClaimReport` submission also carries a `corroboration::ClaimReportProofOfWork` -- see
 //!   `receive_claim_report`'s doc comment.
+//! - `MembershipAttestation` closes the other half of the cross-check gap `ClaimReport`'s own
+//!   cluster-name check leaves open -- see `membership.rs`'s own doc comment for what it does
+//!   and does not verify, and `receive_membership_attestation`'s doc comment for its transport
+//!   treatment (signed, same as `BridgeDeclaration`/`ClaimReport`, same proof-of-work posture).
 
 use std::sync::{Arc, RwLock};
 
@@ -35,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
+use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -65,6 +70,16 @@ pub struct BridgeDeclarationSubmission {
     pub pow: BridgeProofOfWork,
 }
 
+/// The wire shape for `POST /oag-mesh/v1/membership-attestation` -- the attestation plus the
+/// proof-of-work that must satisfy `membership::MembershipRegistry::required_difficulty_bits`
+/// for this attestation's `(cluster, subject_peer_id, attester_peer_id)` (`membership.rs`'s own
+/// anti-sybil mechanism) before it's recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipAttestationSubmission {
+    pub attestation: MembershipAttestation,
+    pub pow: MembershipProofOfWork,
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
@@ -75,6 +90,7 @@ pub struct MeshState {
     pub tree: Arc<RwLock<MeshTree>>,
     pub event_log: Arc<RwLock<AnonymousEventLog>>,
     pub claim_corroboration: Arc<RwLock<ClaimCorroboration>>,
+    pub membership_registry: Arc<RwLock<MembershipRegistry>>,
     /// Other mesh nodes this one pushes its own declarations/events/reports to -- static,
     /// operator-configured, the same "hand-written topology, no automatic discovery" posture as
     /// the base project's own `[transfer].relay_peers`/`[gateway].query_peers`.
@@ -89,17 +105,18 @@ impl MeshState {
             tree: Arc::new(RwLock::new(MeshTree::new())),
             event_log: Arc::new(RwLock::new(AnonymousEventLog::new())),
             claim_corroboration: Arc::new(RwLock::new(ClaimCorroboration::new())),
+            membership_registry: Arc::new(RwLock::new(MembershipRegistry::new())),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
         }
     }
 
-    /// Snapshots all three in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
-    /// and `anonymous_events.json` under `dir`, overwriting whatever was there -- see
-    /// `persistence`'s own module doc comment for what this does and does not guarantee
-    /// (not atomic, not crash-safe, rewrites the whole file every call). This crate doesn't call
-    /// this automatically on any write; a caller decides when to save (periodically, on a clean
-    /// shutdown, after every N writes -- whatever fits its own deployment).
+    /// Snapshots all four in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
+    /// `anonymous_events.json`, and `membership_registry.json` under `dir`, overwriting whatever
+    /// was there -- see `persistence`'s own module doc comment for what this does and does not
+    /// guarantee (not atomic, not crash-safe, rewrites the whole file every call). This crate
+    /// doesn't call this automatically on any write; a caller decides when to save (periodically,
+    /// on a clean shutdown, after every N writes -- whatever fits its own deployment).
     pub fn save_to_dir(&self, dir: &std::path::Path) -> Result<(), crate::persistence::PersistenceError> {
         crate::persistence::save_json(&dir.join("bridge_tree.json"), &self.tree.read().unwrap().snapshot())?;
         crate::persistence::save_json(
@@ -107,10 +124,14 @@ impl MeshState {
             &self.claim_corroboration.read().unwrap().snapshot(),
         )?;
         crate::persistence::save_json(&dir.join("anonymous_events.json"), &*self.event_log.read().unwrap())?;
+        crate::persistence::save_json(
+            &dir.join("membership_registry.json"),
+            &self.membership_registry.read().unwrap().snapshot(),
+        )?;
         Ok(())
     }
 
-    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the three stores from
+    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the four stores from
     /// whatever `save_to_dir` previously wrote to `dir` -- or starting empty for any file that
     /// doesn't exist yet (a brand-new node's first run).
     pub fn load_from_dir(
@@ -126,11 +147,15 @@ impl MeshState {
             .unwrap_or_default();
         let event_log: AnonymousEventLog =
             crate::persistence::load_json(&dir.join("anonymous_events.json"))?.unwrap_or_default();
+        let membership_registry = crate::persistence::load_json(&dir.join("membership_registry.json"))?
+            .map(MembershipRegistry::from_snapshot)
+            .unwrap_or_default();
         Ok(Self {
             identity: Arc::new(identity),
             tree: Arc::new(RwLock::new(tree)),
             event_log: Arc::new(RwLock::new(event_log)),
             claim_corroboration: Arc::new(RwLock::new(claim_corroboration)),
+            membership_registry: Arc::new(RwLock::new(membership_registry)),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
         })
@@ -142,10 +167,15 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/bridge-declaration", post(receive_bridge_declaration))
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
+        .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
         .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
         .route(
             "/oag-mesh/v1/claim-report/{claim_id}/best-cross-checked",
             get(get_best_corroborated_value_cross_checked),
+        )
+        .route(
+            "/oag-mesh/v1/claim-report/{claim_id}/best-fully-cross-checked",
+            get(get_best_corroborated_value_fully_cross_checked),
         )
         .with_state(state)
 }
@@ -265,6 +295,46 @@ fn claim_report_error_response(e: ClaimReportError) -> Response {
     (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
 }
 
+/// Receives a `MembershipAttestationSubmission` (the attestation plus its proof-of-work) and
+/// records it into `state.membership_registry` -- same signature/pairing/clock-skew/
+/// self-attestation checks as `membership::verify`, plus the escalating proof-of-work check
+/// (`membership::MembershipRegistry::required_difficulty_bits`) that taxes becoming a *new*
+/// distinct attester for a `(cluster, subject_peer_id)` fact, rejecting an insufficient proof
+/// with `400` the same way the other mechanisms' proofs are.
+async fn receive_membership_attestation(
+    State(state): State<MeshState>,
+    Json(submission): Json<MembershipAttestationSubmission>,
+) -> Response {
+    let now = now_unix();
+    let result = {
+        let mut registry = state.membership_registry.write().unwrap();
+        registry.add(&submission.attestation, submission.pow, now)
+    };
+    match result {
+        Ok((attester_peer_id, subject_peer_id)) => {
+            tracing::info!(%attester_peer_id, %subject_peer_id, cluster = %submission.attestation.unsigned.cluster, "membership attestation recorded");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => membership_error_response(e),
+    }
+}
+
+fn membership_error_response(e: MembershipError) -> Response {
+    let status = match &e {
+        MembershipError::AttesterPeerId(_)
+        | MembershipError::SubjectPeerId(_)
+        | MembershipError::InvalidPublicKey
+        | MembershipError::PeerIdKeyMismatch
+        | MembershipError::BadSignatureEncoding
+        | MembershipError::BadSignature
+        | MembershipError::ClockSkew
+        | MembershipError::SelfAttestation
+        | MembershipError::InsufficientProofOfWork { .. } => StatusCode::BAD_REQUEST,
+        MembershipError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+}
+
 /// Read-only: this node's own current view of `corroboration::ClaimCorroboration::
 /// best_corroborated_value` for `claim_id`, from whatever `ClaimReport`s it has received so far
 /// (its own, and anything pushed to it). `null` if nothing has been reported for this claim to
@@ -304,6 +374,44 @@ async fn get_best_corroborated_value_cross_checked(
     Json(serde_json::json!({ "result": result })).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct FullyCrossCheckQuery {
+    #[serde(default = "default_min_bridge_corroboration")]
+    min_bridge_corroboration: usize,
+    /// How many distinct `MembershipAttestation`s must vouch for a reporting peer's claimed
+    /// cluster membership before its report counts. Defaults to `1`, the weakest bar
+    /// `membership::MembershipRegistry::is_attested_member` supports.
+    #[serde(default = "default_min_membership_corroboration")]
+    min_membership_corroboration: usize,
+}
+
+fn default_min_membership_corroboration() -> usize {
+    1
+}
+
+/// Read-only, same node-local-only scope as `get_best_corroborated_value_cross_checked`, but
+/// additionally cross-checked against this node's own `state.membership_registry` -- see
+/// `corroboration::ClaimCorroboration::best_corroborated_value_fully_cross_checked` for exactly
+/// what that closes (the reporting peer's actual standing in its claimed cluster, not just the
+/// cluster name being real) and what it still does not (the attesters' own standing).
+async fn get_best_corroborated_value_fully_cross_checked(
+    State(state): State<MeshState>,
+    Path(claim_id): Path<String>,
+    Query(query): Query<FullyCrossCheckQuery>,
+) -> Response {
+    let corroboration = state.claim_corroboration.read().unwrap();
+    let tree = state.tree.read().unwrap();
+    let registry = state.membership_registry.read().unwrap();
+    let result = corroboration.best_corroborated_value_fully_cross_checked(
+        &claim_id,
+        &tree,
+        &registry,
+        query.min_bridge_corroboration,
+        query.min_membership_corroboration,
+    );
+    Json(serde_json::json!({ "result": result })).into_response()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("request to {0} failed: {1}")]
@@ -326,6 +434,49 @@ pub async fn push_bridge_declaration(
         return Err(PushError::Rejected(address.to_string(), response.status()));
     }
     Ok(())
+}
+
+pub async fn push_membership_attestation(
+    http: &reqwest::Client,
+    address: &str,
+    attestation: &MembershipAttestation,
+    pow: MembershipProofOfWork,
+) -> Result<(), PushError> {
+    let url = format!("{}/oag-mesh/v1/membership-attestation", address.trim_end_matches('/'));
+    let submission = MembershipAttestationSubmission { attestation: attestation.clone(), pow };
+    let response =
+        http.post(&url).json(&submission).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PushError::Rejected(address.to_string(), response.status()));
+    }
+    Ok(())
+}
+
+/// Same best-effort push, for a membership attestation -- solves proof-of-work once, against
+/// *this sending node's own* `state.membership_registry` view of `(cluster, subject_peer_id,
+/// attester_peer_id)`, and sends the identical `(attestation, pow)` pair to every configured
+/// peer. Same caveat as `broadcast_bridge_declaration`'s and `broadcast_claim_report`'s own: a
+/// receiving peer with more existing distinct attesters already recorded for this fact may
+/// require a higher difficulty than this node did, and will reject this submission if so.
+pub async fn broadcast_membership_attestation(state: &MeshState, attestation: &MembershipAttestation) {
+    let attester_peer_id: PeerId = match attestation.unsigned.attester_peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return,
+    };
+    let subject_peer_id: PeerId = match attestation.unsigned.subject_peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return,
+    };
+    let required = {
+        let registry = state.membership_registry.read().unwrap();
+        registry.required_difficulty_bits(&attestation.unsigned.cluster, &subject_peer_id, &attester_peer_id)
+    };
+    let pow = MembershipProofOfWork::solve(&attestation.unsigned, required);
+    for peer in state.peers.iter() {
+        if let Err(e) = push_membership_attestation(&state.http, peer, attestation, pow).await {
+            tracing::warn!(peer, error = %e, "failed to push membership attestation to peer");
+        }
+    }
 }
 
 pub async fn push_anonymous_event(
@@ -530,6 +681,21 @@ mod tests {
         ClaimReportProofOfWork::solve(&report.unsigned, required)
     }
 
+    /// Solves whatever proof-of-work `state`'s own `membership_registry` currently requires for
+    /// `attestation`'s `(cluster, subject_peer_id, attester_peer_id)` -- the test-side equivalent
+    /// of a real client asking the node it's about to push to what it needs, before spending the
+    /// work.
+    fn solve_membership_pow(state: &MeshState, attestation: &MembershipAttestation) -> MembershipProofOfWork {
+        let attester_peer_id: PeerId = attestation.unsigned.attester_peer_id.parse().unwrap();
+        let subject_peer_id: PeerId = attestation.unsigned.subject_peer_id.parse().unwrap();
+        let required = state.membership_registry.read().unwrap().required_difficulty_bits(
+            &attestation.unsigned.cluster,
+            &subject_peer_id,
+            &attester_peer_id,
+        );
+        MembershipProofOfWork::solve(&attestation.unsigned, required)
+    }
+
     fn valid_event(nonce: &str) -> AnonymousEvent {
         AnonymousEvent {
             event_id: "evt-1".to_string(),
@@ -717,10 +883,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_to_dir_then_load_from_dir_round_trips_all_three_stores() {
+    async fn save_to_dir_then_load_from_dir_round_trips_all_four_stores() {
         let (_addr_a, state_a) = spawn(vec![]).await;
 
-        // Populate all three stores with one real entry each.
+        // Populate all four stores with one real entry each.
         let bridge_signer = PeerIdentity::generate();
         let decl =
             crate::bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("persist-test".into()), now_unix())
@@ -739,6 +905,13 @@ mod tests {
         let event_pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
         state_a.event_log.write().unwrap().record(event, event_pow).unwrap();
 
+        let attester = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-a", now_unix()).unwrap();
+        let membership_pow = solve_membership_pow(&state_a, &attestation);
+        state_a.membership_registry.write().unwrap().add(&attestation, membership_pow, now_unix()).unwrap();
+
         let dir = std::env::temp_dir().join(format!("oag-mesh-transport-persist-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         state_a.save_to_dir(&dir).unwrap();
@@ -750,6 +923,7 @@ mod tests {
         );
         assert_eq!(loaded.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-persist-test", "blake3:abc"), 1);
         assert_eq!(loaded.event_log.read().unwrap().corroboration_for("persist-test-nonce"), 1);
+        assert!(loaded.membership_registry.read().unwrap().is_attested_member("cluster-a", &subject.peer_id(), 1));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -760,5 +934,132 @@ mod tests {
         let loaded = MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir).unwrap();
         assert!(loaded.tree.read().unwrap().members_of("global", 1).is_empty());
         assert_eq!(loaded.event_log.read().unwrap().corroboration_for("anything"), 0);
+        assert!(!loaded.membership_registry.read().unwrap().is_attested_member("anything", &PeerIdentity::generate().peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn a_pushed_membership_attestation_is_recorded_and_corroborated() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+
+        let attester = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-transport-test", now_unix())
+                .unwrap();
+
+        let pow = solve_membership_pow(&state_a, &attestation);
+        push_membership_attestation(&reqwest::Client::new(), &addr_a, &attestation, pow).await.unwrap();
+
+        assert!(state_a
+            .membership_registry
+            .read()
+            .unwrap()
+            .is_attested_member("cluster-transport-test", &subject.peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_membership_attestation_is_rejected_over_the_wire() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let attester = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let mut attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-tamper-test", now_unix())
+                .unwrap();
+        let pow = solve_membership_pow(&state_a, &attestation);
+        attestation.unsigned.cluster = "tampered".to_string();
+
+        let err = push_membership_attestation(&reqwest::Client::new(), &addr_a, &attestation, pow).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
+        assert!(!state_a.membership_registry.read().unwrap().is_attested_member("tampered", &subject.peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn broadcast_membership_attestation_reaches_every_configured_peer() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_sender, sender_state) = spawn(vec![addr_a.clone(), addr_b.clone()]).await;
+
+        let attester = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-broadcast-test", now_unix())
+                .unwrap();
+
+        broadcast_membership_attestation(&sender_state, &attestation).await;
+
+        assert!(state_a.membership_registry.read().unwrap().is_attested_member("cluster-broadcast-test", &subject.peer_id(), 1));
+        assert!(state_b.membership_registry.read().unwrap().is_attested_member("cluster-broadcast-test", &subject.peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn best_fully_cross_checked_drops_a_report_from_a_peer_with_no_membership_attestation() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+
+        // Attest "cluster-real" via a real BridgeDeclaration.
+        let bridge_signer = PeerIdentity::generate();
+        let decl = crate::bridge::build_and_sign(
+            &bridge_signer,
+            "global",
+            MeshMember::BaseCluster("cluster-real".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let bridge_pow = solve_bridge_pow(&state_a, &decl);
+        push_bridge_declaration(&reqwest::Client::new(), &addr_a, &decl, bridge_pow).await.unwrap();
+
+        // Attest that real_reporter is a genuine member of cluster-real.
+        let attester = PeerIdentity::generate();
+        let real_reporter = PeerIdentity::generate();
+        let unattested_reporter = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, real_reporter.peer_id(), "cluster-real", now_unix()).unwrap();
+        let membership_pow = solve_membership_pow(&state_a, &attestation);
+        push_membership_attestation(&reqwest::Client::new(), &addr_a, &attestation, membership_pow).await.unwrap();
+
+        // Both reporters claim the same real cluster name; only one has a membership attestation.
+        let real_report = crate::corroboration::build_and_sign(
+            &real_reporter,
+            "claim-fully-cross-check-test",
+            "cluster-real",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+        let unattested_report = crate::corroboration::build_and_sign(
+            &unattested_reporter,
+            "claim-fully-cross-check-test",
+            "cluster-real",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+        let real_pow = solve_claim_pow(&state_a, &real_report);
+        push_claim_report(&reqwest::Client::new(), &addr_a, &real_report, real_pow).await.unwrap();
+        let unattested_pow = solve_claim_pow(&state_a, &unattested_report);
+        push_claim_report(&reqwest::Client::new(), &addr_a, &unattested_report, unattested_pow).await.unwrap();
+
+        let response = reqwest::get(format!(
+            "{addr_a}/oag-mesh/v1/claim-report/claim-fully-cross-check-test/best-fully-cross-checked"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["best"]["distinct_peers"], 1);
+        assert_eq!(body["result"]["reports_dropped_unattested_cluster"], 0);
+        assert_eq!(body["result"]["reports_dropped_unattested_membership"], 1);
+    }
+
+    #[tokio::test]
+    async fn best_fully_cross_checked_against_an_unknown_claim_returns_null_result() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let response = reqwest::get(format!(
+            "{addr_a}/oag-mesh/v1/claim-report/never-reported/best-fully-cross-checked"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["result"].is_null());
     }
 }

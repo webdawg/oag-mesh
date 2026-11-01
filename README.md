@@ -52,19 +52,23 @@ record correctness. Global coverage does not grant unrestricted access or author
 
 ## Status
 
-All three mechanisms are implemented: cluster nesting with its own escalating proof-of-work
+Four mechanisms are implemented: cluster nesting with its own escalating proof-of-work
 anti-sybil protection (`spec/02-cluster-nesting.md`), the anonymous-event RFC schema with
-escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`), and
+escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`),
 federated corroboration weighted by distinct cluster rather than distinct peer, also with its own
-escalating proof-of-work anti-sybil protection (`spec/05-federated-corroboration.md`) — all three
-over a real HTTP transport (`spec/04-transport.md`) where every submission now carries its
-mechanism's proof-of-work alongside the signed payload, and manual (not automatic, not
-crash-safe) disk persistence for all three stores (`spec/08-persistence.md`). A `ClaimReport`'s
-self-asserted cluster can also be cross-checked against real cluster-nesting data
-(`best_corroborated_value_cross_checked`, `GET .../best-cross-checked`) — confirming the claimed
-cluster *name* was really attested by a `BridgeDeclaration`, though not that the reporting peer
-actually belongs to it; see `spec/02`'s and `spec/05`'s own sections on where those lines are
-drawn. Still open: confirming a reporting peer's actual standing in the cluster it claims,
-verifying that distinct `PeerIdentity`s are genuinely different organizations rather than just
-different keys (proof-of-work taxes cost, not identity), pull-based anti-entropy, and
+escalating proof-of-work anti-sybil protection (`spec/05-federated-corroboration.md`), and cluster
+membership attestation — signed proof that a peer is a genuine member of a cluster, corroborated
+by distinct attester count, with the same escalating proof-of-work treatment
+(`spec/09-cluster-membership-attestation.md`) — all four over a real HTTP transport
+(`spec/04-transport.md`) where every submission now carries its mechanism's proof-of-work
+alongside the signed payload, and manual (not automatic, not crash-safe) disk persistence for all
+four stores (`spec/08-persistence.md`). A `ClaimReport`'s self-asserted cluster can be
+cross-checked against real cluster-nesting data alone (`best_corroborated_value_cross_checked`,
+`GET .../best-cross-checked`) — confirming the claimed cluster *name* was really attested by a
+`BridgeDeclaration` — or against that **and** real membership-attestation data
+(`best_corroborated_value_fully_cross_checked`, `GET .../best-fully-cross-checked`) — additionally
+confirming the reporting peer actually belongs to that cluster, not just that the name is real.
+Still open: verifying that distinct `PeerIdentity`s are genuinely different organizations rather
+than just different keys (proof-of-work taxes cost, not identity, all the way down — even an
+attester's own standing in a cluster is itself unverified), pull-based anti-entropy, and
 dispatch-to-a-responder for anonymous events. See `spec/01-overview.md`.

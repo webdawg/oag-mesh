@@ -113,11 +113,28 @@ than before, just not for free anymore. Proof-of-work bounds *how cheaply* an ed
 corroboration can be inflated; it does not verify that the declaring peers are genuinely
 different organizations (see `spec/01-overview.md`'s open questions for that remaining gap).
 
+## Closing the other half: membership attestation
+
+`best_corroborated_value_fully_cross_checked(claim_id, mesh_tree, membership_registry,
+min_bridge_corroboration, min_membership_corroboration)` closes the remaining half this section
+used to flag unresolved: in addition to `best_corroborated_value_cross_checked`'s cluster-name
+check, it also drops a report whose reporting peer is not itself attested, via
+`membership::MembershipRegistry`, as a genuine member of its claimed `reporter_cluster` -- see
+`spec/09-cluster-membership-attestation.md` for the new `MembershipAttestation` mechanism this
+leans on, and what *that* mechanism still does not close (an attester's own standing, one level
+deeper). Returns `FullyCrossCheckedAgreement { best, reports_dropped_unattested_cluster,
+reports_dropped_unattested_membership }`.
+`GET /oag-mesh/v1/claim-report/{claim_id}/best-fully-cross-checked?min_bridge_corroboration=N&min_membership_corroboration=M`
+exposes this over the wire, same node-local-only scope as the other read endpoints.
+
 ## What this explicitly is not (yet)
 
-- **No cross-check of reporting-peer standing in a cluster.** Stated above: the cross-check
-  confirms the cluster name is real, never that the reporter belongs to it. See that section for
-  why, and what closing it fully would need.
+- **Cross-check of reporting-peer standing in a cluster now exists
+  (`spec/09-cluster-membership-attestation.md`), but it's attestation-depth-one.** The cross-check
+  confirms both the cluster name is real *and* the reporter is attested as a member of it -- it
+  does not confirm the *attesters themselves* have any more standing in the cluster than the
+  subject they're vouching for. See `spec/09`'s own "what this explicitly is not" for that
+  remaining, one-level-deeper gap.
 - **No weighting by how deeply nested/large a cluster is.** A report from a cluster with one
   member counts exactly the same as one from a cluster with a thousand -- "distinct cluster"
   is binary, not a richer trust score.
@@ -137,7 +154,7 @@ different organizations (see `spec/01-overview.md`'s open questions for that rem
 
 ## Tests
 
-`crates/oag-mesh/src/corroboration.rs` (16 unit tests): sign/verify round trip and the usual
+`crates/oag-mesh/src/corroboration.rs` (19 unit tests): sign/verify round trip and the usual
 tamper/mismatched-key/stale-timestamp rejections; two reports from the same cluster count as one
 cluster's worth of corroboration; reports from different clusters corroborate more strongly than
 a lone dissenter; a peer re-reporting the same value doesn't inflate its own count; an unknown
@@ -149,9 +166,14 @@ cross-check against a genuinely unknown claim still returns `None`; a report wit
 proof-of-work is rejected; a second report from an already-counted cluster requires no
 proof-of-work at all; required difficulty escalates with each additional distinct cluster on one
 claim, and a proof solved for an earlier difficulty is no longer enough; a proof-of-work is bound
-to its own report and can't be reused for a different one. `crates/oag-mesh/src/transport.rs`
-adds 6 more: a pushed report (with valid proof-of-work) is recorded and queryable over the wire;
-a tampered one is rejected; `broadcast_claim_report` reaches every configured peer and each one
-independently corroborates it; querying an unknown claim returns `null`; `.../best-cross-checked`
-drops a report from a fabricated cluster while the plain `.../best` endpoint still counts it;
-`.../best-cross-checked` against an unknown claim returns a `null` result.
+to its own report and can't be reused for a different one; the fully-cross-checked view drops a
+report from a peer with no membership attestation while the half-cross-check still lets it
+through; it still drops reports claiming an unattested cluster name outright; it returns `None`
+against an unknown claim (see `spec/09-cluster-membership-attestation.md` for the rest of that
+mechanism's own tests). `crates/oag-mesh/src/transport.rs` adds 11 more: a pushed report (with
+valid proof-of-work) is recorded and queryable over the wire; a tampered one is rejected;
+`broadcast_claim_report` reaches every configured peer and each one independently corroborates
+it; querying an unknown claim returns `null`; `.../best-cross-checked` drops a report from a
+fabricated cluster while the plain `.../best` endpoint still counts it; `.../best-cross-checked`
+against an unknown claim returns a `null` result; plus 5 more for membership attestation and the
+fully-cross-checked endpoint, listed in `spec/09`'s own "Tests" section.

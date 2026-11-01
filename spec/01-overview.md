@@ -1,20 +1,25 @@
 # Overview
 
-**Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), with a
-real HTTP transport for all of them (`spec/04-transport.md`) and manual, non-crash-safe
-persistence for all three stores (`spec/08-persistence.md`). All three message types now
-require escalating proof-of-work before recording a submission (`spec/02`'s, `spec/03`'s, and
-`spec/05`'s own "Anti-sybil"/"Anti-spam" sections), and `spec/05`'s claim reports are
-cross-checked against real cluster nesting for half the gap that mattered (the cluster *name*
-being real) -- see `spec/02`'s and `spec/05`'s own sections for exactly what each does and does
-not cover. Dispatch-to-a-responder for anonymous events, confirming a reporting peer's actual
-*standing* in the cluster it claims, verifying that distinct `PeerIdentity`s are genuinely
-different organizations (not just different keys), pull-based anti-entropy, and automatic/
-crash-safe persistence, are not.**
+**Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), plus a
+fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half of a gap
+`spec/02`/`spec/05` both left open. A real HTTP transport covers all four
+(`spec/04-transport.md`) and manual, non-crash-safe persistence covers all four stores
+(`spec/08-persistence.md`). All four message types now require escalating proof-of-work before
+recording a submission (`spec/02`'s, `spec/03`'s, `spec/05`'s, and `spec/09`'s own
+"Anti-sybil"/"Anti-spam" sections). `spec/05`'s claim reports can be cross-checked against real
+cluster nesting alone (the cluster *name* being real,
+`best_corroborated_value_cross_checked`) or against both that **and** `spec/09`'s membership
+attestations (the *reporter's own standing* in that cluster,
+`best_corroborated_value_fully_cross_checked`) -- see `spec/02`'s, `spec/05`'s, and `spec/09`'s
+own sections for exactly what each layer does and does not cover; even fully cross-checked, an
+attester's own standing is itself unverified, one level deeper still. Dispatch-to-a-responder for
+anonymous events, verifying that distinct `PeerIdentity`s are genuinely different organizations
+(not just different keys), pull-based anti-entropy, and automatic/crash-safe persistence, are
+not.**
 
 ## What this layer is
 
-Three related mechanisms, one level above a single `oag` peer or peer cluster:
+Four related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -44,21 +49,31 @@ Three related mechanisms, one level above a single `oag` peer or peer cluster:
    diversity from free to real, without requiring that cost for repeat reports from a cluster
    already corroborating the claim. `reporter_cluster` can also be cross-checked against
    mechanism (1)'s real `bridge::MeshTree` data (`best_corroborated_value_cross_checked`) —
-   confirming the claimed cluster *name* was really attested by a `BridgeDeclaration` somewhere,
-   though not that the reporting peer actually belongs to it (see `spec/05`'s own section on
-   exactly where that line is drawn). This is the witness/audit
-   mechanism named in the base project's `spec/22-future-work.md` and its
+   confirming the claimed cluster *name* was really attested by a `BridgeDeclaration` somewhere.
+   Combined with mechanism (4) below (`best_corroborated_value_fully_cross_checked`), it also
+   confirms the reporting peer actually belongs to that cluster, not just that the name is real
+   (see `spec/05`'s own section on exactly where the remaining line is drawn). This is the
+   witness/audit mechanism named in the base project's `spec/22-future-work.md` and its
    `future_flood_propagation_and_anonymity.md`/`future_service_announcements_and_audit.md` memory
    entries, and the mechanism `spec/32-verified-internet-gateway.md`'s own quorum fan-out already
    implements for one peer's gateway queries — this layer is the same idea generalized across
    organizational/cluster boundaries instead of one peer's own configured query_peers.
 3. **Anonymous event reporting for life-saving actions, schema implemented — see
    `spec/03-anonymous-event-rfc.md`.** A deliberately different, identity-*stripped* mechanism
-   from (1) and (2) above, which are both signed-identity-based: an `AnonymousEvent` ("SAW THIS
+   from (1), (2), and (4), which are all signed-identity-based: an `AnonymousEvent` ("SAW THIS
    EVENT" — a sighting, a hazard, a medical emergency, a resource need) carries no persistent
    signature, no precise location or time, and no free-text field that could smuggle an
    identifying description of a person. Corroboration here means independent reports converging
    on the same `corroboration_nonce`, not counting distinct signing peers.
+4. **Cluster membership attestation, implemented — see
+   `spec/09-cluster-membership-attestation.md`.** Closes the half of mechanism (2)'s cross-check
+   gap that mechanism (1) alone can't: a `BridgeDeclaration` only ever says a cluster *name* is
+   nested somewhere, never which peers belong to it. A `MembershipAttestation`, signed by some
+   *other* peer ("I attest peer P is a genuine member of cluster C"), corroborated by distinct
+   attester count, with its own escalating proof-of-work (`spec/09`'s "Anti-sybil resistance")
+   taxing the cost of becoming a new distinct attester for one membership claim. Does not verify
+   the attester's own standing in C either — stated plainly in `spec/09`, the same
+   "proof-of-work bounds cost, not identity" gap one level deeper.
 
 ## What this layer explicitly is not
 
@@ -95,25 +110,30 @@ collection, vault, or release capability. See that RFC for current requirements 
   identity at all to attach a cluster claim to, so the same fix doesn't transfer — it still just
   counts raw report volume under a nonce, mitigated only by proof-of-work's escalating cost, a
   different (and weaker) kind of "independent enough."
-- A real HTTP transport exists now for all three mechanisms (`spec/04-transport.md`), push-only
+- A real HTTP transport exists now for all four mechanisms (`spec/04-transport.md`), push-only
   with no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent`
-  submissions any network-level anonymity on top of their already-anonymous payload. All three
+  submissions any network-level anonymity on top of their already-anonymous payload. All four
   message types now require escalating proof-of-work before being recorded --
   `BridgeDeclaration` (`spec/02`'s "Anti-sybil resistance"), `AnonymousEvent` (`spec/03`'s
-  "Anti-spam and anti-replay"), and `ClaimReport` (`spec/05`'s "Anti-sybil resistance") -- real
-  mitigations, not full solutions, and each says so explicitly: none stops a well-resourced
-  attacker, each only taxes the specific thing its own mechanism's corroboration count depends on
-  (a new distinct peer on a mesh edge, raw report volume under a nonce, or a new distinct cluster
-  on a claim, respectively).
-- **Proof-of-work bounds cost, not identity.** Across all three mechanisms, a well-resourced
+  "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s "Anti-sybil resistance"), and
+  `MembershipAttestation` (`spec/09`'s "Anti-sybil resistance") -- real mitigations, not full
+  solutions, and each says so explicitly: none stops a well-resourced attacker, each only taxes
+  the specific thing its own mechanism's corroboration count depends on (a new distinct peer on a
+  mesh edge, raw report volume under a nonce, a new distinct cluster on a claim, or a new distinct
+  attester on a membership claim, respectively).
+- **Proof-of-work bounds cost, not identity.** Across all four mechanisms, a well-resourced
   single operator can still pay the escalating cost to mint several real, distinct
   `PeerIdentity`s and have each independently corroborate the same fact -- proof-of-work makes
   that cost something instead of nothing, it does not verify the identities behind it are
   genuinely different organizations. This is the same "independent enough" gap as the bullet
-  above, now stated once for all three mechanisms rather than per-mechanism: no amount of
-  proof-of-work alone, as designed here, resolves it. And even with proof-of-work, a fabricated
-  claim of *membership* in a real, already-attested cluster is still not caught by anything here
-  -- minting fresh `PeerIdentity`s that each pay the escalating proof-of-work to claim a real
-  cluster name they have no actual standing in still works, just no longer for free. See
-  `spec/02`'s, `spec/03`'s, `spec/04`'s, and `spec/05`'s own "open questions" sections for what
-  else is still unresolved.
+  above, now stated once for all four mechanisms rather than per-mechanism: no amount of
+  proof-of-work alone, as designed here, resolves it. `spec/09-cluster-membership-attestation.md`
+  closes the specific gap this bullet used to flag -- a fabricated claim of *membership* in a
+  real, already-attested cluster is no longer free to make pass unnoticed, since
+  `best_corroborated_value_fully_cross_checked` requires a real `MembershipAttestation` too --
+  but one level deeper, the same gap reappears: nothing verifies an *attester's* own standing in
+  the cluster it's vouching for, either. Minting fresh `PeerIdentity`s that each pay escalating
+  proof-of-work to attest a subject's membership in a cluster none of them actually belong to
+  still works, just no longer for free, and with one more layer of indirection to climb through.
+  See `spec/02`'s, `spec/03`'s, `spec/04`'s, `spec/05`'s, and `spec/09`'s own "open questions"
+  sections for what else is still unresolved.

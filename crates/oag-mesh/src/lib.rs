@@ -15,6 +15,7 @@
 pub mod anonymous_event;
 pub mod bridge;
 pub mod corroboration;
+pub mod membership;
 pub mod persistence;
 pub mod transport;
 
@@ -28,8 +29,14 @@ pub use bridge::{
 };
 pub use corroboration::{
     ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork, ClaimSnapshot,
-    CrossCheckedAgreement, RecordedReportSnapshot, UnsignedClaimReport, BASE_CLAIM_REPORT_DIFFICULTY_BITS,
-    CLAIM_REPORT_DIFFICULTY_STEP_BITS,
+    CrossCheckedAgreement, FullyCrossCheckedAgreement, RecordedReportSnapshot, UnsignedClaimReport,
+    BASE_CLAIM_REPORT_DIFFICULTY_BITS, CLAIM_REPORT_DIFFICULTY_STEP_BITS,
+};
+pub use membership::{
+    MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry, MembershipSnapshot,
+    UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
 pub use persistence::PersistenceError;
-pub use transport::{BridgeDeclarationSubmission, ClaimReportSubmission, MeshState, PushError};
+pub use transport::{
+    BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission, MeshState, PushError,
+};

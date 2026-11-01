@@ -85,6 +85,11 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
   actually operated by different organizations -- a well-resourced single operator can still
   solve proof-of-work for several real `PeerIdentity`s and look just as "independent" as before.
   Weighing that is a later, harder problem (see `spec/01-overview.md`'s open questions).
+- **A `BridgeDeclaration` never records which peers belong to a cluster, only that a cluster
+  *name* is nested somewhere.** `is_attested_base_cluster` (above) confirms the name is real; it
+  says nothing about any individual peer's standing in that cluster. Closing that is
+  `spec/09-cluster-membership-attestation.md`'s `MembershipAttestation` -- a new, separate
+  mechanism, not an extension of this one.
 
 ## Tests
 

@@ -26,6 +26,7 @@ use oag_crypto::{sign_with_domain, verify_with_domain, PeerId, PeerIdentity, Sig
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::MeshTree;
+use crate::membership::MembershipRegistry;
 
 pub const CLAIM_REPORT_DOMAIN: &str = "OAG-MESH:CLAIM_REPORT:v1:";
 
@@ -250,6 +251,20 @@ pub struct CrossCheckedAgreement {
     pub reports_dropped_unattested_cluster: usize,
 }
 
+/// The result of `ClaimCorroboration::best_corroborated_value_fully_cross_checked` -- like
+/// `CrossCheckedAgreement`, but additionally drops reports whose reporting peer is not itself
+/// attested, via `membership::MembershipRegistry`, as a genuine member of its claimed
+/// `reporter_cluster`. This is the "other half" of the gap `CrossCheckedAgreement`'s own doc
+/// comment named: confirming not just that the cluster *name* is real, but that the reporter
+/// actually belongs to it. See `membership.rs`'s own top-level doc comment for what *this* still
+/// does not close (an attester's own standing is itself unverified one level deeper).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FullyCrossCheckedAgreement {
+    pub best: Option<ClaimAgreement>,
+    pub reports_dropped_unattested_cluster: usize,
+    pub reports_dropped_unattested_membership: usize,
+}
+
 /// Collects verified `ClaimReport`s, grouped by `claim_id`, and aggregates them weighted by
 /// distinct reporting *cluster* -- the mechanism-level answer to `spec/01-overview.md`'s "what
 /// counts as independent enough" question: two reports from the same self-asserted cluster
@@ -379,6 +394,64 @@ impl ClaimCorroboration {
             })
             .max_by_key(|agreement| (agreement.distinct_clusters, agreement.distinct_peers));
         Some(CrossCheckedAgreement { best, reports_dropped_unattested_cluster })
+    }
+
+    /// Like `best_corroborated_value_cross_checked`, but closes the other half of the gap that
+    /// method's own doc comment names: in addition to dropping reports whose `reporter_cluster`
+    /// is not attested as a real cluster name at all (`mesh_tree.is_attested_base_cluster`), this
+    /// also drops reports whose reporting peer is not itself attested, via `membership_registry`
+    /// (requiring at least `min_membership_corroboration` distinct `MembershipAttestation`s), as
+    /// a genuine member of that cluster. A report can now be dropped for either reason, tracked
+    /// separately so a caller can tell which check a given report failed.
+    ///
+    /// Still does **not** verify that the attesters behind `membership_registry`'s corroboration
+    /// count themselves have any real standing in the cluster they're vouching for -- see
+    /// `membership.rs`'s own top-level doc comment for that remaining, one-level-deeper gap.
+    ///
+    /// Returns `None` only if nothing has ever been reported for `claim_id` at all, same as
+    /// `best_corroborated_value`/`best_corroborated_value_cross_checked`.
+    pub fn best_corroborated_value_fully_cross_checked(
+        &self,
+        claim_id: &str,
+        mesh_tree: &MeshTree,
+        membership_registry: &MembershipRegistry,
+        min_bridge_corroboration: usize,
+        min_membership_corroboration: usize,
+    ) -> Option<FullyCrossCheckedAgreement> {
+        let reports = self.reports.get(claim_id)?;
+        let mut by_value: HashMap<&str, (HashSet<&str>, HashSet<PeerId>)> = HashMap::new();
+        let mut reports_dropped_unattested_cluster = 0usize;
+        let mut reports_dropped_unattested_membership = 0usize;
+        for r in reports {
+            if !mesh_tree.is_attested_base_cluster(&r.reporter_cluster, min_bridge_corroboration) {
+                reports_dropped_unattested_cluster += 1;
+                continue;
+            }
+            if !membership_registry.is_attested_member(
+                &r.reporter_cluster,
+                &r.peer_id,
+                min_membership_corroboration,
+            ) {
+                reports_dropped_unattested_membership += 1;
+                continue;
+            }
+            let entry = by_value.entry(&r.observed_value_hash).or_default();
+            entry.0.insert(&r.reporter_cluster);
+            entry.1.insert(r.peer_id);
+        }
+        let best = by_value
+            .into_iter()
+            .map(|(value, (clusters, peers))| ClaimAgreement {
+                observed_value_hash: value.to_string(),
+                distinct_clusters: clusters.len(),
+                distinct_peers: peers.len(),
+            })
+            .max_by_key(|agreement| (agreement.distinct_clusters, agreement.distinct_peers));
+        Some(FullyCrossCheckedAgreement {
+            best,
+            reports_dropped_unattested_cluster,
+            reports_dropped_unattested_membership,
+        })
     }
 
     /// The distinct-cluster corroboration count for one specific `(claim_id,
@@ -654,6 +727,99 @@ mod tests {
         let empty_tree = bridge::MeshTree::new();
         assert!(corroboration
             .best_corroborated_value_cross_checked("never-reported", &empty_tree, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn fully_cross_check_drops_a_report_whose_peer_is_not_an_attested_cluster_member() {
+        use crate::bridge::{self, MeshMember};
+        use crate::membership::{self, MembershipRegistry};
+
+        let peer_real_member = PeerIdentity::generate();
+        let peer_unattested = PeerIdentity::generate();
+        let bridge_signer = PeerIdentity::generate();
+        let attester = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+        let mut tree = bridge::MeshTree::new();
+        let mut registry = MembershipRegistry::new();
+
+        // "cluster-a" is a real, attested cluster name...
+        let bridge_decl =
+            bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("cluster-a".into()), now())
+                .unwrap();
+        let bridge_pow = bridge::BridgeProofOfWork::solve(&bridge_decl.unsigned, bridge::BASE_BRIDGE_DIFFICULTY_BITS);
+        tree.add(&bridge_decl, bridge_pow, now()).unwrap();
+
+        // ...and peer_real_member is attested as an actual member of it...
+        let attestation =
+            membership::build_and_sign(&attester, peer_real_member.peer_id(), "cluster-a", now()).unwrap();
+        let membership_pow =
+            membership::MembershipProofOfWork::solve(&attestation.unsigned, membership::BASE_MEMBERSHIP_DIFFICULTY_BITS);
+        registry.add(&attestation, membership_pow, now()).unwrap();
+
+        // ...but peer_unattested just claims the same real cluster name with no attestation at all.
+        add_with_fresh_pow(
+            &mut corroboration,
+            &build_and_sign(&peer_real_member, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(),
+            now(),
+        )
+        .unwrap();
+        add_with_fresh_pow(
+            &mut corroboration,
+            &build_and_sign(&peer_unattested, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(),
+            now(),
+        )
+        .unwrap();
+
+        // The half-cross-check (cluster name only) still lets both through -- same cluster name.
+        let half_checked = corroboration.best_corroborated_value_cross_checked("claim-1", &tree, 1).unwrap();
+        assert_eq!(half_checked.best.unwrap().distinct_peers, 2);
+
+        // The full cross-check drops the unattested peer.
+        let fully_checked = corroboration
+            .best_corroborated_value_fully_cross_checked("claim-1", &tree, &registry, 1, 1)
+            .unwrap();
+        let best = fully_checked.best.unwrap();
+        assert_eq!(best.distinct_peers, 1);
+        assert_eq!(fully_checked.reports_dropped_unattested_cluster, 0);
+        assert_eq!(fully_checked.reports_dropped_unattested_membership, 1);
+    }
+
+    #[test]
+    fn fully_cross_check_still_drops_reports_claiming_an_unattested_cluster_name() {
+        use crate::bridge;
+        use crate::membership::MembershipRegistry;
+
+        let peer_a = PeerIdentity::generate();
+        let mut corroboration = ClaimCorroboration::new();
+        let empty_tree = bridge::MeshTree::new();
+        let empty_registry = MembershipRegistry::new();
+
+        add_with_fresh_pow(
+            &mut corroboration,
+            &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(),
+            now(),
+        )
+        .unwrap();
+
+        let fully_checked = corroboration
+            .best_corroborated_value_fully_cross_checked("claim-1", &empty_tree, &empty_registry, 1, 1)
+            .unwrap();
+        assert!(fully_checked.best.is_none());
+        assert_eq!(fully_checked.reports_dropped_unattested_cluster, 1);
+        assert_eq!(fully_checked.reports_dropped_unattested_membership, 0);
+    }
+
+    #[test]
+    fn fully_cross_check_against_an_unknown_claim_returns_none() {
+        use crate::bridge;
+        use crate::membership::MembershipRegistry;
+
+        let corroboration = ClaimCorroboration::new();
+        let empty_tree = bridge::MeshTree::new();
+        let empty_registry = MembershipRegistry::new();
+        assert!(corroboration
+            .best_corroborated_value_fully_cross_checked("never-reported", &empty_tree, &empty_registry, 1, 1)
             .is_none());
     }
 
