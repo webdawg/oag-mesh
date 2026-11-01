@@ -347,6 +347,51 @@ impl MeshTree {
             }
         }
     }
+
+    /// A persistable snapshot of every edge this tree currently holds. `PeerId` has no
+    /// `Serialize`/`Deserialize` of its own (it's from the base project, reused via git
+    /// dependency, never modified here), so peer ids round-trip through their `Display`/
+    /// `FromStr` string form -- the same convention every signed message in this crate already
+    /// uses for a `peer_id` field. See `MeshTree::from_snapshot` for the inverse.
+    pub fn snapshot(&self) -> Vec<BridgeEdgeSnapshot> {
+        self.edges
+            .iter()
+            .map(|((mesh_group, member), peers)| BridgeEdgeSnapshot {
+                mesh_group: mesh_group.clone(),
+                member: member.clone(),
+                peers: peers.iter().map(|p| p.to_string()).collect(),
+            })
+            .collect()
+    }
+
+    /// Rebuilds a `MeshTree` from `snapshot` (e.g. loaded from disk via `persistence::load_json`).
+    /// A peer id string that fails to parse is dropped with a warning rather than failing the
+    /// whole load -- corrupted or hand-edited persisted state shouldn't prevent a node from
+    /// starting with whatever of it is still readable.
+    pub fn from_snapshot(snapshot: Vec<BridgeEdgeSnapshot>) -> Self {
+        let mut tree = Self::new();
+        for edge in snapshot {
+            let mut peers = HashSet::new();
+            for peer_id_str in edge.peers {
+                match peer_id_str.parse::<PeerId>() {
+                    Ok(peer_id) => {
+                        peers.insert(peer_id);
+                    }
+                    Err(e) => tracing::warn!(peer_id = %peer_id_str, error = %e, "dropping unparsable peer id from persisted bridge snapshot"),
+                }
+            }
+            tree.edges.insert((edge.mesh_group, edge.member), peers);
+        }
+        tree
+    }
+}
+
+/// See `MeshTree::snapshot`/`MeshTree::from_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeEdgeSnapshot {
+    pub mesh_group: String,
+    pub member: MeshMember,
+    pub peers: Vec<String>,
 }
 
 #[cfg(test)]
@@ -362,6 +407,22 @@ mod tests {
         let required = tree.required_difficulty_bits(&decl.unsigned.mesh_group, &decl.unsigned.member, &peer_id);
         let pow = BridgeProofOfWork::solve(&decl.unsigned, required);
         tree.add(decl, pow, now)
+    }
+
+    /// Solves for a nonce whose hash has *exactly* `exact_bits` leading zero bits, not merely
+    /// at least -- unlike `BridgeProofOfWork::solve`'s `>=` search (which can occasionally
+    /// overshoot a higher threshold by chance, about 1-in-16 per extra `BRIDGE_DIFFICULTY_STEP_BITS`
+    /// step), this guarantees the result does NOT satisfy any higher threshold, which is what an
+    /// escalation-rejection assertion actually needs to be deterministic rather than flaky.
+    fn solve_bridge_pow_exact(unsigned: &UnsignedBridgeDeclaration, exact_bits: u32) -> BridgeProofOfWork {
+        let mut nonce = 0u64;
+        loop {
+            let candidate = BridgeProofOfWork { nonce };
+            if leading_zero_bits(&bridge_pow_hash(unsigned, &candidate).unwrap()) == exact_bits {
+                return candidate;
+            }
+            nonce += 1;
+        }
     }
 
     #[test]
@@ -639,9 +700,11 @@ mod tests {
             BASE_BRIDGE_DIFFICULTY_BITS + BRIDGE_DIFFICULTY_STEP_BITS
         );
 
-        // A stale proof solved at the base difficulty is no longer enough for peer b.
+        // A stale proof solved at the base difficulty is no longer enough for peer b. Solved to
+        // *exactly* the base difficulty (not merely >=) so this assertion is deterministic --
+        // `solve`'s `>=` search can occasionally overshoot a higher threshold by chance.
         let decl_b = build_and_sign(&b, "global", member.clone(), 1_000).unwrap();
-        let stale_pow = BridgeProofOfWork::solve(&decl_b.unsigned, BASE_BRIDGE_DIFFICULTY_BITS);
+        let stale_pow = solve_bridge_pow_exact(&decl_b.unsigned, BASE_BRIDGE_DIFFICULTY_BITS);
         let err = tree.add(&decl_b, stale_pow, 1_010).unwrap_err();
         let expected_bits = BASE_BRIDGE_DIFFICULTY_BITS + BRIDGE_DIFFICULTY_STEP_BITS;
         assert!(matches!(err, BridgeError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));

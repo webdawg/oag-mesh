@@ -58,12 +58,13 @@ escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-ev
 federated corroboration weighted by distinct cluster rather than distinct peer, also with its own
 escalating proof-of-work anti-sybil protection (`spec/05-federated-corroboration.md`) — all three
 over a real HTTP transport (`spec/04-transport.md`) where every submission now carries its
-mechanism's proof-of-work alongside the signed payload. A `ClaimReport`'s self-asserted cluster
-can also be cross-checked against real cluster-nesting data
+mechanism's proof-of-work alongside the signed payload, and manual (not automatic, not
+crash-safe) disk persistence for all three stores (`spec/08-persistence.md`). A `ClaimReport`'s
+self-asserted cluster can also be cross-checked against real cluster-nesting data
 (`best_corroborated_value_cross_checked`, `GET .../best-cross-checked`) — confirming the claimed
 cluster *name* was really attested by a `BridgeDeclaration`, though not that the reporting peer
 actually belongs to it; see `spec/02`'s and `spec/05`'s own sections on where those lines are
 drawn. Still open: confirming a reporting peer's actual standing in the cluster it claims,
 verifying that distinct `PeerIdentity`s are genuinely different organizations rather than just
-different keys (proof-of-work taxes cost, not identity), and dispatch-to-a-responder for
-anonymous events. See `spec/01-overview.md`.
+different keys (proof-of-work taxes cost, not identity), pull-based anti-entropy, and
+dispatch-to-a-responder for anonymous events. See `spec/01-overview.md`.

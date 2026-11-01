@@ -1,14 +1,16 @@
 # Overview
 
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), with a
-real HTTP transport for all of them (`spec/04-transport.md`). All three now require escalating
-proof-of-work before recording a submission (`spec/02`'s, `spec/03`'s, and `spec/05`'s own
-"Anti-sybil"/"Anti-spam" sections), and `spec/05`'s claim reports are cross-checked against real
-cluster nesting for half the gap that mattered (the cluster *name* being real) -- see `spec/02`'s
-and `spec/05`'s own sections for exactly what each does and does not cover. Dispatch-to-a-
-responder for anonymous events, confirming a reporting peer's actual *standing* in the cluster it
-claims, and verifying that distinct `PeerIdentity`s are genuinely different organizations (not
-just different keys), are not.**
+real HTTP transport for all of them (`spec/04-transport.md`) and manual, non-crash-safe
+persistence for all three stores (`spec/08-persistence.md`). All three message types now
+require escalating proof-of-work before recording a submission (`spec/02`'s, `spec/03`'s, and
+`spec/05`'s own "Anti-sybil"/"Anti-spam" sections), and `spec/05`'s claim reports are
+cross-checked against real cluster nesting for half the gap that mattered (the cluster *name*
+being real) -- see `spec/02`'s and `spec/05`'s own sections for exactly what each does and does
+not cover. Dispatch-to-a-responder for anonymous events, confirming a reporting peer's actual
+*standing* in the cluster it claims, verifying that distinct `PeerIdentity`s are genuinely
+different organizations (not just different keys), pull-based anti-entropy, and automatic/
+crash-safe persistence, are not.**
 
 ## What this layer is
 

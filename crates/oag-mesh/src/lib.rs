@@ -15,6 +15,7 @@
 pub mod anonymous_event;
 pub mod bridge;
 pub mod corroboration;
+pub mod persistence;
 pub mod transport;
 
 pub use anonymous_event::{
@@ -22,11 +23,13 @@ pub use anonymous_event::{
     ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
 };
 pub use bridge::{
-    BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree, UnsignedBridgeDeclaration,
-    BASE_BRIDGE_DIFFICULTY_BITS, BRIDGE_DIFFICULTY_STEP_BITS,
+    BridgeDeclaration, BridgeEdgeSnapshot, BridgeError, BridgeProofOfWork, MeshMember, MeshTree,
+    UnsignedBridgeDeclaration, BASE_BRIDGE_DIFFICULTY_BITS, BRIDGE_DIFFICULTY_STEP_BITS,
 };
 pub use corroboration::{
-    ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork, CrossCheckedAgreement,
-    UnsignedClaimReport, BASE_CLAIM_REPORT_DIFFICULTY_BITS, CLAIM_REPORT_DIFFICULTY_STEP_BITS,
+    ClaimAgreement, ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork, ClaimSnapshot,
+    CrossCheckedAgreement, RecordedReportSnapshot, UnsignedClaimReport, BASE_CLAIM_REPORT_DIFFICULTY_BITS,
+    CLAIM_REPORT_DIFFICULTY_STEP_BITS,
 };
+pub use persistence::PersistenceError;
 pub use transport::{BridgeDeclarationSubmission, ClaimReportSubmission, MeshState, PushError};

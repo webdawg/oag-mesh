@@ -93,6 +93,48 @@ impl MeshState {
             http: Arc::new(reqwest::Client::new()),
         }
     }
+
+    /// Snapshots all three in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
+    /// and `anonymous_events.json` under `dir`, overwriting whatever was there -- see
+    /// `persistence`'s own module doc comment for what this does and does not guarantee
+    /// (not atomic, not crash-safe, rewrites the whole file every call). This crate doesn't call
+    /// this automatically on any write; a caller decides when to save (periodically, on a clean
+    /// shutdown, after every N writes -- whatever fits its own deployment).
+    pub fn save_to_dir(&self, dir: &std::path::Path) -> Result<(), crate::persistence::PersistenceError> {
+        crate::persistence::save_json(&dir.join("bridge_tree.json"), &self.tree.read().unwrap().snapshot())?;
+        crate::persistence::save_json(
+            &dir.join("claim_corroboration.json"),
+            &self.claim_corroboration.read().unwrap().snapshot(),
+        )?;
+        crate::persistence::save_json(&dir.join("anonymous_events.json"), &*self.event_log.read().unwrap())?;
+        Ok(())
+    }
+
+    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the three stores from
+    /// whatever `save_to_dir` previously wrote to `dir` -- or starting empty for any file that
+    /// doesn't exist yet (a brand-new node's first run).
+    pub fn load_from_dir(
+        identity: oag_crypto::PeerIdentity,
+        peers: Vec<String>,
+        dir: &std::path::Path,
+    ) -> Result<Self, crate::persistence::PersistenceError> {
+        let tree = crate::persistence::load_json(&dir.join("bridge_tree.json"))?
+            .map(MeshTree::from_snapshot)
+            .unwrap_or_default();
+        let claim_corroboration = crate::persistence::load_json(&dir.join("claim_corroboration.json"))?
+            .map(ClaimCorroboration::from_snapshot)
+            .unwrap_or_default();
+        let event_log: AnonymousEventLog =
+            crate::persistence::load_json(&dir.join("anonymous_events.json"))?.unwrap_or_default();
+        Ok(Self {
+            identity: Arc::new(identity),
+            tree: Arc::new(RwLock::new(tree)),
+            event_log: Arc::new(RwLock::new(event_log)),
+            claim_corroboration: Arc::new(RwLock::new(claim_corroboration)),
+            peers: Arc::new(peers),
+            http: Arc::new(reqwest::Client::new()),
+        })
+    }
 }
 
 pub fn router(state: MeshState) -> Router {
@@ -672,5 +714,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(body["best"].is_null());
+    }
+
+    #[tokio::test]
+    async fn save_to_dir_then_load_from_dir_round_trips_all_three_stores() {
+        let (_addr_a, state_a) = spawn(vec![]).await;
+
+        // Populate all three stores with one real entry each.
+        let bridge_signer = PeerIdentity::generate();
+        let decl =
+            crate::bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("persist-test".into()), now_unix())
+                .unwrap();
+        let bridge_pow = solve_bridge_pow(&state_a, &decl);
+        state_a.tree.write().unwrap().add(&decl, bridge_pow, now_unix()).unwrap();
+
+        let reporter = PeerIdentity::generate();
+        let report =
+            crate::corroboration::build_and_sign(&reporter, "claim-persist-test", "cluster-a", "blake3:abc", now_unix())
+                .unwrap();
+        let claim_pow = solve_claim_pow(&state_a, &report);
+        state_a.claim_corroboration.write().unwrap().add(&report, claim_pow, now_unix()).unwrap();
+
+        let event = valid_event("persist-test-nonce");
+        let event_pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        state_a.event_log.write().unwrap().record(event, event_pow).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("oag-mesh-transport-persist-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        state_a.save_to_dir(&dir).unwrap();
+
+        let loaded = MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir).unwrap();
+        assert_eq!(
+            loaded.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("persist-test".into())),
+            1
+        );
+        assert_eq!(loaded.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-persist-test", "blake3:abc"), 1);
+        assert_eq!(loaded.event_log.read().unwrap().corroboration_for("persist-test-nonce"), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn load_from_dir_against_a_nonexistent_directory_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("oag-mesh-transport-persist-missing-{}", std::process::id()));
+        let loaded = MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir).unwrap();
+        assert!(loaded.tree.read().unwrap().members_of("global", 1).is_empty());
+        assert_eq!(loaded.event_log.read().unwrap().corroboration_for("anything"), 0);
     }
 }

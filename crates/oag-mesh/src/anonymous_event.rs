@@ -224,7 +224,13 @@ impl AnonymousEvent {
 /// equivalent of `bridge::MeshTree`'s distinct-peer corroboration count, except the signal here
 /// is "how many independently-submitted reports share this nonce," since there's no identity to
 /// count distinctness by.
-#[derive(Debug, Default)]
+///
+/// Derives `Serialize`/`Deserialize` directly (no snapshot-type indirection, unlike
+/// `bridge::MeshTree`/`corroboration::ClaimCorroboration`) because `AnonymousEvent` carries no
+/// `PeerId` at all -- identity-stripped by design -- so there's nothing here that needs a
+/// string round-trip to serialize. See `persistence::save_json`/`load_json` for how this gets
+/// written to and read from disk.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AnonymousEventLog {
     events: std::collections::HashMap<String, Vec<AnonymousEvent>>,
 }
@@ -293,6 +299,22 @@ mod tests {
         let required = log.required_difficulty_bits(&event.corroboration_nonce);
         let pow = ProofOfWork::solve(&event, required);
         log.record(event, pow)
+    }
+
+    /// Solves for a nonce whose hash has *exactly* `exact_bits` leading zero bits, not merely
+    /// at least -- unlike `ProofOfWork::solve`'s `>=` search (which can occasionally overshoot a
+    /// higher threshold by chance), this guarantees the result does NOT satisfy any higher
+    /// threshold, which is what an escalation-rejection assertion actually needs to be
+    /// deterministic rather than flaky.
+    fn solve_exact(event: &AnonymousEvent, exact_bits: u32) -> ProofOfWork {
+        let mut nonce = 0u64;
+        loop {
+            let candidate = ProofOfWork { nonce };
+            if leading_zero_bits(&proof_of_work_hash(event, &candidate)) == exact_bits {
+                return candidate;
+            }
+            nonce += 1;
+        }
     }
 
     #[test]
@@ -386,9 +408,12 @@ mod tests {
         assert_eq!(log.required_difficulty_bits(nonce), BASE_DIFFICULTY_BITS + 2 * DIFFICULTY_STEP_BITS);
 
         // A proof solved for the *first* report's difficulty is no longer enough for a third.
+        // Solved to *exactly* the base difficulty (not merely >=) so this assertion is
+        // deterministic -- `solve`'s `>=` search can occasionally overshoot a higher threshold
+        // by chance.
         let mut third = valid_event(nonce);
         third.event_id = "evt-3".to_string();
-        let stale_pow = ProofOfWork::solve(&third, BASE_DIFFICULTY_BITS);
+        let stale_pow = solve_exact(&third, BASE_DIFFICULTY_BITS);
         let err = log.record(third, stale_pow).unwrap_err();
         assert_eq!(
             err,

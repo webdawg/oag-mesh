@@ -125,8 +125,10 @@ different organizations (see `spec/01-overview.md`'s open questions for that rem
   "Anti-sybil resistance" above for what `ClaimReportProofOfWork` does and does not achieve --
   stated there as plainly as `anonymous_event.rs`'s own identical caveat: a well-resourced
   attacker is not stopped, only taxed.
-- **No persistence, no pull-based anti-entropy.** Same gaps as every other mechanism in this
-  crate -- `ClaimCorroboration` is in-memory, and `broadcast_claim_report` is push-only.
+- **Manual, non-crash-safe persistence now exists (`spec/08-persistence.md`); no pull-based
+  anti-entropy.** `ClaimCorroboration::snapshot`/`from_snapshot` cover save/load, but nothing
+  calls them automatically, and `broadcast_claim_report` is still push-only -- a peer offline at
+  broadcast time never gets a report unless something else re-pushes it later.
 - **The read endpoint is node-local, not network-wide.** `GET /oag-mesh/v1/claim-report/{claim_id}/best`
   answers from whatever this one node has received so far -- it does not fan out to other mesh
   nodes to assemble a wider view. A caller wanting the whole mesh's picture has to ask multiple

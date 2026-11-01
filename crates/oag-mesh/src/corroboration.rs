@@ -396,6 +396,65 @@ impl ClaimCorroboration {
             })
             .unwrap_or(0)
     }
+
+    /// A persistable snapshot of every report this struct currently holds, grouped by
+    /// `claim_id`. `PeerId` has no `Serialize`/`Deserialize` of its own, so it round-trips
+    /// through its `Display`/`FromStr` string form -- same convention as
+    /// `bridge::MeshTree::snapshot`. See `ClaimCorroboration::from_snapshot` for the inverse.
+    pub fn snapshot(&self) -> Vec<ClaimSnapshot> {
+        self.reports
+            .iter()
+            .map(|(claim_id, reports)| ClaimSnapshot {
+                claim_id: claim_id.clone(),
+                reports: reports
+                    .iter()
+                    .map(|r| RecordedReportSnapshot {
+                        peer_id: r.peer_id.to_string(),
+                        reporter_cluster: r.reporter_cluster.clone(),
+                        observed_value_hash: r.observed_value_hash.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Rebuilds a `ClaimCorroboration` from `snapshot` (e.g. loaded from disk via
+    /// `persistence::load_json`). A peer id string that fails to parse is dropped with a
+    /// warning rather than failing the whole load -- same posture as
+    /// `bridge::MeshTree::from_snapshot`.
+    pub fn from_snapshot(snapshot: Vec<ClaimSnapshot>) -> Self {
+        let mut corroboration = Self::new();
+        for claim in snapshot {
+            let mut reports = Vec::new();
+            for r in claim.reports {
+                match r.peer_id.parse::<PeerId>() {
+                    Ok(peer_id) => reports.push(RecordedReport {
+                        peer_id,
+                        reporter_cluster: r.reporter_cluster,
+                        observed_value_hash: r.observed_value_hash,
+                    }),
+                    Err(e) => tracing::warn!(peer_id = %r.peer_id, error = %e, "dropping unparsable peer id from persisted claim corroboration snapshot"),
+                }
+            }
+            corroboration.reports.insert(claim.claim_id, reports);
+        }
+        corroboration
+    }
+}
+
+/// See `ClaimCorroboration::snapshot`/`ClaimCorroboration::from_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordedReportSnapshot {
+    pub peer_id: String,
+    pub reporter_cluster: String,
+    pub observed_value_hash: String,
+}
+
+/// See `ClaimCorroboration::snapshot`/`ClaimCorroboration::from_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimSnapshot {
+    pub claim_id: String,
+    pub reports: Vec<RecordedReportSnapshot>,
 }
 
 #[cfg(test)]
@@ -418,6 +477,22 @@ mod tests {
         let required = corroboration.required_difficulty_bits(&report.unsigned.claim_id, &report.unsigned.reporter_cluster);
         let pow = ClaimReportProofOfWork::solve(&report.unsigned, required);
         corroboration.add(report, pow, now)
+    }
+
+    /// Solves for a nonce whose hash has *exactly* `exact_bits` leading zero bits, not merely
+    /// at least -- unlike `ClaimReportProofOfWork::solve`'s `>=` search (which can occasionally
+    /// overshoot a higher threshold by chance), this guarantees the result does NOT satisfy any
+    /// higher threshold, which is what an escalation-rejection assertion actually needs to be
+    /// deterministic rather than flaky.
+    fn solve_claim_report_pow_exact(report: &UnsignedClaimReport, exact_bits: u32) -> ClaimReportProofOfWork {
+        let mut nonce = 0u64;
+        loop {
+            let candidate = ClaimReportProofOfWork { nonce };
+            if leading_zero_bits(&claim_report_pow_hash(report, &candidate)) == exact_bits {
+                return candidate;
+            }
+            nonce += 1;
+        }
     }
 
     #[test]
@@ -640,8 +715,11 @@ mod tests {
         );
 
         // A stale proof solved at the base difficulty is no longer enough for this new cluster.
+        // Solved to *exactly* the base difficulty (not merely >=) so this assertion is
+        // deterministic -- `solve`'s `>=` search can occasionally overshoot a higher threshold
+        // by chance.
         let report_b = build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap();
-        let stale_pow = ClaimReportProofOfWork::solve(&report_b.unsigned, BASE_CLAIM_REPORT_DIFFICULTY_BITS);
+        let stale_pow = solve_claim_report_pow_exact(&report_b.unsigned, BASE_CLAIM_REPORT_DIFFICULTY_BITS);
         let err = corroboration.add(&report_b, stale_pow, now()).unwrap_err();
         let expected_bits = BASE_CLAIM_REPORT_DIFFICULTY_BITS + CLAIM_REPORT_DIFFICULTY_STEP_BITS;
         assert!(matches!(err, ClaimReportError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));

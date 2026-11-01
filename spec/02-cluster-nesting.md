@@ -72,8 +72,10 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
   other mesh nodes by being pushed to a static, operator-configured peer list
   (`broadcast_bridge_declaration`) — there is no pull-based anti-entropy, so a peer offline at
   broadcast time simply never gets it unless something else re-pushes it later.
-- **No persistence.** `MeshTree` is in-memory, rebuilt from whatever declarations are fed to it
-  (including over the transport above) each time a process starts.
+- **Persistence exists now (`spec/08-persistence.md`), but is manual and not crash-safe.**
+  `MeshTree::snapshot`/`from_snapshot` let a caller save/load this tree to/from disk via
+  `transport::MeshState::save_to_dir`/`load_from_dir` -- nothing calls this automatically, and a
+  crash mid-write can still lose or corrupt the file. Still in-memory at runtime either way.
 - **No interaction with the base project's `FederationPolicy`/trust machinery.** A base cluster
   being nested under a mesh-group does not, by itself, change how the base project's own peers
   federate with each other — see `spec/01-overview.md`'s "not a trust merger" note.

@@ -14,6 +14,7 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | [03-anonymous-event-rfc.md](03-anonymous-event-rfc.md) | Identity-stripped event reports ("SAW THIS EVENT") for life-saving actions — strict schema, coarse location/time, corroboration without identity |
 | [04-transport.md](04-transport.md) | A real HTTP transport for all three mechanisms, on its own layer/port — explicit that it gives `AnonymousEvent` submission no network-level anonymity on top of its already-anonymous payload |
 | [05-federated-corroboration.md](05-federated-corroboration.md) | Signed claim reports, weighted by distinct self-asserted cluster rather than distinct peer — generalizes the base project's gateway quorum fan-out across organizational boundaries |
+| [08-persistence.md](08-persistence.md) | One JSON file per in-memory store, written/read on demand — not automatic, not atomic, not a database |
 
 ## Proposed research-data extension (not implemented)
 
