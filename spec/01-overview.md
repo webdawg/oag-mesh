@@ -2,30 +2,33 @@
 
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), plus a
 fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half of a gap
-`spec/02`/`spec/05` both left open. A real HTTP transport covers all four
+`spec/02`/`spec/05` both left open, and a fifth, `spec/12-responder-acknowledgment.md`, that adds
+an advisory, signed claim-to-handling layered on `spec/03`'s own search primitive
+(`spec/11-responder-search.md`). A real HTTP transport covers all five
 (`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
 (`pull_and_merge`/`sync_with_all_peers`, `spec/10-anti-entropy.md`) now reaching a peer that was
-offline for a specific broadcast, and manual, non-crash-safe persistence covers all four stores
-(`spec/08-persistence.md`). All four message types now require escalating proof-of-work before
-recording a submission (`spec/02`'s, `spec/03`'s, `spec/05`'s, and `spec/09`'s own
-"Anti-sybil"/"Anti-spam" sections). `spec/05`'s claim reports can be cross-checked against real
-cluster nesting alone (the cluster *name* being real,
+offline for a specific broadcast, and manual, non-crash-safe persistence covers all five stores
+(`spec/08-persistence.md`). Four of the five message types now require escalating proof-of-work
+before recording a submission (`spec/02`'s, `spec/03`'s, `spec/05`'s, and `spec/09`'s own
+"Anti-sybil"/"Anti-spam" sections) -- `spec/12`'s `ResponderAcknowledgment` deliberately carries
+none, for reasons stated in that file. `spec/05`'s claim reports can be cross-checked against
+real cluster nesting alone (the cluster *name* being real,
 `best_corroborated_value_cross_checked`) or against both that **and** `spec/09`'s membership
 attestations (the *reporter's own standing* in that cluster,
 `best_corroborated_value_fully_cross_checked`) -- see `spec/02`'s, `spec/05`'s, and `spec/09`'s
 own sections for exactly what each layer does and does not cover; even fully cross-checked, an
 attester's own standing is itself unverified, one level deeper still. Full dispatch-to-a-responder
-for anonymous events is still not designed, though one narrow slice of it now is --
-`spec/11-responder-search.md`'s filterable, anonymous search over a node's own log -- explicitly
-not dispatch, notification, or duplicate-response prevention, see that file for where the line is
-drawn. Verifying that distinct `PeerIdentity`s are genuinely different organizations (not just
-different keys), and automatic/crash-safe persistence, remain unaddressed. Pull-based
-anti-entropy's own trade-off -- it trusts a peer's prior verification rather than re-deriving it,
-a weaker guarantee than push -- is stated in `spec/10`'s own section on exactly that.**
+for anonymous events is still not designed -- `spec/11`'s search and `spec/12`'s acknowledgment
+are the two narrow, explicitly-bounded slices of it this crate answers, neither of them
+notification, delivery, or a guarantee that a claimed response is real. Verifying that distinct
+`PeerIdentity`s are genuinely different organizations (not just different keys), and
+automatic/crash-safe persistence, remain unaddressed. Pull-based anti-entropy's own trade-off --
+it trusts a peer's prior verification rather than re-deriving it, a weaker guarantee than push --
+is stated in `spec/10`'s own section on exactly that.**
 
 ## What this layer is
 
-Four related mechanisms, one level above a single `oag` peer or peer cluster:
+Five related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -83,6 +86,15 @@ Four related mechanisms, one level above a single `oag` peer or peer cluster:
    taxing the cost of becoming a new distinct attester for one membership claim. Does not verify
    the attester's own standing in C either — stated plainly in `spec/09`, the same
    "proof-of-work bounds cost, not identity" gap one level deeper.
+5. **Responder acknowledgment, implemented — see `spec/12-responder-acknowledgment.md`.** Layers
+   on top of mechanism (3)'s search primitive: a responder signs a `ResponderAcknowledgment`
+   ("I am handling the event at this `corroboration_nonce`"), so a second responder checking
+   first can see it and stand down. Unlike `AnonymousEvent`, this one *does* carry a real
+   `PeerIdentity` -- a responder isn't the vulnerable party the reporter-anonymity constraint
+   exists to protect. Deliberately carries no proof-of-work (there's no corroboration count here
+   worth taxing), which leaves open a real, explicitly-stated risk: a bad-faith identity could
+   falsely claim to be handling events specifically to suppress genuine responders, and nothing
+   here detects or prevents that in the moment.
 
 ## What this layer explicitly is not
 
@@ -119,23 +131,25 @@ collection, vault, or release capability. See that RFC for current requirements 
   identity at all to attach a cluster claim to, so the same fix doesn't transfer — it still just
   counts raw report volume under a nonce, mitigated only by proof-of-work's escalating cost, a
   different (and weaker) kind of "independent enough."
-- A real HTTP transport exists now for all four mechanisms (`spec/04-transport.md`), with both
+- A real HTTP transport exists now for all five mechanisms (`spec/04-transport.md`), with both
   push and pull-based anti-entropy (`spec/10-anti-entropy.md`), and explicit that it does not
   give `AnonymousEvent` submissions any network-level anonymity on top of their already-anonymous
-  payload. All four message types now require escalating proof-of-work before being recorded --
-  `BridgeDeclaration` (`spec/02`'s "Anti-sybil resistance"), `AnonymousEvent` (`spec/03`'s
-  "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s "Anti-sybil resistance"), and
-  `MembershipAttestation` (`spec/09`'s "Anti-sybil resistance") -- real mitigations, not full
+  payload. Four of the five message types now require escalating proof-of-work before being
+  recorded -- `BridgeDeclaration` (`spec/02`'s "Anti-sybil resistance"), `AnonymousEvent`
+  (`spec/03`'s "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s "Anti-sybil resistance"),
+  and `MembershipAttestation` (`spec/09`'s "Anti-sybil resistance") -- real mitigations, not full
   solutions, and each says so explicitly: none stops a well-resourced attacker, each only taxes
   the specific thing its own mechanism's corroboration count depends on (a new distinct peer on a
   mesh edge, raw report volume under a nonce, a new distinct cluster on a claim, or a new distinct
-  attester on a membership claim, respectively).
-- **Proof-of-work bounds cost, not identity.** Across all four mechanisms, a well-resourced
-  single operator can still pay the escalating cost to mint several real, distinct
-  `PeerIdentity`s and have each independently corroborate the same fact -- proof-of-work makes
-  that cost something instead of nothing, it does not verify the identities behind it are
+  attester on a membership claim, respectively). `ResponderAcknowledgment` (`spec/12`) is the
+  fifth, and deliberately carries none -- its own open risk (a false "I'm handling this" claim
+  suppressing a real responder) is a different shape proof-of-work wouldn't have addressed anyway.
+- **Proof-of-work bounds cost, not identity.** Across the four proof-of-work-bearing mechanisms,
+  a well-resourced single operator can still pay the escalating cost to mint several real,
+  distinct `PeerIdentity`s and have each independently corroborate the same fact -- proof-of-work
+  makes that cost something instead of nothing, it does not verify the identities behind it are
   genuinely different organizations. This is the same "independent enough" gap as the bullet
-  above, now stated once for all four mechanisms rather than per-mechanism: no amount of
+  above, now stated once for those four mechanisms rather than per-mechanism: no amount of
   proof-of-work alone, as designed here, resolves it. `spec/09-cluster-membership-attestation.md`
   closes the specific gap this bullet used to flag -- a fabricated claim of *membership* in a
   real, already-attested cluster is no longer free to make pass unnoticed, since
@@ -146,6 +160,15 @@ collection, vault, or release capability. See that RFC for current requirements 
   still works, just no longer for free, and with one more layer of indirection to climb through.
   See `spec/02`'s, `spec/03`'s, `spec/04`'s, `spec/05`'s, and `spec/09`'s own "open questions"
   sections for what else is still unresolved.
+- **A signed identity protects against sybil inflation; it does not protect against a single
+  bad-faith identity making a false claim.** `spec/12-responder-acknowledgment.md`'s
+  `ResponderAcknowledgment` is the one mechanism here where this distinction actually matters:
+  it has no corroboration count to sybil-inflate (more claimed responders isn't a stronger
+  signal), so its real risk isn't "mint many identities," it's "one real, traceable identity
+  lies about handling an event to suppress a genuine responder." Accountability-after-the-fact
+  (the identity is at least attributable) is the only mitigation; nothing here detects or
+  prevents it in the moment, and no amount of proof-of-work would have, either -- a genuinely
+  different open question from every other mechanism's "mint fresh identities" gap above.
 - **Pull-based anti-entropy trusts a peer's own prior verification, it does not re-derive it.**
   `spec/10-anti-entropy.md`'s `pull_and_merge` closes the "offline during a broadcast" gap by
   merging a peer's whole snapshot, but a snapshot has already collapsed past the original signed

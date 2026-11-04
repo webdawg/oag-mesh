@@ -40,6 +40,7 @@ use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, Pro
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
+use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -80,6 +81,15 @@ pub struct MembershipAttestationSubmission {
     pub pow: MembershipProofOfWork,
 }
 
+/// The wire shape for `POST /oag-mesh/v1/responder-acknowledgment` -- just the signed
+/// acknowledgment, no proof-of-work alongside it. See `responder.rs`'s own top-level doc comment
+/// for why this mechanism deliberately carries none, unlike the other three signed submission
+/// types above.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponderAcknowledgmentSubmission {
+    pub acknowledgment: ResponderAcknowledgment,
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
@@ -91,6 +101,7 @@ pub struct MeshState {
     pub event_log: Arc<RwLock<AnonymousEventLog>>,
     pub claim_corroboration: Arc<RwLock<ClaimCorroboration>>,
     pub membership_registry: Arc<RwLock<MembershipRegistry>>,
+    pub responder_acknowledgments: Arc<RwLock<ResponderAcknowledgmentLog>>,
     /// Other mesh nodes this one pushes its own declarations/events/reports to -- static,
     /// operator-configured, the same "hand-written topology, no automatic discovery" posture as
     /// the base project's own `[transfer].relay_peers`/`[gateway].query_peers`.
@@ -106,17 +117,19 @@ impl MeshState {
             event_log: Arc::new(RwLock::new(AnonymousEventLog::new())),
             claim_corroboration: Arc::new(RwLock::new(ClaimCorroboration::new())),
             membership_registry: Arc::new(RwLock::new(MembershipRegistry::new())),
+            responder_acknowledgments: Arc::new(RwLock::new(ResponderAcknowledgmentLog::new())),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
         }
     }
 
-    /// Snapshots all four in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
-    /// `anonymous_events.json`, and `membership_registry.json` under `dir`, overwriting whatever
-    /// was there -- see `persistence`'s own module doc comment for what this does and does not
-    /// guarantee (not atomic, not crash-safe, rewrites the whole file every call). This crate
-    /// doesn't call this automatically on any write; a caller decides when to save (periodically,
-    /// on a clean shutdown, after every N writes -- whatever fits its own deployment).
+    /// Snapshots all five in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
+    /// `anonymous_events.json`, `membership_registry.json`, and
+    /// `responder_acknowledgments.json` under `dir`, overwriting whatever was there -- see
+    /// `persistence`'s own module doc comment for what this does and does not guarantee (not
+    /// atomic, not crash-safe, rewrites the whole file every call). This crate doesn't call this
+    /// automatically on any write; a caller decides when to save (periodically, on a clean
+    /// shutdown, after every N writes -- whatever fits its own deployment).
     pub fn save_to_dir(&self, dir: &std::path::Path) -> Result<(), crate::persistence::PersistenceError> {
         crate::persistence::save_json(&dir.join("bridge_tree.json"), &self.tree.read().unwrap().snapshot())?;
         crate::persistence::save_json(
@@ -128,10 +141,14 @@ impl MeshState {
             &dir.join("membership_registry.json"),
             &self.membership_registry.read().unwrap().snapshot(),
         )?;
+        crate::persistence::save_json(
+            &dir.join("responder_acknowledgments.json"),
+            &self.responder_acknowledgments.read().unwrap().snapshot(),
+        )?;
         Ok(())
     }
 
-    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the four stores from
+    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the five stores from
     /// whatever `save_to_dir` previously wrote to `dir` -- or starting empty for any file that
     /// doesn't exist yet (a brand-new node's first run).
     pub fn load_from_dir(
@@ -150,12 +167,17 @@ impl MeshState {
         let membership_registry = crate::persistence::load_json(&dir.join("membership_registry.json"))?
             .map(MembershipRegistry::from_snapshot)
             .unwrap_or_default();
+        let responder_acknowledgments =
+            crate::persistence::load_json(&dir.join("responder_acknowledgments.json"))?
+                .map(ResponderAcknowledgmentLog::from_snapshot)
+                .unwrap_or_default();
         Ok(Self {
             identity: Arc::new(identity),
             tree: Arc::new(RwLock::new(tree)),
             event_log: Arc::new(RwLock::new(event_log)),
             claim_corroboration: Arc::new(RwLock::new(claim_corroboration)),
             membership_registry: Arc::new(RwLock::new(membership_registry)),
+            responder_acknowledgments: Arc::new(RwLock::new(responder_acknowledgments)),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
         })
@@ -169,6 +191,11 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/anonymous-event/search", get(search_anonymous_events))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
+        .route("/oag-mesh/v1/responder-acknowledgment", post(receive_responder_acknowledgment))
+        .route(
+            "/oag-mesh/v1/responder-acknowledgment/{corroboration_nonce}",
+            get(get_active_responders),
+        )
         .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
         .route(
             "/oag-mesh/v1/claim-report/{claim_id}/best-cross-checked",
@@ -182,6 +209,7 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/sync/claim-corroboration", get(get_claim_corroboration_snapshot))
         .route("/oag-mesh/v1/sync/membership-registry", get(get_membership_registry_snapshot))
         .route("/oag-mesh/v1/sync/anonymous-events", get(get_anonymous_event_log_snapshot))
+        .route("/oag-mesh/v1/sync/responder-acknowledgments", get(get_responder_acknowledgment_snapshot))
         .with_state(state)
 }
 
@@ -352,6 +380,53 @@ fn membership_error_response(e: MembershipError) -> Response {
     (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
 }
 
+/// Receives a `ResponderAcknowledgmentSubmission` (just the signed acknowledgment, no
+/// proof-of-work -- see `responder.rs`'s own doc comment for why) and records it into
+/// `state.responder_acknowledgments`, same signature/pairing/clock-skew checks as every other
+/// signed mechanism's receiver.
+async fn receive_responder_acknowledgment(
+    State(state): State<MeshState>,
+    Json(submission): Json<ResponderAcknowledgmentSubmission>,
+) -> Response {
+    let now = now_unix();
+    let result = {
+        let mut log = state.responder_acknowledgments.write().unwrap();
+        log.add(&submission.acknowledgment, now)
+    };
+    match result {
+        Ok(peer_id) => {
+            tracing::info!(%peer_id, corroboration_nonce = %submission.acknowledgment.unsigned.corroboration_nonce, "responder acknowledgment recorded");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => responder_acknowledgment_error_response(e),
+    }
+}
+
+fn responder_acknowledgment_error_response(e: ResponderAcknowledgmentError) -> Response {
+    let status = match &e {
+        ResponderAcknowledgmentError::PeerId(_)
+        | ResponderAcknowledgmentError::InvalidPublicKey
+        | ResponderAcknowledgmentError::PeerIdKeyMismatch
+        | ResponderAcknowledgmentError::BadSignatureEncoding
+        | ResponderAcknowledgmentError::BadSignature
+        | ResponderAcknowledgmentError::ClockSkew => StatusCode::BAD_REQUEST,
+        ResponderAcknowledgmentError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+}
+
+/// Read-only: every responder currently claiming to be handling `corroboration_nonce`, per
+/// `responder::ResponderAcknowledgmentLog::active_responders_for` -- **advisory only**, see
+/// `responder.rs`'s own doc comment and `spec/12-responder-acknowledgment.md` for exactly what
+/// a non-empty result does and does not guarantee. Same node-local-only, no-auth scope as every
+/// other `GET` endpoint here.
+async fn get_active_responders(State(state): State<MeshState>, Path(corroboration_nonce): Path<String>) -> Response {
+    let log = state.responder_acknowledgments.read().unwrap();
+    let responders: Vec<String> =
+        log.active_responders_for(&corroboration_nonce).into_iter().map(|p| p.to_string()).collect();
+    Json(serde_json::json!({ "active_responders": responders })).into_response()
+}
+
 /// Read-only: this node's own current view of `corroboration::ClaimCorroboration::
 /// best_corroborated_value` for `claim_id`, from whatever `ClaimReport`s it has received so far
 /// (its own, and anything pushed to it). `null` if nothing has been reported for this claim to
@@ -456,6 +531,12 @@ async fn get_anonymous_event_log_snapshot(State(state): State<MeshState>) -> Res
     Json(&*state.event_log.read().unwrap()).into_response()
 }
 
+/// Read-only: this node's entire current `responder::ResponderAcknowledgmentLog`, as a snapshot
+/// -- see `get_bridge_tree_snapshot`'s doc comment for the shape of what this is for.
+async fn get_responder_acknowledgment_snapshot(State(state): State<MeshState>) -> Response {
+    Json(state.responder_acknowledgments.read().unwrap().snapshot()).into_response()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("request to {0} failed: {1}")]
@@ -519,6 +600,31 @@ pub async fn broadcast_membership_attestation(state: &MeshState, attestation: &M
     for peer in state.peers.iter() {
         if let Err(e) = push_membership_attestation(&state.http, peer, attestation, pow).await {
             tracing::warn!(peer, error = %e, "failed to push membership attestation to peer");
+        }
+    }
+}
+
+pub async fn push_responder_acknowledgment(
+    http: &reqwest::Client,
+    address: &str,
+    acknowledgment: &ResponderAcknowledgment,
+) -> Result<(), PushError> {
+    let url = format!("{}/oag-mesh/v1/responder-acknowledgment", address.trim_end_matches('/'));
+    let submission = ResponderAcknowledgmentSubmission { acknowledgment: acknowledgment.clone() };
+    let response =
+        http.post(&url).json(&submission).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PushError::Rejected(address.to_string(), response.status()));
+    }
+    Ok(())
+}
+
+/// Same best-effort push, for a responder acknowledgment -- no proof-of-work to solve first,
+/// unlike every other broadcast function here (see `responder.rs`'s own doc comment for why).
+pub async fn broadcast_responder_acknowledgment(state: &MeshState, acknowledgment: &ResponderAcknowledgment) {
+    for peer in state.peers.iter() {
+        if let Err(e) = push_responder_acknowledgment(&state.http, peer, acknowledgment).await {
+            tracing::warn!(peer, error = %e, "failed to push responder acknowledgment to peer");
         }
     }
 }
@@ -661,6 +767,10 @@ pub async fn pull_and_merge(state: &MeshState, address: &str) {
         Ok(log) => state.event_log.write().unwrap().merge(log),
         Err(e) => tracing::warn!(address, error = %e, "failed to pull anonymous events from peer"),
     }
+    match pull_responder_acknowledgments(&state.http, address).await {
+        Ok(snapshot) => state.responder_acknowledgments.write().unwrap().merge_snapshot(snapshot),
+        Err(e) => tracing::warn!(address, error = %e, "failed to pull responder acknowledgments from peer"),
+    }
 }
 
 /// Same best-effort pull-and-merge as `pull_and_merge`, against every peer on `state.peers` in
@@ -719,6 +829,18 @@ pub async fn pull_membership_registry(
 
 pub async fn pull_anonymous_events(http: &reqwest::Client, address: &str) -> Result<AnonymousEventLog, PullError> {
     let url = format!("{}/oag-mesh/v1/sync/anonymous-events", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
+}
+
+pub async fn pull_responder_acknowledgments(
+    http: &reqwest::Client,
+    address: &str,
+) -> Result<Vec<crate::responder::ResponderAcknowledgmentSnapshot>, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/responder-acknowledgments", address.trim_end_matches('/'));
     let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
     if !response.status().is_success() {
         return Err(PullError::Rejected(address.to_string(), response.status()));
@@ -1066,10 +1188,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_to_dir_then_load_from_dir_round_trips_all_four_stores() {
+    async fn save_to_dir_then_load_from_dir_round_trips_all_five_stores() {
         let (_addr_a, state_a) = spawn(vec![]).await;
 
-        // Populate all four stores with one real entry each.
+        // Populate all five stores with one real entry each.
         let bridge_signer = PeerIdentity::generate();
         let decl =
             crate::bridge::build_and_sign(&bridge_signer, "global", MeshMember::BaseCluster("persist-test".into()), now_unix())
@@ -1095,6 +1217,10 @@ mod tests {
         let membership_pow = solve_membership_pow(&state_a, &attestation);
         state_a.membership_registry.write().unwrap().add(&attestation, membership_pow, now_unix()).unwrap();
 
+        let responder = PeerIdentity::generate();
+        let ack = crate::responder::build_and_sign(&responder, "ack-persist-test", true, now_unix()).unwrap();
+        state_a.responder_acknowledgments.write().unwrap().add(&ack, now_unix()).unwrap();
+
         let dir = std::env::temp_dir().join(format!("oag-mesh-transport-persist-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         state_a.save_to_dir(&dir).unwrap();
@@ -1107,6 +1233,10 @@ mod tests {
         assert_eq!(loaded.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-persist-test", "blake3:abc"), 1);
         assert_eq!(loaded.event_log.read().unwrap().corroboration_for("persist-test-nonce"), 1);
         assert!(loaded.membership_registry.read().unwrap().is_attested_member("cluster-a", &subject.peer_id(), 1));
+        assert_eq!(
+            loaded.responder_acknowledgments.read().unwrap().active_responders_for("ack-persist-test"),
+            vec![responder.peer_id()]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1118,6 +1248,7 @@ mod tests {
         assert!(loaded.tree.read().unwrap().members_of("global", 1).is_empty());
         assert_eq!(loaded.event_log.read().unwrap().corroboration_for("anything"), 0);
         assert!(!loaded.membership_registry.read().unwrap().is_attested_member("anything", &PeerIdentity::generate().peer_id(), 1));
+        assert!(loaded.responder_acknowledgments.read().unwrap().active_responders_for("anything").is_empty());
     }
 
     #[tokio::test]
@@ -1172,6 +1303,70 @@ mod tests {
 
         assert!(state_a.membership_registry.read().unwrap().is_attested_member("cluster-broadcast-test", &subject.peer_id(), 1));
         assert!(state_b.membership_registry.read().unwrap().is_attested_member("cluster-broadcast-test", &subject.peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn a_pushed_responder_acknowledgment_is_recorded_and_readable_over_the_wire() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let responder = PeerIdentity::generate();
+        let ack = crate::responder::build_and_sign(&responder, "ack-wire-test", true, now_unix()).unwrap();
+
+        push_responder_acknowledgment(&reqwest::Client::new(), &addr_a, &ack).await.unwrap();
+
+        assert_eq!(
+            state_a.responder_acknowledgments.read().unwrap().active_responders_for("ack-wire-test"),
+            vec![responder.peer_id()]
+        );
+
+        let response =
+            reqwest::get(format!("{addr_a}/oag-mesh/v1/responder-acknowledgment/ack-wire-test")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["active_responders"].as_array().unwrap().len(), 1);
+        assert_eq!(body["active_responders"][0], responder.peer_id().to_string());
+    }
+
+    #[tokio::test]
+    async fn a_tampered_responder_acknowledgment_is_rejected_over_the_wire() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let responder = PeerIdentity::generate();
+        let mut ack = crate::responder::build_and_sign(&responder, "ack-tamper-test", true, now_unix()).unwrap();
+        ack.unsigned.corroboration_nonce = "tampered".to_string();
+
+        let err = push_responder_acknowledgment(&reqwest::Client::new(), &addr_a, &ack).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
+        assert!(state_a.responder_acknowledgments.read().unwrap().active_responders_for("tampered").is_empty());
+    }
+
+    #[tokio::test]
+    async fn broadcast_responder_acknowledgment_reaches_every_configured_peer() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_sender, sender_state) = spawn(vec![addr_a.clone(), addr_b.clone()]).await;
+
+        let responder = PeerIdentity::generate();
+        let ack = crate::responder::build_and_sign(&responder, "ack-broadcast-test", true, now_unix()).unwrap();
+
+        broadcast_responder_acknowledgment(&sender_state, &ack).await;
+
+        assert_eq!(
+            state_a.responder_acknowledgments.read().unwrap().active_responders_for("ack-broadcast-test"),
+            vec![responder.peer_id()]
+        );
+        assert_eq!(
+            state_b.responder_acknowledgments.read().unwrap().active_responders_for("ack-broadcast-test"),
+            vec![responder.peer_id()]
+        );
+    }
+
+    #[tokio::test]
+    async fn querying_active_responders_for_an_unknown_nonce_returns_an_empty_list() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let response =
+            reqwest::get(format!("{addr_a}/oag-mesh/v1/responder-acknowledgment/never-acknowledged")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["active_responders"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1251,7 +1446,7 @@ mod tests {
         let (addr_source, state_source) = spawn(vec![]).await;
         let (_addr_catcher, state_catcher) = spawn(vec![]).await;
 
-        // Populate the source node's four stores directly, as if it had received all this from
+        // Populate the source node's five stores directly, as if it had received all this from
         // broadcasts the catcher node was offline for.
         let bridge_signer = PeerIdentity::generate();
         let decl = crate::bridge::build_and_sign(
@@ -1287,6 +1482,10 @@ mod tests {
         let event_pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
         state_source.event_log.write().unwrap().record(event, event_pow).unwrap();
 
+        let responder = PeerIdentity::generate();
+        let ack = crate::responder::build_and_sign(&responder, "sync-test-nonce", true, now_unix()).unwrap();
+        state_source.responder_acknowledgments.write().unwrap().add(&ack, now_unix()).unwrap();
+
         // The catcher starts empty; one pull_and_merge call should bring it fully up to date.
         pull_and_merge(&state_catcher, &addr_source).await;
 
@@ -1300,6 +1499,10 @@ mod tests {
         );
         assert!(state_catcher.membership_registry.read().unwrap().is_attested_member("cluster-a", &subject.peer_id(), 1));
         assert_eq!(state_catcher.event_log.read().unwrap().corroboration_for("sync-test-nonce"), 1);
+        assert_eq!(
+            state_catcher.responder_acknowledgments.read().unwrap().active_responders_for("sync-test-nonce"),
+            vec![responder.peer_id()]
+        );
 
         // Pulling again (e.g. a periodic re-sync) must not inflate anything -- idempotent merge.
         pull_and_merge(&state_catcher, &addr_source).await;

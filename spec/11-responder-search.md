@@ -50,12 +50,13 @@ still apply unchanged) -- search only narrows what's already there, it cannot re
   this crate -- no registration, no address, no notification preference. Search is anonymous and
   stateless on both sides: querying it reveals nothing about who's asking, and it remembers
   nothing about who asked.
-- **No claim-to-avoid-duplicate-response.** Two different responders searching the same filter
-  see the exact same results, with nothing recording "someone is already handling this." A real
-  deployment layering dispatch on top of this would need its own, separate answer for that --
-  likely a signed acknowledgment from a responder identity, which (unlike a reporter's) *could*
-  reasonably carry a real `PeerIdentity` since responders are organizations, not the vulnerable
-  party being reported about. Not designed here.
+- **Claim-to-avoid-duplicate-response now exists (`spec/12-responder-acknowledgment.md`), but
+  it's advisory, not a lock.** A responder can sign a `ResponderAcknowledgment` saying "I am
+  handling this," queryable alongside a search, so a second responder checking first can stand
+  down -- but nothing *enforces* that, nothing verifies the claim reflects real action, and
+  nothing stops a bad-faith identity from acknowledging events it never intends to act on
+  specifically to suppress real responders. See `spec/12`'s own "what this explicitly is not"
+  for that stated plainly.
 - **Node-local only, same as every other `GET` endpoint in this crate.** Search answers from
   whatever this one node's `AnonymousEventLog` holds -- its own received submissions, plus
   whatever `spec/10-anti-entropy.md`'s pull-based sync has merged in from peers. It does not fan

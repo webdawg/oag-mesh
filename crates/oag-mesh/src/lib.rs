@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod corroboration;
 pub mod membership;
 pub mod persistence;
+pub mod responder;
 pub mod transport;
 
 pub use anonymous_event::{
@@ -37,7 +38,11 @@ pub use membership::{
     UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
 pub use persistence::PersistenceError;
+pub use responder::{
+    RecordedAcknowledgmentSnapshot, ResponderAcknowledgment, ResponderAcknowledgmentError,
+    ResponderAcknowledgmentLog, ResponderAcknowledgmentSnapshot, UnsignedResponderAcknowledgment,
+};
 pub use transport::{
     BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission, MeshState, PullError,
-    PushError,
+    PushError, ResponderAcknowledgmentSubmission,
 };
