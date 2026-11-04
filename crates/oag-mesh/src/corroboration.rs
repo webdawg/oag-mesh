@@ -497,21 +497,41 @@ impl ClaimCorroboration {
     /// `bridge::MeshTree::from_snapshot`.
     pub fn from_snapshot(snapshot: Vec<ClaimSnapshot>) -> Self {
         let mut corroboration = Self::new();
+        corroboration.merge_snapshot(snapshot);
+        corroboration
+    }
+
+    /// Merges `snapshot` into this struct's existing reports -- appending any `(peer_id,
+    /// reporter_cluster, observed_value_hash)` entry not already recorded for its `claim_id`,
+    /// rather than replacing anything, so merging the same snapshot repeatedly (or merging
+    /// snapshots from several different peers) is idempotent and additive. The building block
+    /// for `transport::pull_and_merge`'s pull-based anti-entropy (`spec/10-anti-entropy.md`).
+    /// Same peer-id-string-parse-failure handling as `from_snapshot`.
+    ///
+    /// **Trust note**: same as `bridge::MeshTree::merge_snapshot` -- no signature or
+    /// proof-of-work is re-checked here, because a snapshot has already collapsed each report
+    /// down past its original signed `ClaimReport`. This trusts the source peer the same way
+    /// `MeshState.peers`'s static configuration already does, but it is a weaker guarantee than
+    /// `add`'s own independent verification. See `spec/10-anti-entropy.md`.
+    pub fn merge_snapshot(&mut self, snapshot: Vec<ClaimSnapshot>) {
         for claim in snapshot {
-            let mut reports = Vec::new();
+            let entry = self.reports.entry(claim.claim_id).or_default();
             for r in claim.reports {
                 match r.peer_id.parse::<PeerId>() {
-                    Ok(peer_id) => reports.push(RecordedReport {
-                        peer_id,
-                        reporter_cluster: r.reporter_cluster,
-                        observed_value_hash: r.observed_value_hash,
-                    }),
+                    Ok(peer_id) => {
+                        let recorded = RecordedReport {
+                            peer_id,
+                            reporter_cluster: r.reporter_cluster,
+                            observed_value_hash: r.observed_value_hash,
+                        };
+                        if !entry.contains(&recorded) {
+                            entry.push(recorded);
+                        }
+                    }
                     Err(e) => tracing::warn!(peer_id = %r.peer_id, error = %e, "dropping unparsable peer id from persisted claim corroboration snapshot"),
                 }
             }
-            corroboration.reports.insert(claim.claim_id, reports);
         }
-        corroboration
     }
 }
 
@@ -889,6 +909,24 @@ mod tests {
         let err = corroboration.add(&report_b, stale_pow, now()).unwrap_err();
         let expected_bits = BASE_CLAIM_REPORT_DIFFICULTY_BITS + CLAIM_REPORT_DIFFICULTY_STEP_BITS;
         assert!(matches!(err, ClaimReportError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));
+    }
+
+    #[test]
+    fn merge_snapshot_appends_new_reports_and_skips_exact_duplicates() {
+        let peer_a = PeerIdentity::generate();
+        let peer_b = PeerIdentity::generate();
+        let mut local = ClaimCorroboration::new();
+        let mut remote = ClaimCorroboration::new();
+
+        add_with_fresh_pow(&mut local, &build_and_sign(&peer_a, "claim-1", "cluster-a", "blake3:abc", now()).unwrap(), now()).unwrap();
+        add_with_fresh_pow(&mut remote, &build_and_sign(&peer_b, "claim-1", "cluster-b", "blake3:abc", now()).unwrap(), now()).unwrap();
+
+        local.merge_snapshot(remote.snapshot());
+        assert_eq!(local.cluster_corroboration_for("claim-1", "blake3:abc"), 2);
+
+        // Merging the identical snapshot again must not duplicate the entry.
+        local.merge_snapshot(remote.snapshot());
+        assert_eq!(local.cluster_corroboration_for("claim-1", "blake3:abc"), 2);
     }
 
     #[test]

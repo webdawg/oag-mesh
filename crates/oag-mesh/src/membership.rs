@@ -323,6 +323,23 @@ impl MembershipRegistry {
     /// the same reason.
     pub fn from_snapshot(snapshot: Vec<MembershipSnapshot>) -> Self {
         let mut registry = Self::new();
+        registry.merge_snapshot(snapshot);
+        registry
+    }
+
+    /// Merges `snapshot` into this registry's existing attestations -- unions each `(cluster,
+    /// subject_peer_id)` pair's attesting-peer set rather than replacing it, so merging the same
+    /// snapshot repeatedly (or merging snapshots from several different peers) is idempotent and
+    /// additive. The building block for `transport::pull_and_merge`'s pull-based anti-entropy
+    /// (`spec/10-anti-entropy.md`). Same peer-id-string-parse-failure handling as
+    /// `from_snapshot`.
+    ///
+    /// **Trust note**: same as `bridge::MeshTree::merge_snapshot` -- no signature or
+    /// proof-of-work is re-checked here, because a snapshot has already collapsed each
+    /// attestation down past its original signed `MembershipAttestation`. This trusts the source
+    /// peer the same way `MeshState.peers`'s static configuration already does, but it is a
+    /// weaker guarantee than `add`'s own independent verification. See `spec/10-anti-entropy.md`.
+    pub fn merge_snapshot(&mut self, snapshot: Vec<MembershipSnapshot>) {
         for entry in snapshot {
             let subject_peer_id: PeerId = match entry.subject_peer_id.parse() {
                 Ok(peer_id) => peer_id,
@@ -340,9 +357,8 @@ impl MembershipRegistry {
                     Err(e) => tracing::warn!(peer_id = %peer_id_str, error = %e, "dropping unparsable attester peer id from persisted membership snapshot"),
                 }
             }
-            registry.attestations.insert((entry.cluster, subject_peer_id), attesters);
+            self.attestations.entry((entry.cluster, subject_peer_id)).or_default().extend(attesters);
         }
-        registry
     }
 }
 
@@ -588,6 +604,25 @@ mod tests {
             err,
             MembershipError::InsufficientProofOfWork { required_bits } if required_bits == BASE_MEMBERSHIP_DIFFICULTY_BITS
         ));
+    }
+
+    #[test]
+    fn merge_snapshot_unions_attester_sets_rather_than_replacing_them() {
+        let attester_a = PeerIdentity::generate();
+        let attester_b = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let mut local = MembershipRegistry::new();
+        let mut remote = MembershipRegistry::new();
+
+        add_with_fresh_pow(&mut local, &build_and_sign(&attester_a, subject.peer_id(), "cluster-a", 1_000).unwrap(), 1_010).unwrap();
+        add_with_fresh_pow(&mut remote, &build_and_sign(&attester_b, subject.peer_id(), "cluster-a", 1_000).unwrap(), 1_010).unwrap();
+
+        local.merge_snapshot(remote.snapshot());
+        assert_eq!(local.attester_count("cluster-a", &subject.peer_id()), 2);
+
+        // Merging the identical snapshot again must not double-count.
+        local.merge_snapshot(remote.snapshot());
+        assert_eq!(local.attester_count("cluster-a", &subject.peer_id()), 2);
     }
 
     #[test]

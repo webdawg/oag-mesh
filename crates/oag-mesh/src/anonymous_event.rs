@@ -275,6 +275,27 @@ impl AnonymousEventLog {
     pub fn reports_for(&self, corroboration_nonce: &str) -> &[AnonymousEvent] {
         self.events.get(corroboration_nonce).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// Merges every event in `other` into `self`, skipping anything already present (exact
+    /// `AnonymousEvent` equality -- `event_id` is random per submission, so this only catches a
+    /// literal re-pull of the same record, not two independent reports of the same real event;
+    /// that distinction is `corroboration_nonce`'s job, unaffected either way). This is
+    /// `transport::pull_and_merge`'s building block for pull-based anti-entropy
+    /// (`spec/10-anti-entropy.md`) -- unlike `record`, it does **not** re-check proof-of-work or
+    /// any validity constraint, because `other` is assumed to already be a verified log from a
+    /// trusted peer, not raw untrusted submissions. See that spec file for exactly what trust
+    /// this assumption rests on, and why it's weaker than the push path's per-message
+    /// verification.
+    pub fn merge(&mut self, other: AnonymousEventLog) {
+        for (nonce, events) in other.events {
+            let existing = self.events.entry(nonce).or_default();
+            for event in events {
+                if !existing.contains(&event) {
+                    existing.push(event);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +440,28 @@ mod tests {
             err,
             AnonymousEventError::InsufficientProofOfWork { required_bits: BASE_DIFFICULTY_BITS + 2 * DIFFICULTY_STEP_BITS }
         );
+    }
+
+    #[test]
+    fn merge_adds_new_events_and_skips_exact_duplicates() {
+        let mut local = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut local, valid_event("merge-test")).unwrap();
+
+        let mut remote = AnonymousEventLog::new();
+        // The same event local already has (by full equality) -- must not be double-counted.
+        let duplicate = local.reports_for("merge-test")[0].clone();
+        remote.events.entry("merge-test".to_string()).or_default().push(duplicate);
+        // A genuinely new, independent report of the same real event.
+        let mut new_report = valid_event("merge-test");
+        new_report.event_id = "evt-from-remote".to_string();
+        remote.events.entry("merge-test".to_string()).or_default().push(new_report);
+        // An event under an entirely different nonce local has never seen.
+        remote.events.entry("remote-only-nonce".to_string()).or_default().push(valid_event("remote-only-nonce"));
+
+        local.merge(remote);
+
+        assert_eq!(local.corroboration_for("merge-test"), 2);
+        assert_eq!(local.corroboration_for("remote-only-nonce"), 1);
     }
 
     #[test]

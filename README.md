@@ -61,14 +61,17 @@ membership attestation — signed proof that a peer is a genuine member of a clu
 by distinct attester count, with the same escalating proof-of-work treatment
 (`spec/09-cluster-membership-attestation.md`) — all four over a real HTTP transport
 (`spec/04-transport.md`) where every submission now carries its mechanism's proof-of-work
-alongside the signed payload, and manual (not automatic, not crash-safe) disk persistence for all
-four stores (`spec/08-persistence.md`). A `ClaimReport`'s self-asserted cluster can be
-cross-checked against real cluster-nesting data alone (`best_corroborated_value_cross_checked`,
-`GET .../best-cross-checked`) — confirming the claimed cluster *name* was really attested by a
-`BridgeDeclaration` — or against that **and** real membership-attestation data
-(`best_corroborated_value_fully_cross_checked`, `GET .../best-fully-cross-checked`) — additionally
-confirming the reporting peer actually belongs to that cluster, not just that the name is real.
-Still open: verifying that distinct `PeerIdentity`s are genuinely different organizations rather
-than just different keys (proof-of-work taxes cost, not identity, all the way down — even an
-attester's own standing in a cluster is itself unverified), pull-based anti-entropy, and
-dispatch-to-a-responder for anonymous events. See `spec/01-overview.md`.
+alongside the signed payload, both pushed to configured peers and pullable later by one that
+missed a broadcast (`spec/10-anti-entropy.md`), and manual (not automatic, not crash-safe) disk
+persistence for all four stores (`spec/08-persistence.md`). A `ClaimReport`'s self-asserted
+cluster can be cross-checked against real cluster-nesting data alone
+(`best_corroborated_value_cross_checked`, `GET .../best-cross-checked`) — confirming the claimed
+cluster *name* was really attested by a `BridgeDeclaration` — or against that **and** real
+membership-attestation data (`best_corroborated_value_fully_cross_checked`,
+`GET .../best-fully-cross-checked`) — additionally confirming the reporting peer actually belongs
+to that cluster, not just that the name is real. Still open: verifying that distinct
+`PeerIdentity`s are genuinely different organizations rather than just different keys
+(proof-of-work taxes cost, not identity, all the way down — even an attester's own standing in a
+cluster is itself unverified), dispatch-to-a-responder for anonymous events, and pull-based
+anti-entropy's own stated trade-off — it trusts a peer's prior verification instead of
+re-checking a signature, a weaker guarantee than push. See `spec/01-overview.md`.

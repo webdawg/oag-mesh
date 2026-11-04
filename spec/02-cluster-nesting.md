@@ -68,10 +68,11 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
 
 ## What this explicitly is not (yet)
 
-- **Transport exists now (`spec/04-transport.md`), but is push-only.** A declaration reaches
-  other mesh nodes by being pushed to a static, operator-configured peer list
-  (`broadcast_bridge_declaration`) — there is no pull-based anti-entropy, so a peer offline at
-  broadcast time simply never gets it unless something else re-pushes it later.
+- **Transport exists now (`spec/04-transport.md`).** A declaration reaches other mesh nodes by
+  being pushed to a static, operator-configured peer list (`broadcast_bridge_declaration`), or
+  by a peer pulling and merging a whole `MeshTree` snapshot later (`spec/10-anti-entropy.md`) --
+  the latter trusts the source peer's own prior verification rather than re-checking signatures
+  itself, a real trade-off `spec/10` states plainly.
 - **Persistence exists now (`spec/08-persistence.md`), but is manual and not crash-safe.**
   `MeshTree::snapshot`/`from_snapshot` let a caller save/load this tree to/from disk via
   `transport::MeshState::save_to_dir`/`load_from_dir` -- nothing calls this automatically, and a
@@ -93,7 +94,7 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
 
 ## Tests
 
-`crates/oag-mesh/src/bridge.rs` (15 unit tests): sign/verify round trip, self-reference rejection
+`crates/oag-mesh/src/bridge.rs` (16 unit tests): sign/verify round trip, self-reference rejection
 (a mesh-group cannot declare itself as its own member), tampered-field/mismatched-key/stale-
 timestamp rejection (mirroring the base project's own signed-declaration test shapes), corroboration
 counting distinct peers rather than repeated declarations, recursive resolution through nested
@@ -101,5 +102,6 @@ mesh-groups down to base-cluster leaves, cycle termination, minimum-corroboratio
 `is_attested_base_cluster`'s existence/minimum-corroboration check, a declaration with no
 proof-of-work being rejected, a peer re-declaring an edge it already declared requiring no
 proof-of-work, required difficulty escalating with each additional distinct peer on one edge
-(and a stale proof no longer being enough), and a proof-of-work being bound to its own
-declaration and unable to be reused for another.
+(and a stale proof no longer being enough), a proof-of-work being bound to its own declaration
+and unable to be reused for another, and `merge_snapshot` unioning peer sets idempotently (see
+`spec/10-anti-entropy.md`).

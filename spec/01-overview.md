@@ -3,7 +3,9 @@
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), plus a
 fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half of a gap
 `spec/02`/`spec/05` both left open. A real HTTP transport covers all four
-(`spec/04-transport.md`) and manual, non-crash-safe persistence covers all four stores
+(`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
+(`pull_and_merge`/`sync_with_all_peers`, `spec/10-anti-entropy.md`) now reaching a peer that was
+offline for a specific broadcast, and manual, non-crash-safe persistence covers all four stores
 (`spec/08-persistence.md`). All four message types now require escalating proof-of-work before
 recording a submission (`spec/02`'s, `spec/03`'s, `spec/05`'s, and `spec/09`'s own
 "Anti-sybil"/"Anti-spam" sections). `spec/05`'s claim reports can be cross-checked against real
@@ -14,8 +16,9 @@ attestations (the *reporter's own standing* in that cluster,
 own sections for exactly what each layer does and does not cover; even fully cross-checked, an
 attester's own standing is itself unverified, one level deeper still. Dispatch-to-a-responder for
 anonymous events, verifying that distinct `PeerIdentity`s are genuinely different organizations
-(not just different keys), pull-based anti-entropy, and automatic/crash-safe persistence, are
-not.**
+(not just different keys), and automatic/crash-safe persistence, are not. Pull-based
+anti-entropy's own trade-off -- it trusts a peer's prior verification rather than re-deriving it,
+a weaker guarantee than push -- is stated in `spec/10`'s own section on exactly that.**
 
 ## What this layer is
 
@@ -110,10 +113,10 @@ collection, vault, or release capability. See that RFC for current requirements 
   identity at all to attach a cluster claim to, so the same fix doesn't transfer — it still just
   counts raw report volume under a nonce, mitigated only by proof-of-work's escalating cost, a
   different (and weaker) kind of "independent enough."
-- A real HTTP transport exists now for all four mechanisms (`spec/04-transport.md`), push-only
-  with no pull-based anti-entropy, and explicit that it does not give `AnonymousEvent`
-  submissions any network-level anonymity on top of their already-anonymous payload. All four
-  message types now require escalating proof-of-work before being recorded --
+- A real HTTP transport exists now for all four mechanisms (`spec/04-transport.md`), with both
+  push and pull-based anti-entropy (`spec/10-anti-entropy.md`), and explicit that it does not
+  give `AnonymousEvent` submissions any network-level anonymity on top of their already-anonymous
+  payload. All four message types now require escalating proof-of-work before being recorded --
   `BridgeDeclaration` (`spec/02`'s "Anti-sybil resistance"), `AnonymousEvent` (`spec/03`'s
   "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s "Anti-sybil resistance"), and
   `MembershipAttestation` (`spec/09`'s "Anti-sybil resistance") -- real mitigations, not full
@@ -137,3 +140,11 @@ collection, vault, or release capability. See that RFC for current requirements 
   still works, just no longer for free, and with one more layer of indirection to climb through.
   See `spec/02`'s, `spec/03`'s, `spec/04`'s, `spec/05`'s, and `spec/09`'s own "open questions"
   sections for what else is still unresolved.
+- **Pull-based anti-entropy trusts a peer's own prior verification, it does not re-derive it.**
+  `spec/10-anti-entropy.md`'s `pull_and_merge` closes the "offline during a broadcast" gap by
+  merging a peer's whole snapshot, but a snapshot has already collapsed past the original signed
+  message -- there's no signature left to re-check on a pull, unlike every push handler's own
+  independent re-verification. This is a new, different trust boundary from the "mint fresh
+  `PeerIdentity`s" gap above, not the same one restated: it's about trusting the specific peers
+  already on `MeshState.peers`'s list to report their own state honestly, not about how many
+  identities an attacker can mint.

@@ -12,10 +12,11 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | [01-overview.md](01-overview.md) | Scope, relationship to the base project, and what this layer is not |
 | [02-cluster-nesting.md](02-cluster-nesting.md) | Signed bridge declarations placing a base-layer cluster (or another mesh-group) into a mesh-group, recursively, with corroboration by distinct-peer count |
 | [03-anonymous-event-rfc.md](03-anonymous-event-rfc.md) | Identity-stripped event reports ("SAW THIS EVENT") for life-saving actions — strict schema, coarse location/time, corroboration without identity |
-| [04-transport.md](04-transport.md) | A real HTTP transport for all four mechanisms, on its own layer/port — explicit that it gives `AnonymousEvent` submission no network-level anonymity on top of its already-anonymous payload |
+| [04-transport.md](04-transport.md) | A real HTTP transport for all four mechanisms, on its own layer/port, with both push and pull — explicit that it gives `AnonymousEvent` submission no network-level anonymity on top of its already-anonymous payload |
 | [05-federated-corroboration.md](05-federated-corroboration.md) | Signed claim reports, weighted by distinct self-asserted cluster rather than distinct peer — generalizes the base project's gateway quorum fan-out across organizational boundaries |
 | [08-persistence.md](08-persistence.md) | One JSON file per in-memory store, written/read on demand — not automatic, not atomic, not a database |
 | [09-cluster-membership-attestation.md](09-cluster-membership-attestation.md) | Signed attestations that a peer is a genuine member of a cluster, corroborated by distinct attester count — closes the "is the reporter really in that cluster" half of `05`'s cross-check that `02` alone couldn't |
+| [10-anti-entropy.md](10-anti-entropy.md) | Pull-based catch-up for all four stores — fetch a peer's whole snapshot and merge it in, closing the "offline during a broadcast" gap push-only transport left open, at the cost of a weaker (unverified) trust model than push |
 
 ## Proposed research-data extension (not implemented)
 

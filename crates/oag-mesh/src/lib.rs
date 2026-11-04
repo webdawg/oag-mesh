@@ -38,5 +38,6 @@ pub use membership::{
 };
 pub use persistence::PersistenceError;
 pub use transport::{
-    BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission, MeshState, PushError,
+    BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission, MeshState, PullError,
+    PushError,
 };

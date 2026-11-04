@@ -177,6 +177,10 @@ pub fn router(state: MeshState) -> Router {
             "/oag-mesh/v1/claim-report/{claim_id}/best-fully-cross-checked",
             get(get_best_corroborated_value_fully_cross_checked),
         )
+        .route("/oag-mesh/v1/sync/bridge-tree", get(get_bridge_tree_snapshot))
+        .route("/oag-mesh/v1/sync/claim-corroboration", get(get_claim_corroboration_snapshot))
+        .route("/oag-mesh/v1/sync/membership-registry", get(get_membership_registry_snapshot))
+        .route("/oag-mesh/v1/sync/anonymous-events", get(get_anonymous_event_log_snapshot))
         .with_state(state)
 }
 
@@ -412,6 +416,33 @@ async fn get_best_corroborated_value_fully_cross_checked(
     Json(serde_json::json!({ "result": result })).into_response()
 }
 
+/// Read-only: this node's entire current `bridge::MeshTree`, as a snapshot -- the pull side of
+/// pull-based anti-entropy (`spec/10-anti-entropy.md`). Unlike the `best`/`best-cross-checked`
+/// endpoints, this isn't a computed answer to one query, it's this node's whole store, meant to
+/// be merged wholesale into a puller's own via `MeshTree::merge_snapshot`.
+async fn get_bridge_tree_snapshot(State(state): State<MeshState>) -> Response {
+    Json(state.tree.read().unwrap().snapshot()).into_response()
+}
+
+/// Read-only: this node's entire current `corroboration::ClaimCorroboration`, as a snapshot --
+/// see `get_bridge_tree_snapshot`'s doc comment for the shape of what this is for.
+async fn get_claim_corroboration_snapshot(State(state): State<MeshState>) -> Response {
+    Json(state.claim_corroboration.read().unwrap().snapshot()).into_response()
+}
+
+/// Read-only: this node's entire current `membership::MembershipRegistry`, as a snapshot -- see
+/// `get_bridge_tree_snapshot`'s doc comment for the shape of what this is for.
+async fn get_membership_registry_snapshot(State(state): State<MeshState>) -> Response {
+    Json(state.membership_registry.read().unwrap().snapshot()).into_response()
+}
+
+/// Read-only: this node's entire current `anonymous_event::AnonymousEventLog` -- serialized
+/// directly (no snapshot-type indirection needed, same reason `persistence` doesn't need one for
+/// this store) -- see `get_bridge_tree_snapshot`'s doc comment for the shape of what this is for.
+async fn get_anonymous_event_log_snapshot(State(state): State<MeshState>) -> Response {
+    Json(&*state.event_log.read().unwrap()).into_response()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PushError {
     #[error("request to {0} failed: {1}")]
@@ -579,6 +610,107 @@ pub async fn broadcast_claim_report(state: &MeshState, report: &ClaimReport) {
             tracing::warn!(peer, error = %e, "failed to push claim report to peer");
         }
     }
+}
+
+/// Pull-based anti-entropy (`spec/10-anti-entropy.md`): unlike every `push_*`/`broadcast_*`
+/// function above, which only reach a peer that's online at the moment of a specific
+/// declaration/event/report/attestation, this pulls a peer's *entire* current view of all four
+/// stores and merges it into `state`'s own -- closing the gap a peer that was offline during a
+/// broadcast is left in otherwise. Best-effort per store: one store's pull failing (e.g. a
+/// network error) doesn't stop the others from being attempted, logged as a warning like every
+/// other per-peer failure in this file.
+///
+/// **Trust note, stated as plainly as every other partial guarantee in this crate**: this merges
+/// `address`'s own already-verified state wholesale, via `merge_snapshot`/`merge`, **without**
+/// re-checking any underlying signature or proof-of-work -- a snapshot has already collapsed
+/// past the original signed messages, so there's nothing left here to independently re-verify.
+/// This is *not* the same guarantee `receive_bridge_declaration`/`receive_claim_report`/
+/// `receive_membership_attestation`/`receive_anonymous_event` give a push: those re-verify every
+/// message at the border. Pulling instead trusts that `address` -- already a peer on
+/// `MeshState.peers`'s static, operator-configured list, the same trust boundary every push
+/// target already sits inside -- did its own verification honestly. A compromised or malicious
+/// peer on that list could report corroboration it never actually received proof of; this
+/// function has no way to catch that. See `spec/10-anti-entropy.md` for this stated in full.
+pub async fn pull_and_merge(state: &MeshState, address: &str) {
+    match pull_bridge_tree(&state.http, address).await {
+        Ok(snapshot) => state.tree.write().unwrap().merge_snapshot(snapshot),
+        Err(e) => tracing::warn!(address, error = %e, "failed to pull bridge tree from peer"),
+    }
+    match pull_claim_corroboration(&state.http, address).await {
+        Ok(snapshot) => state.claim_corroboration.write().unwrap().merge_snapshot(snapshot),
+        Err(e) => tracing::warn!(address, error = %e, "failed to pull claim corroboration from peer"),
+    }
+    match pull_membership_registry(&state.http, address).await {
+        Ok(snapshot) => state.membership_registry.write().unwrap().merge_snapshot(snapshot),
+        Err(e) => tracing::warn!(address, error = %e, "failed to pull membership registry from peer"),
+    }
+    match pull_anonymous_events(&state.http, address).await {
+        Ok(log) => state.event_log.write().unwrap().merge(log),
+        Err(e) => tracing::warn!(address, error = %e, "failed to pull anonymous events from peer"),
+    }
+}
+
+/// Same best-effort pull-and-merge as `pull_and_merge`, against every peer on `state.peers` in
+/// turn -- the periodic, pull-side counterpart to the `broadcast_*` functions' push-side
+/// best-effort fan-out. A caller decides when and how often to call this (e.g. on a timer);
+/// nothing in this crate schedules it automatically.
+pub async fn sync_with_all_peers(state: &MeshState) {
+    for peer in state.peers.iter() {
+        pull_and_merge(state, peer).await;
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PullError {
+    #[error("request to {0} failed: {1}")]
+    Request(String, reqwest::Error),
+    #[error("{0} rejected the request with status {1}")]
+    Rejected(String, StatusCode),
+}
+
+pub async fn pull_bridge_tree(
+    http: &reqwest::Client,
+    address: &str,
+) -> Result<Vec<crate::bridge::BridgeEdgeSnapshot>, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/bridge-tree", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
+}
+
+pub async fn pull_claim_corroboration(
+    http: &reqwest::Client,
+    address: &str,
+) -> Result<Vec<crate::corroboration::ClaimSnapshot>, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/claim-corroboration", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
+}
+
+pub async fn pull_membership_registry(
+    http: &reqwest::Client,
+    address: &str,
+) -> Result<Vec<crate::membership::MembershipSnapshot>, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/membership-registry", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
+}
+
+pub async fn pull_anonymous_events(http: &reqwest::Client, address: &str) -> Result<AnonymousEventLog, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/anonymous-events", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
 }
 
 #[cfg(test)]
@@ -1061,5 +1193,115 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(body["result"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pull_and_merge_catches_up_a_node_that_missed_every_broadcast() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![]).await;
+
+        // Populate the source node's four stores directly, as if it had received all this from
+        // broadcasts the catcher node was offline for.
+        let bridge_signer = PeerIdentity::generate();
+        let decl = crate::bridge::build_and_sign(
+            &bridge_signer,
+            "global",
+            MeshMember::BaseCluster("sync-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let bridge_pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, bridge_pow, now_unix()).unwrap();
+
+        let reporter = PeerIdentity::generate();
+        let report = crate::corroboration::build_and_sign(
+            &reporter,
+            "claim-sync-test",
+            "cluster-a",
+            "blake3:abc",
+            now_unix(),
+        )
+        .unwrap();
+        let claim_pow = solve_claim_pow(&state_source, &report);
+        state_source.claim_corroboration.write().unwrap().add(&report, claim_pow, now_unix()).unwrap();
+
+        let attester = PeerIdentity::generate();
+        let subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-a", now_unix()).unwrap();
+        let membership_pow = solve_membership_pow(&state_source, &attestation);
+        state_source.membership_registry.write().unwrap().add(&attestation, membership_pow, now_unix()).unwrap();
+
+        let event = valid_event("sync-test-nonce");
+        let event_pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        state_source.event_log.write().unwrap().record(event, event_pow).unwrap();
+
+        // The catcher starts empty; one pull_and_merge call should bring it fully up to date.
+        pull_and_merge(&state_catcher, &addr_source).await;
+
+        assert_eq!(
+            state_catcher.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("sync-test".into())),
+            1
+        );
+        assert_eq!(
+            state_catcher.claim_corroboration.read().unwrap().cluster_corroboration_for("claim-sync-test", "blake3:abc"),
+            1
+        );
+        assert!(state_catcher.membership_registry.read().unwrap().is_attested_member("cluster-a", &subject.peer_id(), 1));
+        assert_eq!(state_catcher.event_log.read().unwrap().corroboration_for("sync-test-nonce"), 1);
+
+        // Pulling again (e.g. a periodic re-sync) must not inflate anything -- idempotent merge.
+        pull_and_merge(&state_catcher, &addr_source).await;
+        assert_eq!(
+            state_catcher.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("sync-test".into())),
+            1
+        );
+        assert_eq!(state_catcher.event_log.read().unwrap().corroboration_for("sync-test-nonce"), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_with_all_peers_pulls_from_every_configured_peer() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_a.clone(), addr_b.clone()]).await;
+
+        let decl_a = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("from-a".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow_a = solve_bridge_pow(&state_a, &decl_a);
+        state_a.tree.write().unwrap().add(&decl_a, pow_a, now_unix()).unwrap();
+
+        let decl_b = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("from-b".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow_b = solve_bridge_pow(&state_b, &decl_b);
+        state_b.tree.write().unwrap().add(&decl_b, pow_b, now_unix()).unwrap();
+
+        sync_with_all_peers(&state_catcher).await;
+
+        assert_eq!(
+            state_catcher.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("from-a".into())),
+            1
+        );
+        assert_eq!(
+            state_catcher.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("from-b".into())),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pulling_from_an_unreachable_peer_does_not_panic_or_stop_other_stores() {
+        let (_addr_catcher, state_catcher) = spawn(vec![]).await;
+        // Port 0 on loopback is never a live listener -- a real connection failure.
+        pull_and_merge(&state_catcher, "http://127.0.0.1:0").await;
+        assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
     }
 }

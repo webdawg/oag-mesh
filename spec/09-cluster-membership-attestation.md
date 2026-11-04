@@ -88,8 +88,11 @@ exposes this over the wire, same node-local-only scope as the other read endpoin
   PKI, DNS, or other out-of-band credential) -- out of scope for this protocol layer. See
   `spec/01-overview.md`'s "proof-of-work bounds cost, not identity" note, which applies here one
   level deeper than it did for `spec/02`/`spec/05`.
-- **Transport is push-only, same as every other mechanism here.** No pull-based anti-entropy;
-  `broadcast_membership_attestation` reaches only statically-configured peers.
+- **Transport is push-and-pull, same as every other mechanism here.**
+  `broadcast_membership_attestation` reaches only statically-configured peers that are online at
+  that moment; `pull_and_merge`/`sync_with_all_peers` (`spec/10-anti-entropy.md`) close the
+  "offline at broadcast time" gap, at the cost of trusting the source peer's own prior
+  verification rather than re-checking a signature itself.
 - **Persistence is manual and not crash-safe (`spec/08-persistence.md`).**
   `MembershipRegistry::snapshot`/`from_snapshot` cover save/load via
   `transport::MeshState::save_to_dir`/`load_from_dir`, nothing calls them automatically.
@@ -100,7 +103,7 @@ exposes this over the wire, same node-local-only scope as the other read endpoin
 
 ## Tests
 
-`crates/oag-mesh/src/membership.rs` (14 unit tests): sign/verify round trip, self-attestation
+`crates/oag-mesh/src/membership.rs` (15 unit tests): sign/verify round trip, self-attestation
 rejected both at build time and independently at verify time (hand-constructing one to prove
 `verify` enforces it rather than trusting the constructor), tampered-field/mismatched-key/stale-
 timestamp rejection, corroboration counting distinct attesters rather than repeated attestations,
@@ -108,7 +111,8 @@ timestamp rejection, corroboration counting distinct attesters rather than repea
 recorded, an attestation with no proof-of-work rejected, an attester re-attesting the same fact
 requiring no proof-of-work, required difficulty escalating with each additional distinct attester
 on one subject (and a stale proof no longer being enough), a proof-of-work bound to its own
-attestation and unable to be reused, and a snapshot round-tripping through `from_snapshot`.
+attestation and unable to be reused, a snapshot round-tripping through `from_snapshot`, and
+`merge_snapshot` unioning attester sets idempotently (see `spec/10-anti-entropy.md`).
 `crates/oag-mesh/src/corroboration.rs` adds 3 more for the combined view: the full cross-check
 drops a report from a peer with no membership attestation while the half-cross-check (cluster name
 only) still lets it through; the full cross-check still drops reports claiming an unattested

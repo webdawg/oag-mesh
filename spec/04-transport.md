@@ -66,10 +66,12 @@ partial guarantee.
 "operator-configured topology, no automatic discovery" posture as the base project's
 `[transfer].relay_peers`/`[gateway].query_peers`. `broadcast_bridge_declaration`/
 `broadcast_anonymous_event`/`broadcast_claim_report`/`broadcast_membership_attestation` push to
-every configured peer, best-effort (one unreachable peer doesn't stop the others reaching it).
-There is **no pull-based anti-entropy** — a peer offline at broadcast time simply never receives
-that message unless something else re-pushes it later. This is a real, accepted gap for a first
-version, not a hidden one.
+every configured peer, best-effort (one unreachable peer doesn't stop the others reaching it). A
+peer offline at broadcast time doesn't get left behind forever, though: pull-based anti-entropy
+now exists (`spec/10-anti-entropy.md`) -- `pull_and_merge`/`sync_with_all_peers` fetch a peer's
+*entire* current store and merge it in, closing that gap at the cost of a weaker, unverified
+trust model than push's own re-verification (see `spec/10`'s own "trade-off" section). Nothing
+calls this automatically; a caller decides when and how often.
 
 `POST /oag-mesh/v1/anonymous-event` carries an `AnonymousEventSubmission { event, pow }` --
 `anonymous_event::AnonymousEventLog::record` enforces the escalating proof-of-work check
@@ -82,7 +84,7 @@ mechanism's own "Anti-spam"/"Anti-sybil resistance" section).
 
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (19 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (22 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` (with valid
 proof-of-work) is recorded and corroborated on the receiving side; a tampered declaration is
 rejected over the wire with `400` and never recorded; `broadcast_bridge_declaration` reaches
@@ -100,7 +102,8 @@ valid proof-of-work) is recorded; a tampered one is rejected over the wire;
 `broadcast_membership_attestation` reaches every configured peer; `GET
 .../best-fully-cross-checked` drops a report from a peer with no membership attestation while
 still counting one that passes both checks; `.../best-fully-cross-checked` against an unknown
-claim returns a `null` result.
+claim returns a `null` result; plus 3 more for pull-based anti-entropy, listed in
+`spec/10-anti-entropy.md`'s own "Tests" section.
 
 ## Open questions (genuinely unresolved)
 
@@ -108,11 +111,11 @@ claim returns a `null` result.
   because it's the single most important gap in this file: nothing here hides a reporter's
   source IP from the peer they submit to. Proof-of-work (below) is an orthogonal mechanism and
   does nothing about this.
-- **No pull-based sync/anti-entropy.** A declaration, event, or report only reaches a peer that
-  was online and reachable at broadcast time. The base project's `oag-sync` solves exactly this
-  for its own event log (`hello`/`heads` + anti-entropy pull) — whether `oag-mesh` should
-  eventually grow the same mechanism, or stay push-only given its different
-  (lower-stakes-per-message, higher-volume) traffic pattern, is undecided.
+- **Pull-based anti-entropy exists now (`spec/10-anti-entropy.md`), but it's a weaker trust
+  model than push, not a free upgrade.** Merging a pulled snapshot trusts the source peer's own
+  prior verification instead of re-deriving it -- see `spec/10`'s own "trade-off" section for
+  exactly what that costs. It's also not incremental (every pull fetches a peer's whole store)
+  and not scheduled (nothing calls it automatically yet).
 - **All four submission types now cost real, escalating proof-of-work, but none of them stop a
   well-resourced attacker.** `AnonymousEvent` (`spec/03`'s "Anti-spam and anti-replay"),
   `ClaimReport` (`spec/05`'s "Anti-sybil resistance"), `BridgeDeclaration` (`spec/02`'s

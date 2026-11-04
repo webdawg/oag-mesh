@@ -370,6 +370,27 @@ impl MeshTree {
     /// starting with whatever of it is still readable.
     pub fn from_snapshot(snapshot: Vec<BridgeEdgeSnapshot>) -> Self {
         let mut tree = Self::new();
+        tree.merge_snapshot(snapshot);
+        tree
+    }
+
+    /// Merges `snapshot` into this tree's existing edges -- unions each edge's declaring-peer set
+    /// rather than replacing it, so merging the same snapshot repeatedly (or merging snapshots
+    /// from several different peers) is idempotent and additive, never lossy. The building block
+    /// for `transport::pull_and_merge`'s pull-based anti-entropy (`spec/10-anti-entropy.md`): a
+    /// peer that was offline for a `broadcast_bridge_declaration` can catch up by pulling a
+    /// peer's whole snapshot and merging it in, rather than waiting to be re-pushed to
+    /// individually. Same peer-id-string-parse-failure handling as `from_snapshot` -- an
+    /// unparsable entry is dropped with a warning, not fatal to the rest of the merge.
+    ///
+    /// **Trust note**: unlike `add`, this does not re-verify a signature or proof-of-work for any
+    /// of it -- a snapshot has already collapsed each edge down to a bare set of peer ids, with
+    /// no signed `BridgeDeclaration` left to re-check. Merging a snapshot means trusting that the
+    /// peer it came from already verified what it's reporting, the same trust already extended to
+    /// any peer on `MeshState.peers`'s static list, not a new or weaker boundary introduced here
+    /// -- but it is a different (weaker) guarantee than `add`'s own independent verification, and
+    /// callers should not confuse the two. See `spec/10-anti-entropy.md` for this stated plainly.
+    pub fn merge_snapshot(&mut self, snapshot: Vec<BridgeEdgeSnapshot>) {
         for edge in snapshot {
             let mut peers = HashSet::new();
             for peer_id_str in edge.peers {
@@ -380,9 +401,8 @@ impl MeshTree {
                     Err(e) => tracing::warn!(peer_id = %peer_id_str, error = %e, "dropping unparsable peer id from persisted bridge snapshot"),
                 }
             }
-            tree.edges.insert((edge.mesh_group, edge.member), peers);
+            self.edges.entry((edge.mesh_group, edge.member)).or_default().extend(peers);
         }
-        tree
     }
 }
 
@@ -708,6 +728,25 @@ mod tests {
         let err = tree.add(&decl_b, stale_pow, 1_010).unwrap_err();
         let expected_bits = BASE_BRIDGE_DIFFICULTY_BITS + BRIDGE_DIFFICULTY_STEP_BITS;
         assert!(matches!(err, BridgeError::InsufficientProofOfWork { required_bits } if required_bits == expected_bits));
+    }
+
+    #[test]
+    fn merge_snapshot_unions_peer_sets_rather_than_replacing_them() {
+        let a = PeerIdentity::generate();
+        let b = PeerIdentity::generate();
+        let mut tree_a = MeshTree::new();
+        let mut tree_b = MeshTree::new();
+        let member = MeshMember::BaseCluster("merge-test".into());
+
+        add_with_fresh_pow(&mut tree_a, &build_and_sign(&a, "global", member.clone(), 1_000).unwrap(), 1_010).unwrap();
+        add_with_fresh_pow(&mut tree_b, &build_and_sign(&b, "global", member.clone(), 1_000).unwrap(), 1_010).unwrap();
+
+        tree_a.merge_snapshot(tree_b.snapshot());
+        assert_eq!(tree_a.corroboration_for("global", &member), 2);
+
+        // Merging the identical snapshot again must not double-count (union, not append).
+        tree_a.merge_snapshot(tree_b.snapshot());
+        assert_eq!(tree_a.corroboration_for("global", &member), 2);
     }
 
     #[test]

@@ -142,10 +142,12 @@ exposes this over the wire, same node-local-only scope as the other read endpoin
   "Anti-sybil resistance" above for what `ClaimReportProofOfWork` does and does not achieve --
   stated there as plainly as `anonymous_event.rs`'s own identical caveat: a well-resourced
   attacker is not stopped, only taxed.
-- **Manual, non-crash-safe persistence now exists (`spec/08-persistence.md`); no pull-based
-  anti-entropy.** `ClaimCorroboration::snapshot`/`from_snapshot` cover save/load, but nothing
-  calls them automatically, and `broadcast_claim_report` is still push-only -- a peer offline at
-  broadcast time never gets a report unless something else re-pushes it later.
+- **Manual, non-crash-safe persistence now exists (`spec/08-persistence.md`).**
+  `ClaimCorroboration::snapshot`/`from_snapshot` cover save/load, but nothing calls them
+  automatically. Pull-based anti-entropy now exists too (`spec/10-anti-entropy.md`) -- a peer
+  offline at broadcast time can catch up by pulling and merging a whole snapshot later, trusting
+  the source peer's own prior verification rather than re-checking it, a real trade-off `spec/10`
+  states plainly.
 - **The read endpoint is node-local, not network-wide.** `GET /oag-mesh/v1/claim-report/{claim_id}/best`
   answers from whatever this one node has received so far -- it does not fan out to other mesh
   nodes to assemble a wider view. A caller wanting the whole mesh's picture has to ask multiple
@@ -170,7 +172,8 @@ to its own report and can't be reused for a different one; the fully-cross-check
 report from a peer with no membership attestation while the half-cross-check still lets it
 through; it still drops reports claiming an unattested cluster name outright; it returns `None`
 against an unknown claim (see `spec/09-cluster-membership-attestation.md` for the rest of that
-mechanism's own tests). `crates/oag-mesh/src/transport.rs` adds 11 more: a pushed report (with
+mechanism's own tests); `merge_snapshot` appends new reports and skips exact duplicates on a
+repeated merge (see `spec/10-anti-entropy.md`). `crates/oag-mesh/src/transport.rs` adds 11 more: a pushed report (with
 valid proof-of-work) is recorded and queryable over the wire; a tampered one is rejected;
 `broadcast_claim_report` reaches every configured peer and each one independently corroborates
 it; querying an unknown claim returns `null`; `.../best-cross-checked` drops a report from a

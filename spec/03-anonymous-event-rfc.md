@@ -184,7 +184,7 @@ identity-free check can ever guarantee.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (9 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (10 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
 recorded into the log (checked before any proof-of-work is even considered); independent reports
 sharing a `corroboration_nonce` corroborate each other while an unrelated nonce stays separate; a
@@ -192,5 +192,7 @@ sharing a `corroboration_nonce` corroborate each other while an unrelated nonce 
 report with no proof-of-work is rejected; required difficulty escalates with each additional
 report under one nonce (and a proof solved for an earlier, lower difficulty is correctly rejected
 against the new, higher one); a proof-of-work solved for one event cannot be reused for a
-different one. `crates/oag-mesh/src/transport.rs` adds one more over the wire: a submission with
-insufficient proof-of-work is rejected with `400`, never recorded.
+different one; `merge` adds genuinely new events and skips an exact duplicate while keeping an
+unrelated nonce distinct (see `spec/10-anti-entropy.md`). `crates/oag-mesh/src/transport.rs` adds
+one more over the wire: a submission with insufficient proof-of-work is rejected with `400`,
+never recorded.
