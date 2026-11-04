@@ -783,6 +783,29 @@ pub async fn sync_with_all_peers(state: &MeshState) {
     }
 }
 
+/// Opts into a schedule for `sync_with_all_peers`: spawns a background task that calls it once
+/// immediately, then again every `interval`, forever, until the returned `JoinHandle` is aborted
+/// or dropped-and-the-runtime-shuts-down. This is the specific thing `spec/10-anti-entropy.md`'s
+/// own "not scheduled" gap named -- `sync_with_all_peers` existing wasn't enough on its own,
+/// since nothing in this crate called it on any cadence. Calling this function is still an
+/// explicit opt-in a caller makes (and picks its own `interval` for); nothing here runs by
+/// default just from constructing a `MeshState`.
+///
+/// Best-effort in the same sense every other function in this file is: a single peer being
+/// unreachable on one tick is logged and retried on the next tick, never fatal to the loop. Drop
+/// or `.abort()` the returned handle to stop -- there is no graceful mid-tick cancellation beyond
+/// what `tokio::task::JoinHandle::abort`'s usual "cancel at the next `.await` point" already
+/// gives.
+pub fn spawn_periodic_sync(state: MeshState, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            sync_with_all_peers(&state).await;
+        }
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PullError {
     #[error("request to {0} failed: {1}")]
@@ -1556,6 +1579,60 @@ mod tests {
         let (_addr_catcher, state_catcher) = spawn(vec![]).await;
         // Port 0 on loopback is never a live listener -- a real connection failure.
         pull_and_merge(&state_catcher, "http://127.0.0.1:0").await;
+        assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_periodic_sync_picks_up_data_that_arrives_after_the_first_tick() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        let handle = spawn_periodic_sync(state_catcher.clone(), std::time::Duration::from_millis(20));
+
+        // Populate the source only *after* starting the schedule -- the periodic nature, not
+        // just a one-shot pull, is what this test is actually checking.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("periodic-sync-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            state_catcher.tree.read().unwrap().corroboration_for("global", &MeshMember::BaseCluster("periodic-sync-test".into())),
+            1
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn aborting_the_returned_handle_stops_further_syncing() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        let handle = spawn_periodic_sync(state_catcher.clone(), std::time::Duration::from_millis(20));
+        // Let at least one tick run, then stop the schedule entirely.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await; // let the abort actually land
+
+        // Data added to the source *after* the abort must never reach the catcher.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("post-abort-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
     }
 }

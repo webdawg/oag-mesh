@@ -64,7 +64,8 @@ identity-bearing (unlike the reporter side) claim that a responder is handling a
 advisory only, deliberately carrying no proof-of-work
 (`spec/12-responder-acknowledgment.md`) — all five over a real HTTP transport
 (`spec/04-transport.md`), both pushed to configured peers and pullable later by one that
-missed a broadcast (`spec/10-anti-entropy.md`), and manual (not automatic, not crash-safe) disk
+missed a broadcast, optionally on an opt-in schedule (`spawn_periodic_sync`,
+`spec/10-anti-entropy.md`), and manual (not automatic, not crash-safe) disk
 persistence for all five stores (`spec/08-persistence.md`). A `ClaimReport`'s self-asserted
 cluster can be cross-checked against real cluster-nesting data alone
 (`best_corroborated_value_cross_checked`, `GET .../best-cross-checked`) — confirming the claimed

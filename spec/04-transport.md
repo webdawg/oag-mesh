@@ -99,7 +99,7 @@ is the deliberate exception -- see `spec/12-responder-acknowledgment.md` for why
 
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (27 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (29 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` (with valid
 proof-of-work) is recorded and corroborated on the receiving side; a tampered declaration is
 rejected over the wire with `400` and never recorded; `broadcast_bridge_declaration` reaches
@@ -122,7 +122,7 @@ severity correctly, with an empty query string returning everything (`spec/11-re
 search.md`); a pushed `ResponderAcknowledgment` (no proof-of-work required) is recorded and
 readable back, a tampered one is rejected, `broadcast_responder_acknowledgment` reaches every
 configured peer, and querying an unacknowledged nonce returns an empty list
-(`spec/12-responder-acknowledgment.md`); plus 3 more for pull-based anti-entropy, listed in
+(`spec/12-responder-acknowledgment.md`); plus 5 more for pull-based anti-entropy, listed in
 `spec/10-anti-entropy.md`'s own "Tests" section.
 
 ## Open questions (genuinely unresolved)
@@ -134,8 +134,9 @@ configured peer, and querying an unacknowledged nonce returns an empty list
 - **Pull-based anti-entropy exists now (`spec/10-anti-entropy.md`), but it's a weaker trust
   model than push, not a free upgrade.** Merging a pulled snapshot trusts the source peer's own
   prior verification instead of re-deriving it -- see `spec/10`'s own "trade-off" section for
-  exactly what that costs. It's also not incremental (every pull fetches a peer's whole store)
-  and not scheduled (nothing calls it automatically yet).
+  exactly what that costs. It's also still not incremental (every pull fetches a peer's whole
+  store, and `spawn_periodic_sync` just means doing that more often) -- a scheduling opt-in now
+  exists (`spawn_periodic_sync`), but with no default cadence, jitter, or cross-node coordination.
 - **Four of five submission types now cost real, escalating proof-of-work, but none of them stop
   a well-resourced attacker, and the fifth has a different problem entirely.**
   `AnonymousEvent` (`spec/03`'s "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s

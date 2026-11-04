@@ -1,7 +1,7 @@
 # Pull-Based Anti-Entropy
 
 **Source**: `crates/oag-mesh/src/transport.rs` (`pull_and_merge`, `sync_with_all_peers`,
-`/oag-mesh/v1/sync/*`), plus `merge_snapshot` on `bridge::MeshTree`,
+`spawn_periodic_sync`, `/oag-mesh/v1/sync/*`), plus `merge_snapshot` on `bridge::MeshTree`,
 `corroboration::ClaimCorroboration`, `membership::MembershipRegistry`, and
 `responder::ResponderAcknowledgmentLog`, and `merge` on `anonymous_event::AnonymousEventLog`.
 
@@ -40,9 +40,13 @@ regresses state. `sync_with_all_peers(state)` is the convenience wrapper: pull-a
 every configured peer in turn, best-effort, the pull-side mirror of the `broadcast_*` functions'
 push-side fan-out.
 
-Nothing in this crate calls `sync_with_all_peers` on its own -- same "caller decides the
-schedule" posture as `MeshState::save_to_dir`. A real deployment would call it on a timer, or on
-startup, or both; this crate has no opinion on cadence.
+Nothing in this crate calls `sync_with_all_peers` *by default* -- same "caller decides" posture
+as `MeshState::save_to_dir`. `spawn_periodic_sync(state, interval)` is the opt-in: it spawns a
+background task that calls `sync_with_all_peers` once immediately, then again every `interval`,
+forever, until the returned `tokio::task::JoinHandle` is aborted or dropped (with the runtime
+shutting down). A caller still has to call this function and still picks its own `interval` --
+nothing here decides a cadence on anyone's behalf, it just removes the need to hand-write the
+loop.
 
 ## The trade-off, stated as plainly as every other partial guarantee in this crate
 
@@ -73,8 +77,14 @@ with -- this crate takes no position on that, beyond stating the trade-off exist
 - **Not incremental.** Every pull fetches a peer's *entire* store, every time -- no "since
   sequence number N" delta sync like the base project's own `oag-sync` `hello`/`heads` protocol
   uses. Fine at this crate's current scale, a real cost once any store grows large.
-- **Not scheduled.** `sync_with_all_peers` exists, nothing calls it automatically. A real
-  deployment decides its own cadence.
+  `spawn_periodic_sync` makes this worse in one specific way worth naming: running it on a short
+  interval means re-fetching every store's *entire* contents that often, not just the since-last-
+  tick delta -- the convenience of scheduling and the cost of non-incremental pulls compound.
+- **Scheduling now exists (`spawn_periodic_sync`), but it's still an explicit opt-in with no
+  default cadence.** Nothing constructs a `MeshState` and starts syncing on its own; a caller
+  calls `spawn_periodic_sync` and picks an `interval` appropriate to its own deployment. No
+  jitter/backoff, no adaptive interval, no coordination across multiple nodes to avoid every peer
+  pulling from every other peer at the same wall-clock moment.
 - **Does not re-verify anything.** Stated above, the central caveat: a pull trusts the source
   peer's own verification, it does not re-derive it.
 - **Mostly no conflict resolution beyond union -- `ResponderAcknowledgmentLog` is the one
@@ -96,9 +106,13 @@ unions attester sets the same way. `crates/oag-mesh/src/anonymous_event.rs` adds
 genuinely new events and skips an exact duplicate, while keeping an unrelated nonce distinct.
 `crates/oag-mesh/src/responder.rs` adds 1: `merge_snapshot` keeps whichever of a local and
 incoming entry is more recent per responder, in both directions (see `spec/12`'s own tests for
-the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 3 integration tests, real
+the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 5 integration tests, real
 axum servers, real HTTP round trips: `pull_and_merge` brings a node that started completely empty
 fully up to date across all five stores in one call, and a second, repeated call doesn't inflate
 anything (idempotent); `sync_with_all_peers` pulls from every configured peer and merges both;
 pulling from an unreachable address logs a warning and leaves the puller's state untouched rather
-than panicking or stopping other stores from being attempted.
+than panicking or stopping other stores from being attempted; `spawn_periodic_sync` picks up data
+that's added to a peer only *after* the schedule already started, across real wall-clock ticks
+(not just a single pull at spawn time); aborting the returned handle actually stops further
+syncing -- data added to a peer after the abort never reaches the catcher even after waiting
+long enough that further ticks would otherwise have occurred.

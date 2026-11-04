@@ -6,8 +6,9 @@ fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half
 an advisory, signed claim-to-handling layered on `spec/03`'s own search primitive
 (`spec/11-responder-search.md`). A real HTTP transport covers all five
 (`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
-(`pull_and_merge`/`sync_with_all_peers`, `spec/10-anti-entropy.md`) now reaching a peer that was
-offline for a specific broadcast, and manual, non-crash-safe persistence covers all five stores
+(`pull_and_merge`/`sync_with_all_peers`/`spawn_periodic_sync`, `spec/10-anti-entropy.md`) now
+reaching a peer that was offline for a specific broadcast, optionally on an opt-in schedule, and
+manual, non-crash-safe persistence covers all five stores
 (`spec/08-persistence.md`). Four of the five message types now require escalating proof-of-work
 before recording a submission (`spec/02`'s, `spec/03`'s, `spec/05`'s, and `spec/09`'s own
 "Anti-sybil"/"Anti-spam" sections) -- `spec/12`'s `ResponderAcknowledgment` deliberately carries
@@ -176,4 +177,6 @@ collection, vault, or release capability. See that RFC for current requirements 
   independent re-verification. This is a new, different trust boundary from the "mint fresh
   `PeerIdentity`s" gap above, not the same one restated: it's about trusting the specific peers
   already on `MeshState.peers`'s list to report their own state honestly, not about how many
-  identities an attacker can mint.
+  identities an attacker can mint. `spawn_periodic_sync` makes it easier to run this on a
+  schedule; it does not change the trust model at all -- still an explicit opt-in, still trusting
+  whatever peer it pulls from, now just doing so repeatedly instead of once.
