@@ -36,7 +36,7 @@ use axum::{Json, Router};
 use oag_crypto::PeerId;
 use serde::{Deserialize, Serialize};
 
-use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, ProofOfWork};
+use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
@@ -166,6 +166,7 @@ pub fn router(state: MeshState) -> Router {
     Router::new()
         .route("/oag-mesh/v1/bridge-declaration", post(receive_bridge_declaration))
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
+        .route("/oag-mesh/v1/anonymous-event/search", get(search_anonymous_events))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
         .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
@@ -255,6 +256,18 @@ async fn receive_anonymous_event(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
+}
+
+/// Read-only: every event in this node's own `AnonymousEventLog` matching the query-string filter
+/// (`kind`, `min_severity`, `location_prefix`, `since` -- see `anonymous_event::EventFilter`).
+/// This is the one piece of `spec/03-anonymous-event-rfc.md`'s "Reaching a responder" open
+/// question this crate actually answers, and it is a narrow one -- see
+/// `spec/11-responder-search.md` for exactly what it is and is not. Same node-local-only,
+/// no-auth scope as every other `GET` endpoint in this file: it searches this node's own log,
+/// not the wider mesh, and anyone who can reach the listen address can run any search.
+async fn search_anonymous_events(State(state): State<MeshState>, Query(filter): Query<EventFilter>) -> Response {
+    let log = state.event_log.read().unwrap();
+    Json(serde_json::json!({ "events": log.search(&filter) })).into_response()
 }
 
 /// Receives a `ClaimReportSubmission` (the report plus its proof-of-work) and records it into
@@ -847,6 +860,44 @@ mod tests {
         let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
         push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap();
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("transport-test-nonce"), 1);
+    }
+
+    #[tokio::test]
+    async fn search_anonymous_events_filters_by_kind_and_min_severity_over_the_wire() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        let mut medical_critical = valid_event("search-wire-medical");
+        medical_critical.kind = crate::anonymous_event::EventKind::MedicalEmergency(
+            crate::anonymous_event::MedicalEmergencyKind::HeartIssue,
+        );
+        medical_critical.severity = crate::anonymous_event::Severity::Critical;
+        let pow1 = ProofOfWork::solve(&medical_critical, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &medical_critical, pow1).await.unwrap();
+
+        let mut hazard_low = valid_event("search-wire-hazard");
+        hazard_low.severity = crate::anonymous_event::Severity::Low;
+        let pow2 = ProofOfWork::solve(&hazard_low, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &hazard_low, pow2).await.unwrap();
+
+        let response =
+            reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?kind=MedicalEmergency")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["events"][0]["corroboration_nonce"], "search-wire-medical");
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?min_severity=High"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["events"][0]["corroboration_nonce"], "search-wire-medical");
+
+        // No filter at all returns both.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -20,8 +20,8 @@ pub mod persistence;
 pub mod transport;
 
 pub use anonymous_event::{
-    AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventKind, MedicalEmergencyKind,
-    ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
+    AnonymousEvent, AnonymousEventError, AnonymousEventLog, CoarseLocation, EventFilter, EventKind,
+    EventKindCategory, MedicalEmergencyKind, ProofOfWork, Severity, BASE_DIFFICULTY_BITS, DIFFICULTY_STEP_BITS,
 };
 pub use bridge::{
     BridgeDeclaration, BridgeEdgeSnapshot, BridgeError, BridgeProofOfWork, MeshMember, MeshTree,

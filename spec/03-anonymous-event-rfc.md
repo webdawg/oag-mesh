@@ -2,9 +2,12 @@
 
 **Status: schema, local corroboration bookkeeping, a proof-of-work anti-spam/anti-replay check,
 and a real transport (`spec/04-transport.md`) are all implemented. Dispatch-to-a-responder is
-not designed. Proof-of-work raises the cost of spam/self-replay; it does not, and cannot, stop a
-well-resourced attacker — see "Anti-spam and anti-replay" below for exactly what it does and
-doesn't achieve.**
+still not designed, but one narrow slice of "reaching a responder" now is:
+`spec/11-responder-search.md`'s filterable search over a node's own log (by kind, minimum
+severity, location prefix, recency) — explicitly not dispatch itself, see that file for exactly
+where the line is drawn. Proof-of-work raises the cost of spam/self-replay; it does not, and
+cannot, stop a well-resourced attacker — see "Anti-spam and anti-replay" below for exactly what
+it does and doesn't achieve.**
 
 ## Why this is a separate mechanism from `spec/02-cluster-nesting.md`
 
@@ -176,15 +179,19 @@ identity-free check can ever guarantee.
   resistance entry in `spec/22-future-work.md` there. Still not solved here.
 - **Reaching a responder.** A `MedicalEmergency` report is only useful for "life-saving actions"
   if it reaches someone who can act on it — and *that* delivery mechanism needs its own answer for
-  "how does this happen without identifying the reporter or the responder," which this RFC does
-  not attempt.
+  "how does this happen without identifying the reporter or the responder." `spec/11-responder-
+  search.md`'s filterable search over a node's own log is the one piece of this actually
+  answered: a responder can find relevant events without any new identifying surface. Delivery,
+  notification, responder identity/subscription, and duplicate-response prevention are all still
+  unattempted -- see `spec/11`'s own "what this explicitly is not" for exactly what's still
+  missing.
 - **Retention/expiry.** Nothing here specifies how long an `AnonymousEventLog` keeps old reports,
   or when/how an `AllClear` actually removes a resolved situation from view rather than just
   adding one more entry under the same nonce.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (10 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (14 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
 recorded into the log (checked before any proof-of-work is even considered); independent reports
 sharing a `corroboration_nonce` corroborate each other while an unrelated nonce stays separate; a
@@ -193,6 +200,8 @@ report with no proof-of-work is rejected; required difficulty escalates with eac
 report under one nonce (and a proof solved for an earlier, lower difficulty is correctly rejected
 against the new, higher one); a proof-of-work solved for one event cannot be reused for a
 different one; `merge` adds genuinely new events and skips an exact duplicate while keeping an
-unrelated nonce distinct (see `spec/10-anti-entropy.md`). `crates/oag-mesh/src/transport.rs` adds
-one more over the wire: a submission with insufficient proof-of-work is rejected with `400`,
-never recorded.
+unrelated nonce distinct (see `spec/10-anti-entropy.md`); and 4 more for `search`/`EventFilter`
+(see `spec/11-responder-search.md`). `crates/oag-mesh/src/transport.rs` adds 2 more over the
+wire: a submission with insufficient proof-of-work is rejected with `400`, never recorded; and
+`GET .../search` filters correctly by kind and by minimum severity, with an empty query string
+returning everything.

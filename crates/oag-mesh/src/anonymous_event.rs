@@ -44,6 +44,77 @@ pub enum EventKind {
     AllClear,
 }
 
+/// `EventKind` without its `MedicalEmergencyKind` payload -- lets a search/filter (`EventFilter`)
+/// ask "any `MedicalEmergency`, regardless of sub-kind" without needing to enumerate every
+/// `MedicalEmergencyKind` variant whenever a new one is added. Exists only for filtering; nothing
+/// here ever stores one of these in place of a real `EventKind`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EventKindCategory {
+    Sighting,
+    HazardObserved,
+    MedicalEmergency,
+    ResourceNeed,
+    AllClear,
+}
+
+impl EventKindCategory {
+    fn matches(&self, kind: &EventKind) -> bool {
+        matches!(
+            (self, kind),
+            (EventKindCategory::Sighting, EventKind::Sighting)
+                | (EventKindCategory::HazardObserved, EventKind::HazardObserved)
+                | (EventKindCategory::MedicalEmergency, EventKind::MedicalEmergency(_))
+                | (EventKindCategory::ResourceNeed, EventKind::ResourceNeed)
+                | (EventKindCategory::AllClear, EventKind::AllClear)
+        )
+    }
+}
+
+/// What `AnonymousEventLog::search` filters by -- every field is optional and `None` means "no
+/// constraint on this dimension," so an all-`None` filter matches every event (equivalent to no
+/// filter at all). Deliberately only ever narrows what's already in the log; it cannot reveal
+/// anything beyond what an `AnonymousEvent`'s own fields already carry (no new identifying
+/// surface, same constraint the rest of this schema holds to).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EventFilter {
+    pub kind: Option<EventKindCategory>,
+    /// Matches events with severity *at least* this urgent (`Severity`'s derived `Ord`, so
+    /// `High` also matches a `Critical` event).
+    pub min_severity: Option<Severity>,
+    /// A plain string prefix on `CoarseLocation`'s geohash-style string -- a responder covering
+    /// a region searches by that region's geohash prefix, not an exact match.
+    pub location_prefix: Option<String>,
+    /// Matches events with `observed_at >= since` (unix seconds) -- a recency bound, not a
+    /// precise one given `observed_at` is already rounded to `TIME_ROUNDING_SECONDS`.
+    pub since: Option<i64>,
+}
+
+impl EventFilter {
+    fn matches(&self, event: &AnonymousEvent) -> bool {
+        if let Some(kind) = &self.kind {
+            if !kind.matches(&event.kind) {
+                return false;
+            }
+        }
+        if let Some(min_severity) = self.min_severity {
+            if event.severity < min_severity {
+                return false;
+            }
+        }
+        if let Some(prefix) = &self.location_prefix {
+            if !event.location.0.starts_with(prefix.as_str()) {
+                return false;
+            }
+        }
+        if let Some(since) = self.since {
+            if event.observed_at < since {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Closed sub-classification for `EventKind::MedicalEmergency`, so a response can be routed to
 /// the right kind of medical team without any free-text description -- the same "no identifying
 /// detail, closed enum only" constraint as the rest of this schema. Add more variants here, not
@@ -56,8 +127,11 @@ pub enum MedicalEmergencyKind {
 }
 
 /// How urgently a report needs a response -- the base signal a consumer triages on, since there
-/// is no identifying detail in the rest of the payload to go on.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// is no identifying detail in the rest of the payload to go on. Derives `PartialOrd`/`Ord` in
+/// declaration order (`Low < Medium < High < Critical`) so `EventFilter::min_severity` can ask
+/// "at least this urgent" -- a responder's own triage threshold, not a change to how severity is
+/// assigned or interpreted anywhere else.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     /// Worth recording, nothing to act on right now (e.g. a hazard that's already contained).
     Low,
@@ -276,6 +350,18 @@ impl AnonymousEventLog {
         self.events.get(corroboration_nonce).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every recorded event matching `filter`, across every nonce -- the one piece of
+    /// `spec/03-anonymous-event-rfc.md`'s "Reaching a responder" open question this crate
+    /// actually answers: a way for a responder to find events relevant to them (by kind, minimum
+    /// severity, coarse location prefix, or recency) without a push/dispatch mechanism of any
+    /// kind. See `spec/11-responder-search.md` for exactly what this is, and -- stated as
+    /// plainly as that RFC's own "not attempted" framing -- what it is **not**: there is still no
+    /// responder identity, no notification/push to anyone, no claim-to-avoid-duplicate-response,
+    /// and this searches only this one node's own local log, not the wider mesh.
+    pub fn search(&self, filter: &EventFilter) -> Vec<&AnonymousEvent> {
+        self.events.values().flatten().filter(|event| filter.matches(event)).collect()
+    }
+
     /// Merges every event in `other` into `self`, skipping anything already present (exact
     /// `AnonymousEvent` equality -- `event_id` is random per submission, so this only catches a
     /// literal re-pull of the same record, not two independent reports of the same real event;
@@ -462,6 +548,64 @@ mod tests {
 
         assert_eq!(local.corroboration_for("merge-test"), 2);
         assert_eq!(local.corroboration_for("remote-only-nonce"), 1);
+    }
+
+    #[test]
+    fn search_with_no_filter_fields_set_returns_every_event() {
+        let mut log = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut log, valid_event("search-test-1")).unwrap();
+        record_with_fresh_pow(&mut log, valid_event("search-test-2")).unwrap();
+        assert_eq!(log.search(&EventFilter::default()).len(), 2);
+    }
+
+    #[test]
+    fn search_by_kind_category_matches_regardless_of_sub_kind_payload() {
+        let mut log = AnonymousEventLog::new();
+        let mut medical = valid_event("search-medical");
+        medical.kind = EventKind::MedicalEmergency(MedicalEmergencyKind::HeartIssue);
+        record_with_fresh_pow(&mut log, medical).unwrap();
+        record_with_fresh_pow(&mut log, valid_event("search-hazard")).unwrap(); // HazardObserved
+
+        let filter = EventFilter { kind: Some(EventKindCategory::MedicalEmergency), ..Default::default() };
+        let results = log.search(&filter);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].kind, EventKind::MedicalEmergency(_)));
+    }
+
+    #[test]
+    fn search_by_min_severity_matches_at_least_as_urgent() {
+        let mut log = AnonymousEventLog::new();
+        let mut low = valid_event("search-low");
+        low.severity = Severity::Low;
+        record_with_fresh_pow(&mut log, low).unwrap();
+        let mut critical = valid_event("search-critical");
+        critical.severity = Severity::Critical;
+        record_with_fresh_pow(&mut log, critical).unwrap();
+
+        let filter = EventFilter { min_severity: Some(Severity::High), ..Default::default() };
+        let results = log.search(&filter);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn search_by_location_prefix_and_since_narrow_results() {
+        let mut log = AnonymousEventLog::new();
+        let mut nearby = valid_event("search-nearby");
+        nearby.location = CoarseLocation("9q8yy".to_string());
+        nearby.observed_at = 1_700_001_000; // divisible by 300, later than valid_event's default
+        record_with_fresh_pow(&mut log, nearby).unwrap();
+        let mut far = valid_event("search-far");
+        far.location = CoarseLocation("abcde".to_string());
+        record_with_fresh_pow(&mut log, far).unwrap();
+
+        let by_location = log.search(&EventFilter { location_prefix: Some("9q8".to_string()), ..Default::default() });
+        assert_eq!(by_location.len(), 1);
+        assert_eq!(by_location[0].location.0, "9q8yy");
+
+        let by_recency = log.search(&EventFilter { since: Some(1_700_000_900), ..Default::default() });
+        assert_eq!(by_recency.len(), 1);
+        assert_eq!(by_recency[0].location.0, "9q8yy");
     }
 
     #[test]

@@ -14,9 +14,12 @@ cluster nesting alone (the cluster *name* being real,
 attestations (the *reporter's own standing* in that cluster,
 `best_corroborated_value_fully_cross_checked`) -- see `spec/02`'s, `spec/05`'s, and `spec/09`'s
 own sections for exactly what each layer does and does not cover; even fully cross-checked, an
-attester's own standing is itself unverified, one level deeper still. Dispatch-to-a-responder for
-anonymous events, verifying that distinct `PeerIdentity`s are genuinely different organizations
-(not just different keys), and automatic/crash-safe persistence, are not. Pull-based
+attester's own standing is itself unverified, one level deeper still. Full dispatch-to-a-responder
+for anonymous events is still not designed, though one narrow slice of it now is --
+`spec/11-responder-search.md`'s filterable, anonymous search over a node's own log -- explicitly
+not dispatch, notification, or duplicate-response prevention, see that file for where the line is
+drawn. Verifying that distinct `PeerIdentity`s are genuinely different organizations (not just
+different keys), and automatic/crash-safe persistence, remain unaddressed. Pull-based
 anti-entropy's own trade-off -- it trusts a peer's prior verification rather than re-deriving it,
 a weaker guarantee than push -- is stated in `spec/10`'s own section on exactly that.**
 
@@ -67,7 +70,10 @@ Four related mechanisms, one level above a single `oag` peer or peer cluster:
    EVENT" — a sighting, a hazard, a medical emergency, a resource need) carries no persistent
    signature, no precise location or time, and no free-text field that could smuggle an
    identifying description of a person. Corroboration here means independent reports converging
-   on the same `corroboration_nonce`, not counting distinct signing peers.
+   on the same `corroboration_nonce`, not counting distinct signing peers. A node's own log can
+   now be searched/filtered by kind, minimum severity, location prefix, or recency
+   (`spec/11-responder-search.md`) -- the one narrow slice of "reaching a responder" this crate
+   answers, explicitly not dispatch, notification, or anything that identifies a responder.
 4. **Cluster membership attestation, implemented — see
    `spec/09-cluster-membership-attestation.md`.** Closes the half of mechanism (2)'s cross-check
    gap that mechanism (1) alone can't: a `BridgeDeclaration` only ever says a cluster *name* is

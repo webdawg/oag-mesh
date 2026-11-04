@@ -52,7 +52,10 @@ protocol entirely. Nothing in the base project needs to know this exists.
   intermediary that doesn't log source-to-content correlation, onion-style layered relaying, or
   similar) is explicitly not built here — see "Open questions" below, and the identical
   unresolved gap in the base project's own `spec/22-future-work.md` ("never ending morphing
-  encryption," traffic-analysis resistance).
+  encryption," traffic-analysis resistance). `GET /oag-mesh/v1/anonymous-event/search` reads
+  back this node's own log, filtered by kind/minimum severity/location prefix/recency -- see
+  `spec/11-responder-search.md` for exactly what that is (a discovery primitive) and is not
+  (dispatch, notification, or anything that identifies a responder).
 
 Shipping a transport for `AnonymousEvent` at all, with this gap stated plainly, was a deliberate
 choice over waiting for the harder anonymity problem to be solved first — the payload-level
@@ -84,7 +87,7 @@ mechanism's own "Anti-spam"/"Anti-sybil resistance" section).
 
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (22 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (23 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` (with valid
 proof-of-work) is recorded and corroborated on the receiving side; a tampered declaration is
 rejected over the wire with `400` and never recorded; `broadcast_bridge_declaration` reaches
@@ -102,8 +105,10 @@ valid proof-of-work) is recorded; a tampered one is rejected over the wire;
 `broadcast_membership_attestation` reaches every configured peer; `GET
 .../best-fully-cross-checked` drops a report from a peer with no membership attestation while
 still counting one that passes both checks; `.../best-fully-cross-checked` against an unknown
-claim returns a `null` result; plus 3 more for pull-based anti-entropy, listed in
-`spec/10-anti-entropy.md`'s own "Tests" section.
+claim returns a `null` result; `GET .../anonymous-event/search` filters by kind and by minimum
+severity correctly, with an empty query string returning everything (`spec/11-responder-
+search.md`); plus 3 more for pull-based anti-entropy, listed in `spec/10-anti-entropy.md`'s own
+"Tests" section.
 
 ## Open questions (genuinely unresolved)
 

@@ -17,6 +17,7 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | [08-persistence.md](08-persistence.md) | One JSON file per in-memory store, written/read on demand — not automatic, not atomic, not a database |
 | [09-cluster-membership-attestation.md](09-cluster-membership-attestation.md) | Signed attestations that a peer is a genuine member of a cluster, corroborated by distinct attester count — closes the "is the reporter really in that cluster" half of `05`'s cross-check that `02` alone couldn't |
 | [10-anti-entropy.md](10-anti-entropy.md) | Pull-based catch-up for all four stores — fetch a peer's whole snapshot and merge it in, closing the "offline during a broadcast" gap push-only transport left open, at the cost of a weaker (unverified) trust model than push |
+| [11-responder-search.md](11-responder-search.md) | Filterable search over a node's own `AnonymousEvent` log (kind, minimum severity, location prefix, recency) — the one narrow slice of "reaching a responder" this crate answers; explicitly not dispatch, notification, or duplicate-response prevention |
 
 ## Proposed research-data extension (not implemented)
 

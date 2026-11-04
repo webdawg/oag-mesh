@@ -69,9 +69,12 @@ cluster can be cross-checked against real cluster-nesting data alone
 cluster *name* was really attested by a `BridgeDeclaration` — or against that **and** real
 membership-attestation data (`best_corroborated_value_fully_cross_checked`,
 `GET .../best-fully-cross-checked`) — additionally confirming the reporting peer actually belongs
-to that cluster, not just that the name is real. Still open: verifying that distinct
+to that cluster, not just that the name is real. A node's own anonymous-event log can also be
+searched/filtered by kind, minimum severity, location prefix, or recency
+(`spec/11-responder-search.md`) — a narrow discovery primitive, explicitly **not** dispatch,
+notification, or anything that identifies a responder. Still open: verifying that distinct
 `PeerIdentity`s are genuinely different organizations rather than just different keys
 (proof-of-work taxes cost, not identity, all the way down — even an attester's own standing in a
-cluster is itself unverified), dispatch-to-a-responder for anonymous events, and pull-based
-anti-entropy's own stated trade-off — it trusts a peer's prior verification instead of
-re-checking a signature, a weaker guarantee than push. See `spec/01-overview.md`.
+cluster is itself unverified), full dispatch-to-a-responder, and pull-based anti-entropy's own
+stated trade-off — it trusts a peer's prior verification instead of re-checking a signature, a
+weaker guarantee than push. See `spec/01-overview.md`.
