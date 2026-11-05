@@ -348,6 +348,78 @@ impl MeshTree {
         }
     }
 
+    /// Every edge directly touching `node` -- the mesh-groups it's a declared member of (if
+    /// `node` is a `BaseCluster` or a nested `MeshGroup`), and/or its own direct members (if
+    /// `node` is itself acting as a mesh-group) -- with at least `min_corroboration` distinct
+    /// declaring peers. This is the one place `MeshTree` treats a `BridgeDeclaration`'s
+    /// directional claim ("`member` belongs to `mesh_group`") as a traversable edge in *either*
+    /// direction: `members_of`/`base_clusters_under` only ever go top-down (mesh-group to
+    /// members); this is what `shortest_path`/`degrees_of_separation` walk to go the other way
+    /// too. See this crate's `README.md` -- "Founding principle: bounded-hop reachability" --
+    /// for why that symmetry matters.
+    fn neighbors(&self, node: &MeshMember, min_corroboration: usize) -> Vec<MeshMember> {
+        let mut result = Vec::new();
+        for ((mesh_group, member), peers) in &self.edges {
+            if peers.len() < min_corroboration {
+                continue;
+            }
+            let container = MeshMember::MeshGroup(mesh_group.clone());
+            if &container == node {
+                result.push(member.clone());
+            }
+            if member == node {
+                result.push(container);
+            }
+        }
+        result
+    }
+
+    /// The shortest chain of edges connecting `from` to `to`, in *either* direction (down into a
+    /// mesh-group's members, or up out of a cluster/mesh-group to whatever contains it),
+    /// counting only edges with at least `min_corroboration` distinct declaring peers. `None` if
+    /// no such path exists with the data currently held -- either because the two are genuinely
+    /// unreachable from each other in this mesh, or because this node simply hasn't seen enough
+    /// `BridgeDeclaration`s yet to know a path exists. `from == to` returns a one-element path
+    /// (zero hops) rather than searching.
+    ///
+    /// Breadth-first, so the result is always a *shortest* path (fewest hops), not merely *a*
+    /// path -- this is what makes `degrees_of_separation` below a meaningful "how many hops," not
+    /// an arbitrary one. Rebuilds its search from `self.edges` on every call rather than
+    /// maintaining a persistent adjacency structure -- fine at this crate's current scale (see
+    /// `spec/02-cluster-nesting.md`'s own "what this explicitly is not" for where that stops
+    /// being true), not optimized for a mesh with a very large number of edges.
+    pub fn shortest_path(&self, from: &MeshMember, to: &MeshMember, min_corroboration: usize) -> Option<Vec<MeshMember>> {
+        if from == to {
+            return Some(vec![from.clone()]);
+        }
+        let mut visited: HashSet<MeshMember> = HashSet::from([from.clone()]);
+        let mut queue: std::collections::VecDeque<Vec<MeshMember>> =
+            std::collections::VecDeque::from([vec![from.clone()]]);
+        while let Some(path) = queue.pop_front() {
+            let current = path.last().expect("path always has at least one element");
+            for neighbor in self.neighbors(current, min_corroboration) {
+                if &neighbor == to {
+                    let mut full_path = path;
+                    full_path.push(neighbor);
+                    return Some(full_path);
+                }
+                if visited.insert(neighbor.clone()) {
+                    let mut next_path = path.clone();
+                    next_path.push(neighbor);
+                    queue.push_back(next_path);
+                }
+            }
+        }
+        None
+    }
+
+    /// How many hops separate `from` and `to` in this mesh -- `shortest_path`'s length minus
+    /// one, or `None` on the same terms `shortest_path` returns `None`. `0` means `from == to`;
+    /// `1` means a single direct `BridgeDeclaration` edge connects them, in either direction.
+    pub fn degrees_of_separation(&self, from: &MeshMember, to: &MeshMember, min_corroboration: usize) -> Option<usize> {
+        self.shortest_path(from, to, min_corroboration).map(|path| path.len() - 1)
+    }
+
     /// A persistable snapshot of every edge this tree currently holds. `PeerId` has no
     /// `Serialize`/`Deserialize` of its own (it's from the base project, reused via git
     /// dependency, never modified here), so peer ids round-trip through their `Display`/
@@ -603,6 +675,142 @@ mod tests {
 
         let result = tree.base_clusters_under("group-a", 1);
         assert_eq!(result, HashSet::from(["leaf1".to_string()]));
+    }
+
+    #[test]
+    fn degrees_of_separation_from_a_node_to_itself_is_zero() {
+        let tree = MeshTree::new();
+        let node = MeshMember::BaseCluster("solo".into());
+        assert_eq!(tree.degrees_of_separation(&node, &node, 1), Some(0));
+        assert_eq!(tree.shortest_path(&node, &node, 1), Some(vec![node]));
+    }
+
+    #[test]
+    fn shortest_path_finds_a_direct_edge_in_either_direction() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "global", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        let global = MeshMember::MeshGroup("global".into());
+        let ny = MeshMember::BaseCluster("ny-dc1".into());
+
+        // Downward (mesh-group -> member) and upward (member -> mesh-group) are both one hop --
+        // the same edge, traversed in either direction.
+        assert_eq!(tree.degrees_of_separation(&global, &ny, 1), Some(1));
+        assert_eq!(tree.degrees_of_separation(&ny, &global, 1), Some(1));
+        assert_eq!(tree.shortest_path(&global, &ny, 1), Some(vec![global.clone(), ny.clone()]));
+        assert_eq!(tree.shortest_path(&ny, &global, 1), Some(vec![ny, global]));
+    }
+
+    #[test]
+    fn shortest_path_goes_in_any_direction_through_a_sibling_group() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+
+        // "global" contains both "north-america" and "europe"; each contains one base cluster.
+        // Getting from one base cluster to the other means going *up* out of one mesh-group,
+        // sideways through their shared parent, then back *down* into the other -- three hops,
+        // not reachable by top-down traversal (members_of/base_clusters_under) alone.
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "global", MeshMember::MeshGroup("north-america".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "global", MeshMember::MeshGroup("europe".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "north-america", MeshMember::BaseCluster("ny-dc1".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "europe", MeshMember::BaseCluster("fra-dc1".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        let ny = MeshMember::BaseCluster("ny-dc1".into());
+        let fra = MeshMember::BaseCluster("fra-dc1".into());
+
+        // ny-dc1 -> north-america -> global -> europe -> fra-dc1: four hops.
+        assert_eq!(tree.degrees_of_separation(&ny, &fra, 1), Some(4));
+        let path = tree.shortest_path(&ny, &fra, 1).unwrap();
+        assert_eq!(path.len(), 5);
+        assert_eq!(path.first(), Some(&ny));
+        assert_eq!(path.last(), Some(&fra));
+    }
+
+    #[test]
+    fn shortest_path_returns_none_when_genuinely_unreachable() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "global", MeshMember::BaseCluster("connected".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        let isolated = MeshMember::BaseCluster("never-declared-anywhere".into());
+        let connected = MeshMember::BaseCluster("connected".into());
+        assert_eq!(tree.shortest_path(&connected, &isolated, 1), None);
+        assert_eq!(tree.degrees_of_separation(&connected, &isolated, 1), None);
+    }
+
+    #[test]
+    fn shortest_path_respects_min_corroboration() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "global", MeshMember::BaseCluster("weakly-declared".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        let global = MeshMember::MeshGroup("global".into());
+        let weak = MeshMember::BaseCluster("weakly-declared".into());
+
+        // One declaring peer satisfies min_corroboration = 1, but not 2.
+        assert_eq!(tree.degrees_of_separation(&global, &weak, 1), Some(1));
+        assert_eq!(tree.degrees_of_separation(&global, &weak, 2), None);
+    }
+
+    #[test]
+    fn shortest_path_terminates_on_a_cycle_without_hanging() {
+        let a = PeerIdentity::generate();
+        let mut tree = MeshTree::new();
+        // group-a contains group-b, group-b contains group-a -- same cyclical topology
+        // base_clusters_under_terminates_on_a_cycle guards against, now for BFS traversal.
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "group-a", MeshMember::MeshGroup("group-b".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+        add_with_fresh_pow(
+            &mut tree,
+            &build_and_sign(&a, "group-b", MeshMember::MeshGroup("group-a".into()), 1_000).unwrap(),
+            1_010,
+        )
+        .unwrap();
+
+        let group_a = MeshMember::MeshGroup("group-a".into());
+        let unrelated = MeshMember::BaseCluster("never-mentioned".into());
+        // Must terminate (not hang) and correctly report no path to something never declared.
+        assert_eq!(tree.shortest_path(&group_a, &unrelated, 1), None);
     }
 
     #[test]

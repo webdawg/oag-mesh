@@ -23,6 +23,29 @@ that `oag`'s own `spec/22-future-work.md` already named and deliberately left un
   than vendored or reimplemented — a signature produced here verifies the same way a base-project
   peer's does.
 
+## Founding principle: bounded-hop reachability
+
+> "there are only so many degrees of seperation, go in any direction and get there"
+> — the user, stating directly the idea this layer's cluster-nesting graph exists to serve
+
+Interpreted concretely: wherever you start in the mesh — a base cluster, a mesh-group, a peer's
+own local view of it — there should be a short, findable chain of real `BridgeDeclaration`s to
+anywhere else in it, and that chain has to be walkable in *any* direction, not just the one a
+`BridgeDeclaration` happens to be worded in. "`member` belongs to `mesh_group`" is a directional
+*claim*; for routing purposes the edge it describes is not one-way. `bridge::MeshTree::
+shortest_path`/`degrees_of_separation` (`spec/02-cluster-nesting.md`) make this literal and
+queryable: breadth-first search over every sufficiently-corroborated edge, going "down" into a
+mesh-group's members or "up" out of a cluster to whatever contains it with equal ease, answering
+exactly how many hops separate any two points in the mesh, and through what chain.
+
+This is stated as a **design goal for how operators bridge clusters, not a guarantee the
+protocol enforces** — the same honesty-over-overclaiming posture every other mechanism in this
+repository holds to. If two clusters are never bridged at all, or only through a long, sparse
+chain, `degrees_of_separation` says so plainly (a large hop count, or `None` if genuinely
+unreachable) rather than pretending otherwise. What the mechanism guarantees is that the
+question has a real, computable answer from whatever `BridgeDeclaration` data a node has seen —
+not that the mesh will stay small on its own; that's still up to whoever's doing the bridging.
+
 ## Scope — what this is, and what it explicitly is not
 
 This layer connects clusters and corroborates *data/claims* (content a peer crawled, evidence it

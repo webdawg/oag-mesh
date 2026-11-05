@@ -66,6 +66,29 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
   cyclical topology (group A contains group B contains group A) terminates rather than looping
   forever — a caller/operator error, not something this function tries to interpret.
 
+## Bidirectional traversal: bounded-hop reachability
+
+`members_of`/`base_clusters_under` only ever go one direction: from a mesh-group down to its
+members. They can't answer "what mesh-groups is *this* cluster nested under," or "how do I get
+from this base cluster to that one" when the two aren't in a direct parent/child relationship.
+`MeshTree::shortest_path(from, to, min_corroboration)` and `degrees_of_separation(from, to,
+min_corroboration)` close that: breadth-first search treating every sufficiently-corroborated
+`(mesh_group, member)` edge as traversable in *either* direction -- down into a mesh-group's
+members, or up out of a cluster/mesh-group to whatever contains it -- answering "how many hops,
+through what chain" between any two `MeshMember`s this tree has data for.
+
+This is this crate's concrete answer to a founding principle stated directly by this
+repository's user: **"there are only so many degrees of separation, go in any direction and get
+there"** (quoted in full, with this file's own interpretation of it, in the top-level
+`README.md`'s "Founding principle: bounded-hop reachability" section). `degrees_of_separation`
+makes that idea literal and queryable rather than just aspirational -- but it is a **design goal
+for how clusters get bridged, not a guarantee this mechanism enforces**: if an operator never
+bridges two clusters, or only through a long, sparse chain of mesh-groups, `degrees_of_separation`
+reports that honestly (a large hop count, or `None` if genuinely unreachable from the data this
+tree holds) rather than pretending the mesh is smaller than it is. `from == to` is `0` hops by
+definition, with no search performed. A cyclical topology terminates the search (same guard
+`base_clusters_under`'s own cycle test exercises) rather than looping forever.
+
 ## What this explicitly is not (yet)
 
 - **Transport exists now (`spec/04-transport.md`).** A declaration reaches other mesh nodes by
@@ -91,10 +114,16 @@ fabricating edge corroboration from free to real, it does **not** stop a well-re
   says nothing about any individual peer's standing in that cluster. Closing that is
   `spec/09-cluster-membership-attestation.md`'s `MembershipAttestation` -- a new, separate
   mechanism, not an extension of this one.
+- **`shortest_path`/`degrees_of_separation` are node-local and not optimized for a large mesh.**
+  Both answer only from whatever edges *this* tree already holds -- a node that hasn't received
+  (via push or `spec/10-anti-entropy.md`'s pull) the declarations describing a path won't find
+  one even if it exists elsewhere in the wider mesh. Each call rebuilds its breadth-first search
+  from `self.edges` from scratch rather than maintaining any cached adjacency structure; fine at
+  this crate's current scale, a real cost on a mesh with a very large number of edges.
 
 ## Tests
 
-`crates/oag-mesh/src/bridge.rs` (16 unit tests): sign/verify round trip, self-reference rejection
+`crates/oag-mesh/src/bridge.rs` (22 unit tests): sign/verify round trip, self-reference rejection
 (a mesh-group cannot declare itself as its own member), tampered-field/mismatched-key/stale-
 timestamp rejection (mirroring the base project's own signed-declaration test shapes), corroboration
 counting distinct peers rather than repeated declarations, recursive resolution through nested
@@ -104,4 +133,10 @@ proof-of-work being rejected, a peer re-declaring an edge it already declared re
 proof-of-work, required difficulty escalating with each additional distinct peer on one edge
 (and a stale proof no longer being enough), a proof-of-work being bound to its own declaration
 and unable to be reused for another, and `merge_snapshot` unioning peer sets idempotently (see
-`spec/10-anti-entropy.md`).
+`spec/10-anti-entropy.md`). Plus 6 more for bidirectional traversal: a node's degrees of
+separation from itself is `0`; a direct edge is one hop in either direction (mesh-group-to-member
+and member-to-mesh-group); reaching a sibling cluster through a shared parent mesh-group takes
+the right number of hops and the right path, going up and back down, not just sideways through
+top-down traversal alone; a genuinely unreachable node returns `None`; `min_corroboration`
+excludes an edge below the threshold from the path search entirely; a cyclical topology
+terminates the search rather than hanging.

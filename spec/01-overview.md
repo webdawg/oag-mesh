@@ -45,7 +45,11 @@ Five related mechanisms, one level above a single `oag` peer or peer cluster:
    also carries escalating proof-of-work (`spec/02`'s "Anti-sybil resistance") taxing the cost of
    becoming a *new* distinct peer corroborating an edge — this matters beyond mechanism (1) on
    its own, since mechanism (2)'s cross-check (below) leans on this mechanism's data to decide
-   whether a claimed cluster name is real.
+   whether a claimed cluster name is real. `MeshTree::shortest_path`/`degrees_of_separation`
+   (`spec/02`'s "Bidirectional traversal") answer this repository's own founding principle --
+   quoted directly, and interpreted, in the top-level `README.md` -- as a concrete, queryable
+   fact: a breadth-first search treating every declared edge as traversable in either direction,
+   not just the direction a `BridgeDeclaration` happens to be worded in.
 2. **Federated corroboration, implemented — see `spec/05-federated-corroboration.md`.** Multiple
    independently-operated nodes (potentially across different clusters/organizations) receive or
    fetch the *same* claim, content, or gateway answer, each through its own path, and sign a
