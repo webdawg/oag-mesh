@@ -89,6 +89,14 @@ tree holds) rather than pretending the mesh is smaller than it is. `from == to` 
 definition, with no search performed. A cyclical topology terminates the search (same guard
 `base_clusters_under`'s own cycle test exercises) rather than looping forever.
 
+`shortest_path` only ever answers from *this one node's own* local edges, though -- it has no
+way to find a path that's only discoverable by combining what several different peers each
+separately know. `spec/13-distributed-route-search.md`'s `find_route_across_mesh` is the second
+half of the same founding principle, expanded with more of the user's own words: routing should
+work by "mov[ing] forward through random clusters of nodes," asking the mesh itself when one
+node's own knowledge runs out, bounded by the identical "only so many degrees of separation" --
+now a literal hop budget (`max_hops`) rather than just a property of already-known data.
+
 ## What this explicitly is not (yet)
 
 - **Transport exists now (`spec/04-transport.md`).** A declaration reaches other mesh nodes by

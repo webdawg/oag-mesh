@@ -37,7 +37,7 @@ use oag_crypto::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, ProofOfWork};
-use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshTree};
+use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
@@ -88,6 +88,26 @@ pub struct MembershipAttestationSubmission {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponderAcknowledgmentSubmission {
     pub acknowledgment: ResponderAcknowledgment,
+}
+
+/// The wire shape for `POST /oag-mesh/v1/route-search` -- see `find_route_across_mesh`'s own doc
+/// comment for the distributed search this drives. `already_asked` carries forward every peer
+/// address already contacted *in this search*, so the same peer isn't asked twice as the query
+/// fans out across hops -- a best-effort redundancy reducer, not what actually bounds the
+/// search; `remaining_hops` reaching `0` is what guarantees this always terminates, covered in
+/// `spec/13-distributed-route-search.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteSearchRequest {
+    pub from: MeshMember,
+    pub target: MeshMember,
+    pub min_corroboration: usize,
+    pub remaining_hops: u32,
+    pub already_asked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteSearchResponse {
+    pub path: Option<Vec<MeshMember>>,
 }
 
 fn now_unix() -> i64 {
@@ -196,6 +216,7 @@ pub fn router(state: MeshState) -> Router {
             "/oag-mesh/v1/responder-acknowledgment/{corroboration_nonce}",
             get(get_active_responders),
         )
+        .route("/oag-mesh/v1/route-search", post(receive_route_search))
         .route("/oag-mesh/v1/claim-report/{claim_id}/best", get(get_best_corroborated_value))
         .route(
             "/oag-mesh/v1/claim-report/{claim_id}/best-cross-checked",
@@ -425,6 +446,137 @@ async fn get_active_responders(State(state): State<MeshState>, Path(corroboratio
     let responders: Vec<String> =
         log.active_responders_for(&corroboration_nonce).into_iter().map(|p| p.to_string()).collect();
     Json(serde_json::json!({ "active_responders": responders })).into_response()
+}
+
+/// The recursive core of distributed route search (`spec/13-distributed-route-search.md`),
+/// shared by `find_route_across_mesh` (the public entry point a caller starts a search with)
+/// and `receive_route_search` (what runs on *each* node the search reaches, including the one
+/// that started it) -- the same function either way, which is what makes the search distributed
+/// at all: every hop re-runs this exact logic against its own node's own local
+/// `bridge::MeshTree`, not a single node doing all the work.
+///
+/// Checks this node's own local `MeshTree::shortest_path` first -- free, no network -- and
+/// returns immediately if it already has enough edges to answer. Otherwise, if `remaining_hops`
+/// is still above `0`, fans out the identical query (with `remaining_hops - 1`) to every
+/// configured peer not already in `already_asked`, in parallel, and returns the shortest path
+/// any of them found (if several did). `remaining_hops` reaching `0` is the **only** thing that
+/// guarantees this terminates -- `already_asked` reduces redundant re-asking of a peer already
+/// contacted earlier in this specific search, it does not guarantee each node in the mesh is
+/// visited at most once overall (two different branches of the fan-out can independently reach
+/// the same peer with different `already_asked` histories and ask it again). See `spec/13`'s own
+/// "what this explicitly is not" for this stated in full, including the amplification cost this
+/// trades for a chance at finding a path no single node knows end-to-end.
+async fn search_for_route(
+    state: &MeshState,
+    from: &MeshMember,
+    target: &MeshMember,
+    min_corroboration: usize,
+    remaining_hops: u32,
+    already_asked: &[String],
+) -> Option<Vec<MeshMember>> {
+    if let Some(path) = state.tree.read().unwrap().shortest_path(from, target, min_corroboration) {
+        return Some(path);
+    }
+    if remaining_hops == 0 {
+        return None;
+    }
+
+    let mut newly_asked = already_asked.to_vec();
+    let peers_to_ask: Vec<String> =
+        state.peers.iter().filter(|peer| !already_asked.contains(peer)).cloned().collect();
+    newly_asked.extend(peers_to_ask.iter().cloned());
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for peer in peers_to_ask {
+        let http = state.http.clone();
+        let from = from.clone();
+        let target = target.clone();
+        let asked = newly_asked.clone();
+        tasks.spawn(async move {
+            push_route_search(&http, &peer, &from, &target, min_corroboration, remaining_hops - 1, &asked)
+                .await
+                .ok()
+                .flatten()
+        });
+    }
+
+    let mut best: Option<Vec<MeshMember>> = None;
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(Some(path)) = result {
+            if best.as_ref().is_none_or(|current_best| path.len() < current_best.len()) {
+                best = Some(path);
+            }
+        }
+    }
+    best
+}
+
+/// Receives a `RouteSearchRequest` and answers it by running `search_for_route` against this
+/// node's own state -- see that function's doc comment for exactly what happens here, including
+/// the fan-out to this node's own peers if its own local `MeshTree` doesn't already have an
+/// answer.
+async fn receive_route_search(State(state): State<MeshState>, Json(request): Json<RouteSearchRequest>) -> Response {
+    let path = search_for_route(
+        &state,
+        &request.from,
+        &request.target,
+        request.min_corroboration,
+        request.remaining_hops,
+        &request.already_asked,
+    )
+    .await;
+    Json(RouteSearchResponse { path }).into_response()
+}
+
+/// Searches the mesh for a path from `from` to `target`, starting with this node's own local
+/// `bridge::MeshTree::shortest_path` and, if that alone isn't enough, fanning the same query out
+/// across up to `max_hops` of peer-to-peer hops -- "moving forward through random clusters of
+/// nodes" (the mesh's own founding principle, `README.md`'s "Founding principle: bounded-hop
+/// reachability") when a single node's own knowledge of the mesh isn't enough on its own.
+///
+/// **Not the same guarantee as `MeshTree::shortest_path` run against a single node's complete
+/// data.** A path found this way is real (every edge along it came from an actually-verified
+/// `BridgeDeclaration` somewhere in the mesh, same as any local result), but it is not guaranteed
+/// to be the *global* shortest path -- only the shortest one found among whatever this search
+/// actually reached within `max_hops`, which depends on which peers happened to answer and in
+/// what order. `None` means no path was found within the hop budget, not that no path exists
+/// anywhere in the mesh. See `spec/13-distributed-route-search.md` for this stated in full,
+/// including the fan-out/amplification cost of running this at all.
+pub async fn find_route_across_mesh(
+    state: &MeshState,
+    from: &MeshMember,
+    target: &MeshMember,
+    min_corroboration: usize,
+    max_hops: u32,
+) -> Option<Vec<MeshMember>> {
+    search_for_route(state, from, target, min_corroboration, max_hops, &[]).await
+}
+
+pub async fn push_route_search(
+    http: &reqwest::Client,
+    address: &str,
+    from: &MeshMember,
+    target: &MeshMember,
+    min_corroboration: usize,
+    remaining_hops: u32,
+    already_asked: &[String],
+) -> Result<Option<Vec<MeshMember>>, PullError> {
+    let url = format!("{}/oag-mesh/v1/route-search", address.trim_end_matches('/'));
+    let request = RouteSearchRequest {
+        from: from.clone(),
+        target: target.clone(),
+        min_corroboration,
+        remaining_hops,
+        already_asked: already_asked.to_vec(),
+    };
+    let response =
+        http.post(&url).json(&request).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    let parsed: RouteSearchResponse =
+        response.json().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    Ok(parsed.path)
 }
 
 /// Read-only: this node's own current view of `corroboration::ClaimCorroboration::
@@ -1634,5 +1786,128 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_route_across_mesh_answers_from_local_knowledge_with_no_network_call() {
+        // peers: vec![] -- if this succeeds at all, it proves the local-first check is really
+        // checked before any fan-out is attempted, not just faster in practice.
+        let (_addr_a, state_a) = spawn(vec![]).await;
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("local-only".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_a, &decl);
+        state_a.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("local-only".into());
+        let path = find_route_across_mesh(&state_a, &from, &to, 1, 0).await;
+        assert_eq!(path, Some(vec![from, to]));
+    }
+
+    #[tokio::test]
+    async fn find_route_across_mesh_finds_a_path_known_only_by_a_direct_peer() {
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_a, state_a) = spawn(vec![addr_b.clone()]).await;
+
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("known-by-b".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_b, &decl);
+        state_b.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("known-by-b".into());
+
+        // A's own tree knows nothing -- this can only succeed by asking peer B.
+        assert!(state_a.tree.read().unwrap().shortest_path(&from, &to, 1).is_none());
+        let path = find_route_across_mesh(&state_a, &from, &to, 1, 1).await;
+        assert_eq!(path, Some(vec![from, to]));
+    }
+
+    #[tokio::test]
+    async fn find_route_across_mesh_moves_through_a_chain_of_peers_bounded_by_max_hops() {
+        let (addr_c, state_c) = spawn(vec![]).await;
+        let (addr_b, _state_b) = spawn(vec![addr_c.clone()]).await;
+        let (_addr_a, state_a) = spawn(vec![addr_b.clone()]).await;
+
+        // Only C -- two hops away from A, through B -- has the data.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("known-by-c".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_c, &decl);
+        state_c.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("known-by-c".into());
+
+        // Only one degree of separation's worth of hops to spend: A can reach B, but B has no
+        // budget left to forward on to C -- "only so many degrees of separation" cuts the
+        // search off before it reaches the answer.
+        assert_eq!(find_route_across_mesh(&state_a, &from, &to, 1, 1).await, None);
+
+        // Two hops is enough to go A -> B -> C and back with an answer.
+        let path = find_route_across_mesh(&state_a, &from, &to, 1, 2).await;
+        assert_eq!(path, Some(vec![from, to]));
+    }
+
+    #[tokio::test]
+    async fn find_route_across_mesh_cannot_assemble_a_path_split_across_two_peers_with_no_shared_knowledge() {
+        // A real, honest limitation: each hop's answer comes from ONE node's own complete local
+        // shortest_path, never several different peers' partial knowledge stitched together.
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (addr_c, state_c) = spawn(vec![]).await;
+        let (_addr_a, state_a) = spawn(vec![addr_b.clone(), addr_c.clone()]).await;
+
+        // B knows "global contains north-america"; C knows "north-america contains ny-dc1" --
+        // together they describe a real two-hop path, but neither peer alone can compute it,
+        // and A asks each independently rather than combining their answers.
+        let decl_b = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::MeshGroup("north-america".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow_b = solve_bridge_pow(&state_b, &decl_b);
+        state_b.tree.write().unwrap().add(&decl_b, pow_b, now_unix()).unwrap();
+
+        let decl_c = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "north-america",
+            MeshMember::BaseCluster("ny-dc1".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow_c = solve_bridge_pow(&state_c, &decl_c);
+        state_c.tree.write().unwrap().add(&decl_c, pow_c, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("ny-dc1".into());
+
+        // A real path exists in the union of what B and C each know -- but this search can't
+        // see it, exactly the gap spec/13's own "what this explicitly is not" names.
+        assert_eq!(find_route_across_mesh(&state_a, &from, &to, 1, 3).await, None);
+
+        // Running spec/10's own pull-based anti-entropy first consolidates both halves onto one
+        // node, which is then enough for a plain local shortest_path to answer directly.
+        pull_and_merge(&state_a, &addr_b).await;
+        pull_and_merge(&state_a, &addr_c).await;
+        assert_eq!(
+            state_a.tree.read().unwrap().shortest_path(&from, &to, 1),
+            Some(vec![from, MeshMember::MeshGroup("north-america".into()), to])
+        );
     }
 }

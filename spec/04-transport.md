@@ -67,6 +67,15 @@ protocol entirely. Nothing in the base project needs to know this exists.
   `spec/11-responder-search.md` for exactly what that is (a discovery primitive) and is not
   (dispatch, notification, or anything that identifies a responder).
 
+`POST /oag-mesh/v1/route-search` is a different shape entirely from the five above: not a
+submission that gets recorded anywhere, but a query (`RouteSearchRequest { from, target,
+min_corroboration, remaining_hops, already_asked }`) that a receiving node answers by checking
+its own local `bridge::MeshTree::shortest_path` and, if that's not enough, *forwarding the same
+query to its own peers* -- the one endpoint in this file that triggers further outbound requests
+rather than simply reading or writing local state. See `spec/13-distributed-route-search.md` for
+the full mechanism, including the real amplification cost of a query that can fan out across
+multiple hops with no rate limiting.
+
 Shipping a transport for `AnonymousEvent` at all, with this gap stated plainly, was a deliberate
 choice over waiting for the harder anonymity problem to be solved first — the payload-level
 anonymity guarantee (no identifying field) still holds and still has real value even without
@@ -99,7 +108,7 @@ is the deliberate exception -- see `spec/12-responder-acknowledgment.md` for why
 
 ## Tests
 
-`crates/oag-mesh/src/transport.rs` (29 integration tests, real axum servers bound to real
+`crates/oag-mesh/src/transport.rs` (33 integration tests, real axum servers bound to real
 loopback ports, real HTTP round trips — no mocking): a pushed `BridgeDeclaration` (with valid
 proof-of-work) is recorded and corroborated on the receiving side; a tampered declaration is
 rejected over the wire with `400` and never recorded; `broadcast_bridge_declaration` reaches
@@ -123,7 +132,8 @@ search.md`); a pushed `ResponderAcknowledgment` (no proof-of-work required) is r
 readable back, a tampered one is rejected, `broadcast_responder_acknowledgment` reaches every
 configured peer, and querying an unacknowledged nonce returns an empty list
 (`spec/12-responder-acknowledgment.md`); plus 5 more for pull-based anti-entropy, listed in
-`spec/10-anti-entropy.md`'s own "Tests" section.
+`spec/10-anti-entropy.md`'s own "Tests" section, and 4 more for distributed route search, listed
+in `spec/13-distributed-route-search.md`'s own "Tests" section.
 
 ## Open questions (genuinely unresolved)
 
@@ -163,3 +173,9 @@ configured peer, and querying an unacknowledged nonce returns an empty list
   "aggregate, nothing sensitive" posture in the base project) or needs gating depends on what real
   `claim_id`/`observed_value_hash` content ends up flowing through a real deployment, which isn't
   decided yet.
+- **`POST /oag-mesh/v1/route-search` has no auth and no rate limiting, with a sharper
+  consequence than the other endpoints' lack of auth: it triggers real outbound network traffic
+  to a node's own peers.** Anyone who can reach the listen address can start a search that fans
+  out across however many hops they ask for, bounded only by `max_hops` and however many peers
+  each node along the way happens to have configured -- see `spec/13-distributed-route-search.md`
+  for the worst-case amplification this allows.

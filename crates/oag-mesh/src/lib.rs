@@ -43,6 +43,7 @@ pub use responder::{
     ResponderAcknowledgmentLog, ResponderAcknowledgmentSnapshot, UnsignedResponderAcknowledgment,
 };
 pub use transport::{
-    spawn_periodic_sync, BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission,
-    MeshState, PullError, PushError, ResponderAcknowledgmentSubmission,
+    find_route_across_mesh, spawn_periodic_sync, BridgeDeclarationSubmission, ClaimReportSubmission,
+    MembershipAttestationSubmission, MeshState, PullError, PushError, ResponderAcknowledgmentSubmission,
+    RouteSearchRequest, RouteSearchResponse,
 };

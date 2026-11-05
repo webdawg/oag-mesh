@@ -2,9 +2,12 @@
 
 **Status: all three mechanisms below are implemented (`spec/02`, `spec/03`, `spec/05`), plus a
 fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half of a gap
-`spec/02`/`spec/05` both left open, and a fifth, `spec/12-responder-acknowledgment.md`, that adds
+`spec/02`/`spec/05` both left open, a fifth, `spec/12-responder-acknowledgment.md`, that adds
 an advisory, signed claim-to-handling layered on `spec/03`'s own search primitive
-(`spec/11-responder-search.md`). A real HTTP transport covers all five
+(`spec/11-responder-search.md`), and a sixth, `spec/13-distributed-route-search.md`, that extends
+mechanism (1)'s own `shortest_path` across the network -- asking peer after peer, bounded by a
+hop budget, when one node's own local knowledge of the mesh isn't enough to answer alone. A real
+HTTP transport covers all five message-bearing mechanisms
 (`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
 (`pull_and_merge`/`sync_with_all_peers`/`spawn_periodic_sync`, `spec/10-anti-entropy.md`) now
 reaching a peer that was offline for a specific broadcast, optionally on an opt-in schedule, and
@@ -29,7 +32,7 @@ is stated in `spec/10`'s own section on exactly that.**
 
 ## What this layer is
 
-Five related mechanisms, one level above a single `oag` peer or peer cluster:
+Six related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -100,6 +103,17 @@ Five related mechanisms, one level above a single `oag` peer or peer cluster:
    worth taxing), which leaves open a real, explicitly-stated risk: a bad-faith identity could
    falsely claim to be handling events specifically to suppress genuine responders, and nothing
    here detects or prevents that in the moment.
+6. **Distributed route search, implemented — see `spec/13-distributed-route-search.md`.**
+   Mechanism (1)'s `shortest_path` only answers from one node's own local edges.
+   `find_route_across_mesh` asks the mesh itself when that isn't enough: the identical question
+   forwarded to peer after peer, each one checking its own local knowledge first and only
+   forwarding further if it has to, strictly bounded by a hop budget so the search always
+   terminates -- the literal mechanism behind this repository's own founding principle (quoted
+   directly, with its full interpretation, in the top-level `README.md`): "there are only so many
+   degrees of separation, go in any direction and get there." Cannot stitch together knowledge
+   split across multiple peers who haven't already consolidated it via mechanism (1)'s own
+   anti-entropy -- a real, demonstrated limitation, not a theoretical one, see `spec/13`'s own
+   tests.
 
 ## What this layer explicitly is not
 
@@ -184,3 +198,14 @@ collection, vault, or release capability. See that RFC for current requirements 
   identities an attacker can mint. `spawn_periodic_sync` makes it easier to run this on a
   schedule; it does not change the trust model at all -- still an explicit opt-in, still trusting
   whatever peer it pulls from, now just doing so repeatedly instead of once.
+- **Distributed route search (`spec/13-distributed-route-search.md`) trades amplification cost
+  for a chance at finding a path no single node knows end-to-end, and cannot stitch together
+  knowledge split across peers who haven't already consolidated it.** `find_route_across_mesh`'s
+  hop budget is the only hard termination guarantee -- its own "already asked" bookkeeping
+  reduces redundant re-contacting of the same peer within one search, it does not bound the
+  total fan-out across the whole search tree, so a request can issue real network traffic
+  proportional to `branching_factor^hops` in the worst case, with no rate limiting on the
+  receiving endpoint. And because each hop's answer comes from exactly one node's own complete
+  local `shortest_path`, a path whose two halves are known only by two *different* peers that
+  haven't pulled each other's data (`spec/10-anti-entropy.md`) is invisible to this search even
+  though it's real -- demonstrated directly by one of `spec/13`'s own tests, not just asserted.

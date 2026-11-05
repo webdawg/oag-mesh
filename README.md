@@ -28,23 +28,45 @@ that `oag`'s own `spec/22-future-work.md` already named and deliberately left un
 > "there are only so many degrees of seperation, go in any direction and get there"
 > — the user, stating directly the idea this layer's cluster-nesting graph exists to serve
 
-Interpreted concretely: wherever you start in the mesh — a base cluster, a mesh-group, a peer's
-own local view of it — there should be a short, findable chain of real `BridgeDeclaration`s to
+> "you can route faster in any direction - you search for the host moving forward through random
+> clusters of nodes - their are only so many degrees of seperation"
+> — the user, expanding the same principle into how search/routing should actually behave
+
+Interpreted concretely, in two parts matching the two quotes above:
+
+**Any direction.** Wherever you start in the mesh — a base cluster, a mesh-group, a peer's own
+local view of it — there should be a short, findable chain of real `BridgeDeclaration`s to
 anywhere else in it, and that chain has to be walkable in *any* direction, not just the one a
 `BridgeDeclaration` happens to be worded in. "`member` belongs to `mesh_group`" is a directional
 *claim*; for routing purposes the edge it describes is not one-way. `bridge::MeshTree::
 shortest_path`/`degrees_of_separation` (`spec/02-cluster-nesting.md`) make this literal and
-queryable: breadth-first search over every sufficiently-corroborated edge, going "down" into a
-mesh-group's members or "up" out of a cluster to whatever contains it with equal ease, answering
-exactly how many hops separate any two points in the mesh, and through what chain.
+queryable from one node's own knowledge: breadth-first search over every
+sufficiently-corroborated edge, going "down" into a mesh-group's members or "up" out of a
+cluster to whatever contains it with equal ease.
 
-This is stated as a **design goal for how operators bridge clusters, not a guarantee the
-protocol enforces** — the same honesty-over-overclaiming posture every other mechanism in this
-repository holds to. If two clusters are never bridged at all, or only through a long, sparse
-chain, `degrees_of_separation` says so plainly (a large hop count, or `None` if genuinely
-unreachable) rather than pretending otherwise. What the mechanism guarantees is that the
-question has a real, computable answer from whatever `BridgeDeclaration` data a node has seen —
-not that the mesh will stay small on its own; that's still up to whoever's doing the bridging.
+**Moving forward through random clusters of nodes.** One node's own knowledge is not the whole
+mesh's knowledge. `find_route_across_mesh` (`spec/13-distributed-route-search.md`) is what
+"search for the host" becomes concretely: when a node's own local `shortest_path` can't answer,
+it asks its peers the identical question, who ask theirs, moving the search outward through
+cluster after cluster rather than stopping at the edge of one node's own view. "Only so many
+degrees of separation" is the literal hop budget (`max_hops`) bounding that search -- the reason
+it's guaranteed to terminate rather than flood the mesh forever, exactly the same idea
+`degrees_of_separation` already named for a single node's local data, now applied to the search
+itself.
+
+Both are stated as **design goals for how the mesh behaves, not guarantees the protocol
+enforces** — the same honesty-over-overclaiming posture every other mechanism in this repository
+holds to. If two clusters are never bridged at all, or only through a long, sparse chain,
+`degrees_of_separation` says so plainly (a large hop count, or `None` if genuinely unreachable)
+rather than pretending otherwise. And `find_route_across_mesh` has a real, demonstrated limit of
+its own: it cannot stitch together a path whose two halves are known only by two *different*
+peers that haven't already consolidated their knowledge (`spec/10-anti-entropy.md`'s
+pull-based sync) — each hop's answer comes from one node's own complete local view, never
+several nodes' partial views combined on the fly. What both mechanisms guarantee is that the
+question has a real, computable answer from whatever `BridgeDeclaration` data the mesh has
+actually propagated to wherever the search reaches — not that the mesh will stay small, or
+fully-known to any one node, on its own; that's still up to whoever's doing the bridging and the
+syncing.
 
 ## Scope — what this is, and what it explicitly is not
 
@@ -75,7 +97,7 @@ record correctness. Global coverage does not grant unrestricted access or author
 
 ## Status
 
-Five mechanisms are implemented: cluster nesting with its own escalating proof-of-work
+Six mechanisms are implemented: cluster nesting with its own escalating proof-of-work
 anti-sybil protection (`spec/02-cluster-nesting.md`), the anonymous-event RFC schema with
 escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`),
 federated corroboration weighted by distinct cluster rather than distinct peer, also with its own
@@ -100,10 +122,16 @@ searched/filtered by kind, minimum severity, location prefix, or recency
 (`spec/11-responder-search.md`), and a responder can acknowledge an event so another checking
 first can stand down (`spec/12-responder-acknowledgment.md`) — two narrow, explicitly-bounded
 slices of "reaching a responder," neither of them dispatch, notification, or a guarantee that a
-claimed response is real. Still open: verifying that distinct `PeerIdentity`s are genuinely
+claimed response is real. A sixth mechanism, distributed route search
+(`spec/13-distributed-route-search.md`), extends cluster nesting's own `shortest_path` across
+the network: `find_route_across_mesh` asks peer after peer, bounded by a hop budget, when one
+node's local knowledge isn't enough — the concrete realization of this repository's own founding
+principle, above. Still open: verifying that distinct `PeerIdentity`s are genuinely
 different organizations rather than just different keys (proof-of-work taxes cost, not
 identity, all the way down — even an attester's own standing in a cluster is itself unverified),
 a bad-faith responder falsely claiming to handle events (proof-of-work wouldn't help here
-either — see `spec/12`), full dispatch-to-a-responder, and pull-based anti-entropy's own stated
+either — see `spec/12`), full dispatch-to-a-responder, pull-based anti-entropy's own stated
 trade-off — it trusts a peer's prior verification instead of re-checking a signature, a weaker
-guarantee than push. See `spec/01-overview.md`.
+guarantee than push — and distributed route search's own amplification cost and inability to
+stitch together knowledge split across peers who haven't already synced. See
+`spec/01-overview.md`.
