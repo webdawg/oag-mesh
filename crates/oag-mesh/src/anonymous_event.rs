@@ -121,7 +121,9 @@ where
 }
 
 impl EventFilter {
-    fn matches(&self, event: &AnonymousEvent) -> bool {
+    /// Whether `event` passes every constraint this filter sets. `pub(crate)` so the dispatch
+    /// layer (`crate::dispatch`) can route events to matching responder subscriptions.
+    pub(crate) fn matches(&self, event: &AnonymousEvent) -> bool {
         if let Some(kind) = &self.kind {
             if !kind.matches(&event.kind) {
                 return false;

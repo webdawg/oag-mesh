@@ -182,12 +182,12 @@ identity-free check can ever guarantee.
   unresolved.
 - **Reaching a responder.** A `MedicalEmergency` report is only useful for "life-saving actions"
   if it reaches someone who can act on it — and *that* delivery mechanism needs its own answer for
-  "how does this happen without identifying the reporter or the responder." `spec/11-responder-
-  search.md`'s filterable search over a node's own log is the one piece of this actually
-  answered: a responder can find relevant events without any new identifying surface. Delivery,
-  notification, responder identity/subscription, and duplicate-response prevention are all still
-  unattempted -- see `spec/11`'s own "what this explicitly is not" for exactly what's still
-  missing.
+  "how does this happen without identifying the reporter or the responder." `spec/11`'s
+  filterable search and `spec/14`'s blinded subscription + poll inbox are the two slices
+  answered: a responder can find relevant events, and can have them delivered to an inbox under a
+  random id the node cannot link to a `PeerIdentity`. Full push notification, durable delivery,
+  and responder identity remain unattempted -- see `spec/11`'s and `spec/14`'s own "what this
+  explicitly is not" for exactly what's still missing.
 - **Retention/expiry now has a primitive, but no automatic policy.**
   `AnonymousEventLog::prune_before(cutoff)` removes every event older than a cutoff (and empties
   nonce entries), returning the count removed; `prune_expired(now, max_age_seconds)` is the

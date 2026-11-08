@@ -15,6 +15,7 @@
 pub mod anonymous_event;
 pub mod bridge;
 pub mod corroboration;
+pub mod dispatch;
 pub mod membership;
 pub mod persistence;
 pub mod rate_limit;
@@ -38,6 +39,7 @@ pub use membership::{
     MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry, MembershipSnapshot,
     UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
+pub use dispatch::{ResponderInbox, ResponderSubscriptionRegistry};
 pub use persistence::PersistenceError;
 pub use rate_limit::{RateLimiter, TokenBucket};
 pub use responder::{

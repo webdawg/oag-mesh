@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use oag_crypto::PeerId;
@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, ProofOfWork};
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
+use crate::dispatch::{ResponderInbox, ResponderSubscriptionRegistry};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
 use crate::rate_limit::{RateLimiter, TokenBucket};
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
@@ -216,6 +217,14 @@ pub struct MeshState {
     /// "no weighting by how many subjects an attester vouches for, or how often". In-memory
     /// only, so a restart resets it.
     pub membership_attestation_limiter: Arc<RateLimiter>,
+    /// Blinded responder subscriptions: a responder-chosen random id -> filter. The node never
+    /// learns who the responder is, only that a subscription exists. In-memory only -- a
+    /// restart loses it, and the responder re-registers. See `spec/14`.
+    pub responder_subscriptions: Arc<RwLock<ResponderSubscriptionRegistry>>,
+    /// Per-subscription inboxes, filled when an event matching a subscription arrives. The
+    /// responder drains it by polling. In-memory only -- a restart clears it, and the responder
+    /// can re-search the log. See `spec/14`.
+    pub responder_inbox: Arc<RwLock<ResponderInbox>>,
 }
 
 impl MeshState {
@@ -244,6 +253,8 @@ impl MeshState {
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW,
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX,
             )),
+            responder_subscriptions: Arc::new(RwLock::new(ResponderSubscriptionRegistry::new())),
+            responder_inbox: Arc::new(RwLock::new(ResponderInbox::new())),
         }
     }
 
@@ -319,6 +330,8 @@ impl MeshState {
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW,
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX,
             )),
+            responder_subscriptions: Arc::new(RwLock::new(ResponderSubscriptionRegistry::new())),
+            responder_inbox: Arc::new(RwLock::new(ResponderInbox::new())),
         })
     }
 }
@@ -329,6 +342,18 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
         .route("/oag-mesh/v1/anonymous-event/search", get(search_anonymous_events))
         .route("/oag-mesh/v1/anonymous-event/prune", post(prune_anonymous_events))
+        .route(
+            "/oag-mesh/v1/responder-subscriptions",
+            post(register_responder_subscription),
+        )
+        .route(
+            "/oag-mesh/v1/responder-subscriptions/{subscription_id}",
+            delete(unregister_responder_subscription),
+        )
+        .route(
+            "/oag-mesh/v1/responder-inbox/{subscription_id}",
+            get(get_responder_inbox),
+        )
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
         .route("/oag-mesh/v1/responder-acknowledgment", post(receive_responder_acknowledgment))
@@ -427,6 +452,14 @@ async fn receive_anonymous_event(
     };
     match result {
         Ok(()) => {
+            // Dispatch: append the event to every matching blinded responder inbox. Best-effort
+            // and synchronous with the submission -- a responder polling its inbox sees the
+            // event after the 204. See `spec/14`.
+            {
+                let subscriptions = state.responder_subscriptions.read().unwrap();
+                let mut inbox = state.responder_inbox.write().unwrap();
+                inbox.push_matching(&relay_event, subscriptions.subscriptions());
+            }
             // One-hop anonymity relay: the target sees this node's address, not the original
             // submitter's. Best-effort -- a relay failure never rejects the submission, which
             // the relay already recorded. See `spec/04-transport.md`.
@@ -492,6 +525,48 @@ struct PruneRequest {
 async fn prune_anonymous_events(State(state): State<MeshState>, Json(request): Json<PruneRequest>) -> Response {
     let removed = state.event_log.write().unwrap().prune_before(request.before);
     Json(serde_json::json!({ "removed": removed })).into_response()
+}
+
+/// The body for `POST /oag-mesh/v1/responder-subscriptions` -- a responder-chosen random id and
+/// a filter. The node never learns which `PeerIdentity` stands behind the id; see `spec/14`.
+#[derive(Debug, Deserialize)]
+struct SubscriptionRegistration {
+    subscription_id: String,
+    #[serde(flatten)]
+    filter: EventFilter,
+}
+
+/// Registers or replaces a blinded responder subscription. Nothing about the responder's
+/// identity is recorded -- only the id they chose and the filter they want. See `spec/14`.
+async fn register_responder_subscription(
+    State(state): State<MeshState>,
+    Json(registration): Json<SubscriptionRegistration>,
+) -> Response {
+    state
+        .responder_subscriptions
+        .write()
+        .unwrap()
+        .upsert(registration.subscription_id, registration.filter);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Removes a blinded responder subscription. `404` if the id was not registered.
+async fn unregister_responder_subscription(
+    State(state): State<MeshState>,
+    Path(subscription_id): Path<String>,
+) -> Response {
+    if state.responder_subscriptions.write().unwrap().remove(&subscription_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Drains a blinded responder's inbox -- the events that matched its subscription since the
+/// last poll. Nothing is pushed; the responder has to ask. See `spec/14`.
+async fn get_responder_inbox(State(state): State<MeshState>, Path(subscription_id): Path<String>) -> Response {
+    let events = state.responder_inbox.write().unwrap().drain(&subscription_id);
+    Json(serde_json::json!({ "events": events })).into_response()
 }
 
 /// Receives a `ClaimReportSubmission` (the report plus its proof-of-work) and records it into
@@ -1764,6 +1839,84 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_subscription_receives_matching_events_in_its_inbox() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        // Register a blinded subscription for medical emergencies.
+        let register = serde_json::json!({ "subscription_id": "sub-1", "kind": "MedicalEmergency" });
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/responder-subscriptions"))
+            .json(&register)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // A matching event is queued.
+        let mut medical = valid_event("dispatch-medical");
+        medical.kind = crate::anonymous_event::EventKind::MedicalEmergency(
+            crate::anonymous_event::MedicalEmergencyKind::HeartIssue,
+        );
+        let pow = ProofOfWork::solve(&medical, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &medical, pow).await.unwrap();
+
+        // A non-matching event is not.
+        let hazard = valid_event("dispatch-hazard");
+        let pow = ProofOfWork::solve(&hazard, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &hazard, pow).await.unwrap();
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/responder-inbox/sub-1")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["events"][0]["corroboration_nonce"], "dispatch-medical");
+
+        // Draining empties the inbox.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/responder-inbox/sub-1")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn unregister_stops_delivery() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        let register = serde_json::json!({ "subscription_id": "sub-1", "kind": "MedicalEmergency" });
+        http.post(format!("{addr_a}/oag-mesh/v1/responder-subscriptions"))
+            .json(&register)
+            .send()
+            .await
+            .unwrap();
+
+        let response = http
+            .delete(format!("{addr_a}/oag-mesh/v1/responder-subscriptions/sub-1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let mut medical = valid_event("dispatch-unregister");
+        medical.kind = crate::anonymous_event::EventKind::MedicalEmergency(
+            crate::anonymous_event::MedicalEmergencyKind::HeartIssue,
+        );
+        let pow = ProofOfWork::solve(&medical, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &medical, pow).await.unwrap();
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/responder-inbox/sub-1")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 0);
+
+        // Unregistering again is 404.
+        let response = http
+            .delete(format!("{addr_a}/oag-mesh/v1/responder-subscriptions/sub-1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

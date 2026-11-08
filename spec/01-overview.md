@@ -4,9 +4,12 @@
 fourth, `spec/09-cluster-membership-attestation.md`, that closes the second half of a gap
 `spec/02`/`spec/05` both left open, a fifth, `spec/12-responder-acknowledgment.md`, that adds
 an advisory, signed claim-to-handling layered on `spec/03`'s own search primitive
-(`spec/11-responder-search.md`), and a sixth, `spec/13-distributed-route-search.md`, that extends
+(`spec/11-responder-search.md`), a sixth, `spec/13-distributed-route-search.md`, that extends
 mechanism (1)'s own `shortest_path` across the network -- asking peer after peer, bounded by a
-hop budget, when one node's own local knowledge of the mesh isn't enough to answer alone. A real
+hop budget, when one node's own local knowledge of the mesh isn't enough to answer alone, and a
+seventh, `spec/14-responder-dispatch.md`, that gives a responder a blinded subscription and a
+poll inbox -- the narrowest slice of "reaching a responder" that does not reveal which
+`PeerIdentity` is responding. A real
 HTTP transport covers all five message-bearing mechanisms
 (`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
 (`pull_and_merge`/`sync_with_all_peers`/`spawn_periodic_sync`, `spec/10-anti-entropy.md`) now
@@ -32,7 +35,7 @@ is stated in `spec/10`'s own section on exactly that.**
 
 ## What this layer is
 
-Six related mechanisms, one level above a single `oag` peer or peer cluster:
+Seven related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -114,6 +117,12 @@ Six related mechanisms, one level above a single `oag` peer or peer cluster:
    split across multiple peers who haven't already consolidated it via mechanism (1)'s own
    anti-entropy -- a real, demonstrated limitation, not a theoretical one, see `spec/13`'s own
    tests.
+7. **Responder dispatch, implemented — see `spec/14-responder-dispatch.md`.** A responder
+   registers a filter under a random `subscription_id` and polls a per-subscription inbox for
+   matching events. The node never learns which `PeerIdentity` stands behind the id -- only
+   that a subscription exists. The narrowest slice of `spec/03`'s "Reaching a responder" open
+   question: not a push notification, not durable, and the node does see the responder's network
+   address even though it does not learn their identity.
 
 ## What this layer explicitly is not
 

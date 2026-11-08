@@ -92,9 +92,9 @@ idempotent and cannot regress a more recent stand-down into a stale claim.
   than the cap in a window is throttled too. The defaults are a starting point, not a derived
   value; a real deployment should tune them to its own responder traffic. Identity accountability
   still matters after the fact, and the limiter is in-memory only, so a restart resets it.
-- **No notification.** Same as `spec/11-responder-search.md`'s own limits: nothing pushes an
-  acknowledgment to anyone. A responder has to already be polling `GET
-  .../responder-acknowledgment/{nonce}` (or re-running a search) to see one.
+- **No notification.** An acknowledgment is still only visible to a responder who polls `GET
+  .../responder-acknowledgment/{nonce}` (or re-runs a search). `spec/14`'s blinded subscription
+  can deliver *events* to a responder's inbox, but it does not push acknowledgments.
 - **Node-local only, no auth** -- same posture, same caveats, as every other `GET` endpoint in
   this crate.
 

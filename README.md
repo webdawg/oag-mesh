@@ -97,7 +97,7 @@ record correctness. Global coverage does not grant unrestricted access or author
 
 ## Status
 
-Six mechanisms are implemented: cluster nesting with its own escalating proof-of-work
+Seven mechanisms are implemented: cluster nesting with its own escalating proof-of-work
 anti-sybil protection (`spec/02-cluster-nesting.md`), the anonymous-event RFC schema with
 escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`),
 federated corroboration weighted by distinct cluster rather than distinct peer, also with its own
@@ -122,7 +122,10 @@ searched/filtered by kind, minimum severity, location prefix, or recency
 (`spec/11-responder-search.md`), and a responder can acknowledge an event so another checking
 first can stand down (`spec/12-responder-acknowledgment.md`) — two narrow, explicitly-bounded
 slices of "reaching a responder," neither of them dispatch, notification, or a guarantee that a
-claimed response is real. A sixth mechanism, distributed route search
+claimed response is real. A seventh mechanism, blinded responder dispatch
+(`spec/14-responder-dispatch.md`), adds the missing delivery: a responder registers a filter
+under a random id and polls a per-subscription inbox, and the node never learns which
+`PeerIdentity` stands behind that id. A sixth mechanism, distributed route search
 (`spec/13-distributed-route-search.md`), extends cluster nesting's own `shortest_path` across
 the network: `find_route_across_mesh` asks peer after peer, bounded by a hop budget, when one
 node's local knowledge isn't enough — the concrete realization of this repository's own founding
@@ -131,7 +134,8 @@ different organizations rather than just different keys (proof-of-work taxes cos
 identity, all the way down — even an attester's own standing in a cluster is itself unverified),
 a bad-faith responder falsely claiming to handle events (proof-of-work wouldn't help here
 either; a per-identity rate limit now bounds the flood, but it is not a reputation system or
-an allowlist — see `spec/12`), full dispatch-to-a-responder, pull-based anti-entropy's own stated
+an allowlist — see `spec/12`), full push notification and durable delivery for responders (a
+blinded subscription and poll inbox now exist — see `spec/14`), pull-based anti-entropy's own stated
 trade-off — it trusts a peer's prior verification instead of re-checking a signature, a weaker
 guarantee than push — and distributed route search's own residual limits: a per-search fan-out
 budget and a node-wide rate limiter now bound its amplification cost, but neither

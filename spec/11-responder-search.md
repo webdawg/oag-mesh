@@ -50,10 +50,11 @@ still apply unchanged) -- search only narrows what's already there, it cannot re
   surrounding feature could be misread as more than it is: nobody is identified, nothing is
   pushed, nothing is delivered, nothing is claimed. A responder has to already know to poll this
   endpoint; nothing here tells them to.
-- **No responder identity or subscription.** There is no concept of "a responder" anywhere in
-  this crate -- no registration, no address, no notification preference. Search is anonymous and
-  stateless on both sides: querying it reveals nothing about who's asking, and it remembers
-  nothing about who asked.
+- **No responder identity, but a blinded subscription now exists (`spec/14`).** Search itself
+  remains anonymous and stateless: querying it reveals nothing about who's asking, and it
+  remembers nothing about who asked. A responder can now register a filter under a random id and
+  poll an inbox (`spec/14-responder-dispatch.md`), but the node still never learns which
+  `PeerIdentity` stands behind that id -- only that a subscription exists.
 - **Claim-to-avoid-duplicate-response now exists (`spec/12-responder-acknowledgment.md`), but
   it's advisory, not a lock.** A responder can sign a `ResponderAcknowledgment` saying "I am
   handling this," queryable alongside a search, so a second responder checking first can stand
