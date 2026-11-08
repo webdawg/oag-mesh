@@ -41,7 +41,7 @@ use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, Pro
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
-use crate::rate_limit::TokenBucket;
+use crate::rate_limit::{RateLimiter, TokenBucket};
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
 
 /// Default cap on how many outbound `route-search` requests one distributed search may trigger
@@ -52,6 +52,12 @@ pub const DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET: u32 = 256;
 pub const ROUTE_SEARCH_RATE_LIMIT_CAPACITY: u32 = 8;
 /// Default token-bucket refill rate, in tokens per second, for inbound `route-search` requests.
 pub const ROUTE_SEARCH_RATE_LIMIT_PER_SEC: f64 = 2.0;
+/// Default window for the per-identity responder-acknowledgment rate limit -- see
+/// `spec/12-responder-acknowledgment.md`'s "rate limiting by identity" section.
+pub const RESPONDER_ACK_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default cap on responder acknowledgments per identity per window. A starting point, not a
+/// derived value -- a real deployment should tune it to its own responder traffic.
+pub const RESPONDER_ACK_RATE_LIMIT_MAX: u32 = 60;
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -146,6 +152,10 @@ pub struct MeshState {
     /// endpoint that can turn a single request into real outbound fan-out traffic. In-memory
     /// only, so a restart resets it; see `spec/13`'s "Anti-amplification" section.
     pub route_search_limiter: Arc<RwLock<TokenBucket>>,
+    /// Per-identity fixed-window limiter for `POST /oag-mesh/v1/responder-acknowledgment` --
+    /// the griefing mitigation `spec/12-responder-acknowledgment.md` names as "rate limiting by
+    /// identity". In-memory only, so a restart resets it.
+    pub responder_ack_limiter: Arc<RateLimiter>,
 }
 
 impl MeshState {
@@ -163,6 +173,10 @@ impl MeshState {
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
             ))),
+            responder_ack_limiter: Arc::new(RateLimiter::new(
+                RESPONDER_ACK_RATE_LIMIT_WINDOW,
+                RESPONDER_ACK_RATE_LIMIT_MAX,
+            )),
         }
     }
 
@@ -227,6 +241,10 @@ impl MeshState {
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
             ))),
+            responder_ack_limiter: Arc::new(RateLimiter::new(
+                RESPONDER_ACK_RATE_LIMIT_WINDOW,
+                RESPONDER_ACK_RATE_LIMIT_MAX,
+            )),
         })
     }
 }
@@ -437,17 +455,30 @@ async fn receive_responder_acknowledgment(
     Json(submission): Json<ResponderAcknowledgmentSubmission>,
 ) -> Response {
     let now = now_unix();
-    let result = {
-        let mut log = state.responder_acknowledgments.write().unwrap();
-        log.add(&submission.acknowledgment, now)
+    let peer_id = match crate::responder::verify(&submission.acknowledgment, now) {
+        Ok(peer_id) => peer_id,
+        Err(e) => return responder_acknowledgment_error_response(e),
     };
-    match result {
-        Ok(peer_id) => {
-            tracing::info!(%peer_id, corroboration_nonce = %submission.acknowledgment.unsigned.corroboration_nonce, "responder acknowledgment recorded");
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(e) => responder_acknowledgment_error_response(e),
+    // Rate limiting by identity -- the griefing mitigation spec/12 names. Checked after
+    // verification, so an invalid signature never costs a token; see that file's own section.
+    if let Err(retry_after) = state.responder_ack_limiter.check(&peer_id.to_string()) {
+        let retry_after_seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_seconds.to_string())],
+            Json(serde_json::json!({
+                "error": "responder acknowledgment rate limit exceeded",
+                "retry_after_seconds": retry_after_seconds,
+            })),
+        )
+            .into_response();
     }
+    {
+        let mut log = state.responder_acknowledgments.write().unwrap();
+        log.add_verified(&submission.acknowledgment, peer_id);
+    }
+    tracing::info!(%peer_id, corroboration_nonce = %submission.acknowledgment.unsigned.corroboration_nonce, "responder acknowledgment recorded");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn responder_acknowledgment_error_response(e: ResponderAcknowledgmentError) -> Response {
@@ -1627,6 +1658,37 @@ mod tests {
         let err = push_responder_acknowledgment(&reqwest::Client::new(), &addr_a, &ack).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
         assert!(state_a.responder_acknowledgments.read().unwrap().active_responders_for("tampered").is_empty());
+    }
+
+    #[tokio::test]
+    async fn responder_acknowledgment_rate_limiter_rejects_a_burst_per_identity() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let responder = PeerIdentity::generate();
+        let http = reqwest::Client::new();
+
+        for i in 0..RESPONDER_ACK_RATE_LIMIT_MAX {
+            let ack = crate::responder::build_and_sign(&responder, &format!("ack-rate-{i}"), true, now_unix())
+                .unwrap();
+            push_responder_acknowledgment(&http, &addr_a, &ack).await.unwrap();
+        }
+
+        // The identity's window is now full: the next acknowledgment is rejected with 429.
+        let ack = crate::responder::build_and_sign(&responder, "ack-rate-over", true, now_unix()).unwrap();
+        let err = push_responder_acknowledgment(&http, &addr_a, &ack).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::TOO_MANY_REQUESTS));
+        assert!(
+            state_a
+                .responder_acknowledgments
+                .read()
+                .unwrap()
+                .active_responders_for("ack-rate-over")
+                .is_empty()
+        );
+
+        // A different identity has its own window and is not blocked by the first one's burst.
+        let other = PeerIdentity::generate();
+        let ack = crate::responder::build_and_sign(&other, "ack-rate-other", true, now_unix()).unwrap();
+        push_responder_acknowledgment(&http, &addr_a, &ack).await.unwrap();
     }
 
     #[tokio::test]

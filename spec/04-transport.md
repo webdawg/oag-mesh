@@ -160,7 +160,11 @@ in `spec/13-distributed-route-search.md`'s own "Tests" section.
   one of those four. `ResponderAcknowledgment` has no proof-of-work at all, by design -- its open
   risk isn't sybil-inflated corroboration, it's a single identity falsely claiming to handle
   real events to suppress genuine responders, which proof-of-work wouldn't have stopped anyway.
-  See `spec/12-responder-acknowledgment.md`'s own "what this explicitly is not" for that stated
+  A per-identity fixed-window rate limit now bounds that flood (`RESPONDER_ACK_RATE_LIMIT_MAX`
+  per `RESPONDER_ACK_RATE_LIMIT_WINDOW`, 60 per 60s by default, `429` + `Retry-After` when the
+  window is full) -- a rate limit, not a reputation system or an allowlist, and a genuine
+  responder who exceeds the cap is throttled too. See
+  `spec/12-responder-acknowledgment.md`'s own "what this explicitly is not" for that stated
   plainly.
 - **Proof-of-work doesn't verify *who* a peer really is, only that solving a puzzle cost
   something.** A well-resourced single operator can solve enough proof-of-work to mint several

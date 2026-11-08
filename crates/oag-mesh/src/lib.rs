@@ -39,7 +39,7 @@ pub use membership::{
     UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
 pub use persistence::PersistenceError;
-pub use rate_limit::TokenBucket;
+pub use rate_limit::{RateLimiter, TokenBucket};
 pub use responder::{
     RecordedAcknowledgmentSnapshot, ResponderAcknowledgment, ResponderAcknowledgmentError,
     ResponderAcknowledgmentLog, ResponderAcknowledgmentSnapshot, UnsignedResponderAcknowledgment,
@@ -49,5 +49,6 @@ pub use transport::{
     spawn_periodic_sync_with_jitter, BridgeDeclarationSubmission, ClaimReportSubmission,
     MembershipAttestationSubmission, MeshState,
     PullError, PushError, ResponderAcknowledgmentSubmission, RouteSearchRequest, RouteSearchResponse,
-    DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET, ROUTE_SEARCH_RATE_LIMIT_CAPACITY, ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+    DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET, RESPONDER_ACK_RATE_LIMIT_MAX, RESPONDER_ACK_RATE_LIMIT_WINDOW,
+    ROUTE_SEARCH_RATE_LIMIT_CAPACITY, ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
 };

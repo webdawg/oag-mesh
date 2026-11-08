@@ -172,6 +172,13 @@ impl ResponderAcknowledgmentLog {
     /// recent stand-down or re-claim. Returns the responder's `PeerId` on success.
     pub fn add(&mut self, ack: &ResponderAcknowledgment, now: i64) -> Result<PeerId, ResponderAcknowledgmentError> {
         let peer_id = verify(ack, now)?;
+        self.add_verified(ack, peer_id);
+        Ok(peer_id)
+    }
+
+    /// Records an already-verified acknowledgment. The transport handler verifies once, checks
+    /// the per-identity rate limit, then calls this -- so a submission is never verified twice.
+    pub fn add_verified(&mut self, ack: &ResponderAcknowledgment, peer_id: PeerId) {
         let entry = self.acknowledgments.entry(ack.unsigned.corroboration_nonce.clone()).or_default();
         let candidate = RecordedAcknowledgment { active: ack.unsigned.active, acknowledged_at: ack.unsigned.acknowledged_at };
         match entry.get(&peer_id) {
@@ -183,7 +190,6 @@ impl ResponderAcknowledgmentLog {
                 entry.insert(peer_id, candidate);
             }
         }
-        Ok(peer_id)
     }
 
     /// Every responder currently claiming to handle `corroboration_nonce` (`active == true` in

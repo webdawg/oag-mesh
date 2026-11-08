@@ -184,10 +184,13 @@ collection, vault, or release capability. See that RFC for current requirements 
   `ResponderAcknowledgment` is the one mechanism here where this distinction actually matters:
   it has no corroboration count to sybil-inflate (more claimed responders isn't a stronger
   signal), so its real risk isn't "mint many identities," it's "one real, traceable identity
-  lies about handling an event to suppress a genuine responder." Accountability-after-the-fact
-  (the identity is at least attributable) is the only mitigation; nothing here detects or
-  prevents it in the moment, and no amount of proof-of-work would have, either -- a genuinely
-  different open question from every other mechanism's "mint fresh identities" gap above.
+  lies about handling an event to suppress a genuine responder." A per-identity fixed-window
+  rate limit now bounds the flood (60 per 60s by default, `429` + `Retry-After` when the window
+  is full), but it is a rate limit, not a reputation system or an allowlist: a griefer is
+  throttled to the cap, not stopped, and a genuine responder who exceeds the cap is throttled
+  too. Accountability-after-the-fact still matters, and no amount of proof-of-work would have
+  addressed this either -- a genuinely different open question from every other mechanism's
+  "mint fresh identities" gap above.
 - **Pull-based anti-entropy trusts a peer's own prior verification, it does not re-derive it.**
   `spec/10-anti-entropy.md`'s `pull_and_merge` closes the "offline during a broadcast" gap by
   merging a peer's whole snapshot, but a snapshot has already collapsed past the original signed

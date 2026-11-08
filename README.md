@@ -130,7 +130,8 @@ principle, above. Still open: verifying that distinct `PeerIdentity`s are genuin
 different organizations rather than just different keys (proof-of-work taxes cost, not
 identity, all the way down — even an attester's own standing in a cluster is itself unverified),
 a bad-faith responder falsely claiming to handle events (proof-of-work wouldn't help here
-either — see `spec/12`), full dispatch-to-a-responder, pull-based anti-entropy's own stated
+either; a per-identity rate limit now bounds the flood, but it is not a reputation system or
+an allowlist — see `spec/12`), full dispatch-to-a-responder, pull-based anti-entropy's own stated
 trade-off — it trusts a peer's prior verification instead of re-checking a signature, a weaker
 guarantee than push — and distributed route search's own residual limits: a per-search fan-out
 budget and a node-wide rate limiter now bound its amplification cost, but neither

@@ -81,15 +81,17 @@ idempotent and cannot regress a more recent stand-down into a stale claim.
 - **An active acknowledgment is a claim, not a guarantee.** Nothing verifies a responder claiming
   to handle an event is actually, genuinely doing so. A responder could acknowledge and never
   follow through, and nothing here would know.
-- **A real griefing vector, stated plainly rather than ignored.** Because there's no
-  proof-of-work and no cost to acknowledging, a bad-faith (or compromised) `PeerIdentity` could
-  acknowledge every event in a region as `active` specifically to suppress real responders who
-  check first and stand down, believing it's already handled. Identity accountability is the
-  only mitigation: unlike `AnonymousEvent`'s anonymous reporters, a responder's `PeerIdentity` is
-  traceable to whoever operates it, so a pattern of bad-faith acknowledgments is at least
-  attributable after the fact -- but nothing here detects or prevents it in the moment. A real
-  deployment would need its own answer (reputation, a trusted responder allowlist, rate limiting
-  by identity) layered on top; none of that is built here.
+- **A real griefing vector, bounded but not eliminated.** Because there's no proof-of-work and
+  no cost to acknowledging, a bad-faith (or compromised) `PeerIdentity` could acknowledge every
+  event in a region as `active` specifically to suppress real responders who check first and
+  stand down, believing it's already handled. A per-identity fixed-window rate limit now bounds
+  that: `RESPONDER_ACK_RATE_LIMIT_MAX` acknowledgments per `PeerId` per
+  `RESPONDER_ACK_RATE_LIMIT_WINDOW` (60 per 60s by default), returning `429` with `Retry-After`
+  once the window is full. That is a rate limit, not a reputation system or an allowlist -- a
+  griefer is throttled to the cap, not stopped, and a genuine responder who acknowledges more
+  than the cap in a window is throttled too. The defaults are a starting point, not a derived
+  value; a real deployment should tune them to its own responder traffic. Identity accountability
+  still matters after the fact, and the limiter is in-memory only, so a restart resets it.
 - **No notification.** Same as `spec/11-responder-search.md`'s own limits: nothing pushes an
   acknowledgment to anyone. A responder has to already be polling `GET
   .../responder-acknowledgment/{nonce}` (or re-running a search) to see one.
@@ -105,9 +107,11 @@ a fresh acknowledgment from the same responder replaces their prior one; an out-
 acknowledgment does not regress a newer one already recorded; two different responders can both
 claim the same event; a snapshot round-trips through `from_snapshot`; `merge_snapshot` keeps
 whichever of a local and incoming entry is more recent per responder, in both directions.
-`crates/oag-mesh/src/transport.rs` adds 4 more: a pushed acknowledgment (no proof-of-work
+`crates/oag-mesh/src/transport.rs` adds 5 more: a pushed acknowledgment (no proof-of-work
 required) is recorded and readable back over `GET .../responder-acknowledgment/{nonce}`; a
 tampered one is rejected over the wire; `broadcast_responder_acknowledgment` reaches every
-configured peer; querying an unknown nonce returns an empty list rather than an error. Plus 1
-more in the shared persistence/anti-entropy round-trip tests (`spec/08`, `spec/10`), extended to
-cover this fifth store alongside the other four.
+configured peer; querying an unknown nonce returns an empty list rather than an error; and the
+per-identity rate limiter rejects a burst from one identity with `429` while a different identity
+is unaffected. Plus 1 more in the shared persistence/anti-entropy round-trip tests (`spec/08`,
+`spec/10`), extended to cover this fifth store alongside the other four. The fixed-window limiter
+itself gets 3 unit tests in `crates/oag-mesh/src/rate_limit.rs`.

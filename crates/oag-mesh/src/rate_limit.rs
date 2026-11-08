@@ -10,6 +10,8 @@
 //! The bucket is in-memory only, so a restart resets it. That is stated rather than hidden: this
 //! raises the cost of triggering fan-out, it does not bound it absolutely.
 
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 /// A token bucket with a fixed capacity and a constant refill rate.
@@ -77,6 +79,59 @@ impl TokenBucket {
     }
 }
 
+/// A fixed-window rate limiter keyed by an arbitrary string, matching the base project's
+/// `RateLimiter` pattern (`spec/18-rate-limiting-and-resource-limits.md` there). Used where the
+/// key is a real identity -- a responder's `PeerId` -- unlike `TokenBucket`, which this crate
+/// uses for the node-wide route-search limit because that surface has no requester identity.
+///
+/// The tracking map is bounded: once it exceeds `max_entries`, entries whose window has already
+/// expired are swept, and a new key is refused rather than growing the map without bound. That
+/// is the same unbounded-map lesson the base project recorded, applied here to a mesh where a
+/// griefer could mint identities to grow the map.
+#[derive(Debug)]
+pub struct RateLimiter {
+    window: Duration,
+    max_requests: u32,
+    entries: RwLock<HashMap<String, (Instant, u32)>>,
+    max_entries: usize,
+}
+
+impl RateLimiter {
+    pub fn new(window: Duration, max_requests: u32) -> Self {
+        Self {
+            window,
+            max_requests,
+            entries: RwLock::new(HashMap::new()),
+            max_entries: 10_000,
+        }
+    }
+
+    /// Counts one request for `key`. Returns `Err(retry_after)` when the key's current window is
+    /// already at its cap, or when the tracking map is full of live windows and cannot admit a
+    /// new key without growing without bound.
+    pub fn check(&self, key: &str) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut entries = self.entries.write().unwrap();
+        if entries.len() >= self.max_entries {
+            entries.retain(|_, (start, _)| now.duration_since(*start) < self.window);
+            if entries.len() >= self.max_entries {
+                return Err(self.window);
+            }
+        }
+        let entry = entries.entry(key.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= self.window {
+            *entry = (now, 0);
+        }
+        if entry.1 >= self.max_requests {
+            let elapsed = now.duration_since(entry.0).as_secs_f64();
+            let retry = (self.window.as_secs_f64() - elapsed).max(0.001);
+            return Err(Duration::from_secs_f64(retry));
+        }
+        entry.1 += 1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +166,34 @@ mod tests {
         let retry_after = bucket.retry_after_at(start);
         assert!(retry_after > Duration::ZERO);
         assert_eq!(retry_after, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_rate_limiter_allows_up_to_the_window_cap() {
+        let limiter = RateLimiter::new(Duration::from_millis(100), 2);
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_err());
+        // A different key has its own window.
+        assert!(limiter.check("b").is_ok());
+    }
+
+    #[test]
+    fn a_rate_limiter_resets_after_the_window() {
+        let limiter = RateLimiter::new(Duration::from_millis(50), 1);
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_err());
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(limiter.check("a").is_ok());
+    }
+
+    #[test]
+    fn a_rate_limiter_reports_the_remaining_window() {
+        let limiter = RateLimiter::new(Duration::from_millis(500), 1);
+        limiter.check("a").unwrap();
+        let retry_after = limiter.check("a").unwrap_err();
+        assert!(retry_after > Duration::ZERO);
+        assert!(retry_after <= Duration::from_millis(500));
     }
 
     #[test]
