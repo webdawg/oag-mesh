@@ -6,18 +6,19 @@
 `anonymous_event::AnonymousEventLog`, and `transport::MeshState::save_to_dir`/`load_from_dir`.
 
 Closes the "no persistence" gap `spec/02-cluster-nesting.md` and
-`spec/05-federated-corroboration.md` each previously listed: all five in-memory stores were
-lost on every restart, rebuilt from scratch only by whatever got pushed to a node again after it
-came back up.
+`spec/05-federated-corroboration.md` each previously listed: the in-memory stores were lost on
+every restart, rebuilt from scratch only by whatever got pushed to a node again after it came
+back up. The original five stores are now seven: `spec/14-responder-dispatch.md`'s blinded
+subscription registry and inbox are persisted too.
 
 ## The mechanism
 
 One JSON file per store, written to an operator-chosen directory: `bridge_tree.json`,
 `claim_corroboration.json`, `anonymous_events.json`, `membership_registry.json`,
-`responder_acknowledgments.json`. `MeshState::save_to_dir(dir)` writes all five;
-`MeshState::load_from_dir(identity, peers, dir)` builds a fresh `MeshState` by reading back
-whichever of the five files exist, starting empty for any that don't (a brand-new node's first
-run).
+`responder_acknowledgments.json`, `responder_subscriptions.json`, and `responder_inbox.json`.
+`MeshState::save_to_dir(dir)` writes all seven; `MeshState::load_from_dir(identity, peers, dir)`
+builds a fresh `MeshState` by reading back whichever of the seven files exist, starting empty
+for any that don't (a brand-new node's first run).
 
 `AnonymousEvent` carries no `PeerId` at all (identity-stripped by design -- see
 `spec/03-anonymous-event-rfc.md`), so `AnonymousEventLog` derives `Serialize`/`Deserialize`
@@ -60,8 +61,9 @@ loading a file that doesn't exist returns `None`, not an error; loading malforme
 `PersistenceError::Parse`; and a save leaves no `.tmp` file behind (the rename consumed it). `crates/oag-mesh/src/membership.rs` adds 1 more:
 `MembershipRegistry::snapshot` round-trips through `from_snapshot` directly.
 `crates/oag-mesh/src/responder.rs` adds 1 more: `ResponderAcknowledgmentLog::snapshot`
-round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs` adds 2 more:
-`save_to_dir` then `load_from_dir` round-trips one real entry in each of the five stores (a
-`BridgeDeclaration`, a `ClaimReport`, an `AnonymousEvent`, a `MembershipAttestation`, and a
-`ResponderAcknowledgment`); `load_from_dir` against a directory that doesn't exist yet starts
-with all five stores empty rather than erroring.
+round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs` adds 3 more:
+`save_to_dir` then `load_from_dir` round-trips one real entry in each of the five original
+stores (a `BridgeDeclaration`, a `ClaimReport`, an `AnonymousEvent`, a `MembershipAttestation`,
+and a `ResponderAcknowledgment`); the same round-trip covers the dispatch subscription registry
+and inbox (`spec/14`); `load_from_dir` against a directory that doesn't exist yet starts with all
+seven stores empty rather than erroring.

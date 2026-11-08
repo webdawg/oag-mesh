@@ -35,9 +35,12 @@ replace its filter by re-registering, or remove it with
   register and to poll, so the node sees its IP -- just not its `PeerIdentity`. This is a weaker
   anonymity guarantee than the reporter's: a responder is choosing to act, and the mechanism
   deliberately does not hide its network location from the node it uses.
-- **Not durable.** Both the subscription registry and the inbox are in-memory. A restart loses
-  them; a responder re-registers and re-searches the log (`spec/11`). Events are not lost from
-  the log, only from the inbox.
+- **Persisted, but not an acked queue.** `spec/08`'s `save_to_dir`/`load_from_dir` cover both
+  the subscription registry (`responder_subscriptions.json`) and the inbox
+  (`responder_inbox.json`), so a restart no longer loses them. The inbox is still drained on
+  read, not acked -- a responder that never polls accumulates events until it does, and a crash
+  between a save and a drain is the only loss window. Events are never lost from the log, only
+  from the inbox.
 - **Not a guarantee that a responder is reachable at all.** The mechanism only guarantees that,
   if a responder polls, it will see the events it asked for.
 - **Not a lock or an acknowledgment.** This is delivery, not a claim-to-handling -- that remains
@@ -51,6 +54,7 @@ replace its filter by re-registering, or remove it with
 
 `crates/oag-mesh/src/dispatch.rs` adds 3 unit tests: a matching event is queued for a subscription
 and a non-matching one is not; the inbox drains on read; a subscription is blinded and
-replaceable. `crates/oag-mesh/src/transport.rs` adds 2 integration tests over real HTTP: a
-subscription receives only matching events and drains on poll; unregistering stops delivery and a
-second unregister is `404`.
+replaceable. `crates/oag-mesh/src/transport.rs` adds 3 more over real HTTP: a subscription
+receives only matching events and drains on poll; unregistering stops delivery and a second
+unregister is `404`; and `save_to_dir`/`load_from_dir` round-trips both the subscription registry
+and the inbox.

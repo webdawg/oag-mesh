@@ -75,7 +75,7 @@ impl EventKindCategory {
 /// filter at all). Deliberately only ever narrows what's already in the log; it cannot reveal
 /// anything beyond what an `AnonymousEvent`'s own fields already carry (no new identifying
 /// surface, same constraint the rest of this schema holds to).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventFilter {
     pub kind: Option<EventKindCategory>,
     /// Matches events with severity *at least* this urgent (`Severity`'s derived `Ord`, so

@@ -45,6 +45,11 @@ impl ResponderSubscriptionRegistry {
     pub fn subscriptions(&self) -> &HashMap<String, EventFilter> {
         &self.subscriptions
     }
+
+    /// Rebuilds a registry from a loaded map (disk persistence).
+    pub fn from_subscriptions(subscriptions: HashMap<String, EventFilter>) -> Self {
+        Self { subscriptions }
+    }
 }
 
 /// Per-subscription inboxes, filled when an event matching a subscription arrives.
@@ -70,6 +75,15 @@ impl ResponderInbox {
     /// Takes every event queued for `subscription_id`, clearing the inbox.
     pub fn drain(&mut self, subscription_id: &str) -> Vec<AnonymousEvent> {
         self.inbox.remove(subscription_id).unwrap_or_default()
+    }
+
+    pub fn inbox(&self) -> &HashMap<String, Vec<AnonymousEvent>> {
+        &self.inbox
+    }
+
+    /// Rebuilds an inbox from a loaded map (disk persistence).
+    pub fn from_inbox(inbox: HashMap<String, Vec<AnonymousEvent>>) -> Self {
+        Self { inbox }
     }
 }
 

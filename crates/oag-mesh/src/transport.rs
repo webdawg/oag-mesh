@@ -258,11 +258,12 @@ impl MeshState {
         }
     }
 
-    /// Snapshots all five in-memory stores to `bridge_tree.json`, `claim_corroboration.json`,
-    /// `anonymous_events.json`, `membership_registry.json`, and
-    /// `responder_acknowledgments.json` under `dir`, overwriting whatever was there -- see
-    /// `persistence`'s own module doc comment for what this does and does not guarantee (not
-    /// atomic, not crash-safe, rewrites the whole file every call). This crate doesn't call this
+    /// Snapshots all seven in-memory stores to `bridge_tree.json`,
+    /// `claim_corroboration.json`, `anonymous_events.json`, `membership_registry.json`,
+    /// `responder_acknowledgments.json`, `responder_subscriptions.json`, and
+    /// `responder_inbox.json` under `dir`, overwriting whatever was there -- see `persistence`'s
+    /// own module doc comment for what this does and does not guarantee (atomic on Unix via
+    /// temp-file-plus-rename, rewrites the whole file every call). This crate doesn't call this
     /// automatically on any write; a caller decides when to save (periodically, on a clean
     /// shutdown, after every N writes -- whatever fits its own deployment).
     pub fn save_to_dir(&self, dir: &std::path::Path) -> Result<(), crate::persistence::PersistenceError> {
@@ -280,10 +281,15 @@ impl MeshState {
             &dir.join("responder_acknowledgments.json"),
             &self.responder_acknowledgments.read().unwrap().snapshot(),
         )?;
+        crate::persistence::save_json(
+            &dir.join("responder_subscriptions.json"),
+            self.responder_subscriptions.read().unwrap().subscriptions(),
+        )?;
+        crate::persistence::save_json(&dir.join("responder_inbox.json"), self.responder_inbox.read().unwrap().inbox())?;
         Ok(())
     }
 
-    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the five stores from
+    /// Builds a fresh `MeshState` for `identity`/`peers`, loading each of the seven stores from
     /// whatever `save_to_dir` previously wrote to `dir` -- or starting empty for any file that
     /// doesn't exist yet (a brand-new node's first run).
     pub fn load_from_dir(
@@ -306,6 +312,14 @@ impl MeshState {
             crate::persistence::load_json(&dir.join("responder_acknowledgments.json"))?
                 .map(ResponderAcknowledgmentLog::from_snapshot)
                 .unwrap_or_default();
+        let subscriptions = crate::persistence::load_json::<HashMap<String, EventFilter>>(
+            &dir.join("responder_subscriptions.json"),
+        )?
+        .unwrap_or_default();
+        let inbox = crate::persistence::load_json::<HashMap<String, Vec<AnonymousEvent>>>(
+            &dir.join("responder_inbox.json"),
+        )?
+        .unwrap_or_default();
         Ok(Self {
             identity: Arc::new(identity),
             tree: Arc::new(RwLock::new(tree)),
@@ -330,8 +344,10 @@ impl MeshState {
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW,
                 MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX,
             )),
-            responder_subscriptions: Arc::new(RwLock::new(ResponderSubscriptionRegistry::new())),
-            responder_inbox: Arc::new(RwLock::new(ResponderInbox::new())),
+            responder_subscriptions: Arc::new(RwLock::new(ResponderSubscriptionRegistry::from_subscriptions(
+                subscriptions,
+            ))),
+            responder_inbox: Arc::new(RwLock::new(ResponderInbox::from_inbox(inbox))),
         })
     }
 }
@@ -2134,6 +2150,34 @@ mod tests {
             loaded.responder_acknowledgments.read().unwrap().active_responders_for("ack-persist-test"),
             vec![responder.peer_id()]
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn save_to_dir_then_load_from_dir_round_trips_responder_dispatch() {
+        let dir = std::env::temp_dir().join(format!("oag-mesh-dispatch-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = MeshState::new(PeerIdentity::generate(), vec![]);
+        let filter = EventFilter {
+            kind: Some(crate::anonymous_event::EventKindCategory::MedicalEmergency),
+            ..Default::default()
+        };
+        state.responder_subscriptions.write().unwrap().upsert("sub-1".to_string(), filter.clone());
+
+        let mut event = valid_event("dispatch-persist");
+        event.kind = crate::anonymous_event::EventKind::MedicalEmergency(
+            crate::anonymous_event::MedicalEmergencyKind::HeartIssue,
+        );
+        let subscriptions = state.responder_subscriptions.read().unwrap().subscriptions().clone();
+        state.responder_inbox.write().unwrap().push_matching(&event, &subscriptions);
+
+        state.save_to_dir(&dir).unwrap();
+
+        let loaded = MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir).unwrap();
+        assert!(loaded.responder_subscriptions.read().unwrap().subscriptions().contains_key("sub-1"));
+        assert_eq!(loaded.responder_inbox.write().unwrap().drain("sub-1").len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }
