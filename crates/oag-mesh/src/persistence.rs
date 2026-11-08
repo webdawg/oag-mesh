@@ -9,15 +9,16 @@
 //! every N writes -- that's left to whatever embeds this crate, same as everything else here
 //! that stops short of a full deployment story.
 //!
-//! **What this explicitly is not.** Not atomic or crash-safe: `save_json` writes the file
-//! directly, so a crash mid-write can leave a truncated or partially-written file behind, and
-//! the next `load_json` would then either fail to parse or -- worse -- silently load a cut-off
-//! subset of what was actually there. Not a database: no concurrent-writer safety beyond
-//! whatever the caller's own locking already provides (`MeshState`'s `RwLock`s), no WAL, no
-//! incremental writes -- a save rewrites the entire store every time. Fine for this crate's
-//! current scale and the fact that losing any of this state only means re-learning it from the
-//! mesh over time, not losing anything irrecoverable; not fine to build on if that stops being
-//! true.
+//! **What this explicitly is not.** A save is now atomic on Unix -- `save_json` writes a sibling
+//! temp file and renames it over the destination, so a crash mid-write leaves the previous file
+//! intact and the temp file orphaned, rather than a truncated destination. On Windows the
+//! rename does not replace an existing file, so the destination is removed first; that window is
+//! not atomic and is the platform's best effort. Not a database: no concurrent-writer safety
+//! beyond whatever the caller's own locking already provides (`MeshState`'s `RwLock`s) -- two
+//! processes saving the same file still race on the same temp name -- no WAL, no incremental
+//! writes -- a save rewrites the entire store every time. Fine for this crate's current scale
+//! and the fact that losing any of this state only means re-learning it from the mesh over
+//! time, not losing anything irrecoverable; not fine to build on if that stops being true.
 
 use std::path::Path;
 
@@ -36,12 +37,24 @@ pub enum PersistenceError {
     Serialize { path: String, source: serde_json::Error },
 }
 
-/// Writes `value` to `path` as JSON, overwriting whatever was there. See this module's own doc
-/// comment for why this is not atomic or crash-safe.
+/// Writes `value` to `path` as JSON, overwriting whatever was there. The write goes to a
+/// sibling temp file first and is then renamed over the destination -- atomic on Unix, where
+/// `rename(2)` replaces the destination in one step. See this module's own doc comment for the
+/// Windows caveat and the remaining limits.
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistenceError> {
     let json = serde_json::to_vec_pretty(value)
         .map_err(|source| PersistenceError::Serialize { path: path.display().to_string(), source })?;
-    std::fs::write(path, json).map_err(|source| PersistenceError::Write { path: path.display().to_string(), source })
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json)
+        .map_err(|source| PersistenceError::Write { path: tmp.display().to_string(), source })?;
+    if cfg!(windows) {
+        // Windows `rename` does not replace an existing file; remove it first. That window is
+        // not atomic -- on Unix the rename above is the whole story.
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|source| PersistenceError::Write { path: path.display().to_string(), source })?;
+    Ok(())
 }
 
 /// Reads and parses `path` as JSON. Returns `Ok(None)` if the file doesn't exist yet -- a fresh
@@ -79,6 +92,19 @@ mod tests {
         save_json(&path, &value).unwrap();
         let loaded: Option<Example> = load_json(&path).unwrap();
         assert_eq!(loaded, Some(value));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_json_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join(format!("oag-mesh-persistence-test-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("example.json");
+
+        save_json(&path, &Example { a: "hello".to_string(), b: 42 }).unwrap();
+        assert!(path.exists());
+        assert!(!dir.join("example.tmp").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -38,11 +38,12 @@ string form, the same convention every signed message in this crate already uses
   write, not on a timer, not on shutdown. A caller embedding this crate decides when to save;
   that decision depends on deployment specifics (how much state loss on an unclean restart is
   acceptable) this crate has no opinion on.
-- **Not atomic or crash-safe.** `persistence::save_json` writes the target file directly, in
-  place. A crash mid-write can leave a truncated or partially-written file behind, and the next
-  load would then either fail to parse (a clear `PersistenceError::Parse`) or, if the crash
-  happened to land after a complete-looking but stale write, silently load older state than the
-  caller expected. No temp-file-plus-rename, no fsync, no write-ahead log.
+- **Atomic on Unix, best-effort on Windows, but not crash-proof.** `persistence::save_json`
+  writes a sibling temp file and renames it over the destination. On Unix, `rename(2)` is
+  atomic: a crash mid-write leaves the previous file intact and the temp file orphaned, rather
+  than a truncated destination. On Windows, `rename` does not replace an existing file, so the
+  destination is removed first -- that window is not atomic, and is the platform's best effort.
+  There is no fsync, so a power loss could still lose the rename; no write-ahead log.
 - **Not a database.** No concurrent-writer safety beyond whatever `MeshState`'s own `RwLock`s
   already provide for in-memory access, no incremental writes -- every save rewrites the entire
   store from scratch, which is fine at this crate's current scale and becomes a real cost long
@@ -54,9 +55,9 @@ string form, the same convention every signed message in this crate already uses
 
 ## Tests
 
-`crates/oag-mesh/src/persistence.rs` (3 unit tests): save then load round-trips a value exactly;
+`crates/oag-mesh/src/persistence.rs` (4 unit tests): save then load round-trips a value exactly;
 loading a file that doesn't exist returns `None`, not an error; loading malformed JSON returns a
-`PersistenceError::Parse`. `crates/oag-mesh/src/membership.rs` adds 1 more:
+`PersistenceError::Parse`; and a save leaves no `.tmp` file behind (the rename consumed it). `crates/oag-mesh/src/membership.rs` adds 1 more:
 `MembershipRegistry::snapshot` round-trips through `from_snapshot` directly.
 `crates/oag-mesh/src/responder.rs` adds 1 more: `ResponderAcknowledgmentLog::snapshot`
 round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs` adds 2 more:
