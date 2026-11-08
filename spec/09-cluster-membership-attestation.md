@@ -96,10 +96,16 @@ exposes this over the wire, same node-local-only scope as the other read endpoin
 - **Persistence is manual and not crash-safe (`spec/08-persistence.md`).**
   `MembershipRegistry::snapshot`/`from_snapshot` cover save/load via
   `transport::MeshState::save_to_dir`/`load_from_dir`, nothing calls them automatically.
-- **No weighting by how many subjects an attester vouches for, or how often.** A single attester
-  spamming attestations for many different subjects in the same cluster is not flagged or rate
-  limited any differently than one attestation -- each `(cluster, subject_peer_id)` pair's
-  proof-of-work is independent.
+- **No weighting by how many subjects an attester vouches for, but a per-attester rate limit
+  now bounds how often.** A single attester spamming attestations for many different subjects
+  in the same cluster still pays independent proof-of-work per `(cluster, subject_peer_id)`
+  pair, and a per-attester fixed-window rate limit
+  (`MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX` per
+  `MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW`, 30 per 60s by default) bounds the total. It is a
+  rate limit, not a reputation system or an allowlist: a griefer is throttled to the cap, not
+  stopped, and a genuine attester who exceeds the cap in a window is throttled too. The
+  defaults are a starting point, not a derived value. The limiter is in-memory only, so a
+  restart resets it.
 
 ## Tests
 
@@ -117,8 +123,10 @@ attestation and unable to be reused, a snapshot round-tripping through `from_sna
 drops a report from a peer with no membership attestation while the half-cross-check (cluster name
 only) still lets it through; the full cross-check still drops reports claiming an unattested
 cluster name outright; the full cross-check against an unknown claim returns `None`.
-`crates/oag-mesh/src/transport.rs` adds 5 more: a pushed attestation (with valid proof-of-work) is
-recorded; a tampered one is rejected over the wire; `broadcast_membership_attestation` reaches
-every configured peer; `.../best-fully-cross-checked` drops a report from an unattested-membership
-peer while still counting one with both checks satisfied; `.../best-fully-cross-checked` against
-an unknown claim returns a `null` result.
+`crates/oag-mesh/src/transport.rs` adds 6 more: a pushed attestation (with valid proof-of-work)
+is recorded; a tampered one is rejected over the wire;
+`broadcast_membership_attestation` reaches every configured peer;
+`.../best-fully-cross-checked` drops a report from an unattested-membership peer while still
+counting one with both checks satisfied; `.../best-fully-cross-checked` against an unknown claim
+returns a `null` result; and the per-attester rate limiter rejects a burst from one attester with
+`429` while a different attester is unaffected.

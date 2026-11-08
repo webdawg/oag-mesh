@@ -278,6 +278,18 @@ impl MembershipRegistry {
         now: i64,
     ) -> Result<(PeerId, PeerId), MembershipError> {
         let (attester_peer_id, subject_peer_id) = verify(attestation, now)?;
+        self.add_verified(attestation, pow, attester_peer_id, subject_peer_id)
+    }
+
+    /// Records an already-verified attestation. The transport handler verifies once, checks
+    /// the per-attester rate limit, then calls this -- so a submission is never verified twice.
+    pub fn add_verified(
+        &mut self,
+        attestation: &MembershipAttestation,
+        pow: MembershipProofOfWork,
+        attester_peer_id: PeerId,
+        subject_peer_id: PeerId,
+    ) -> Result<(PeerId, PeerId), MembershipError> {
         let required_bits =
             self.required_difficulty_bits(&attestation.unsigned.cluster, &subject_peer_id, &attester_peer_id);
         if !pow.satisfies(&attestation.unsigned, required_bits) {

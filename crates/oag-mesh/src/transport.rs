@@ -59,6 +59,12 @@ pub const RESPONDER_ACK_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Dura
 /// Default cap on responder acknowledgments per identity per window. A starting point, not a
 /// derived value -- a real deployment should tune it to its own responder traffic.
 pub const RESPONDER_ACK_RATE_LIMIT_MAX: u32 = 60;
+/// Default window for the per-attester membership-attestation rate limit.
+pub const MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(60);
+/// Default cap on membership attestations per attester per window -- a starting point, not a
+/// derived value.
+pub const MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX: u32 = 30;
 /// Default maximum number of events `GET /oag-mesh/v1/anonymous-event/search` returns in one
 /// response -- see `spec/11-responder-search.md`'s own pagination section.
 pub const DEFAULT_EVENT_SEARCH_LIMIT: usize = 100;
@@ -205,6 +211,11 @@ pub struct MeshState {
     /// receives is also forwarded to this address, which sees the relay's address rather than
     /// the original submitter's. See `spec/04-transport.md`'s anonymity section.
     pub anonymous_event_relay_target: Option<String>,
+    /// Per-attester fixed-window limiter for `POST /oag-mesh/v1/membership-attestation` --
+    /// bounds how fast one identity can vouch for many subjects, the gap `spec/09` names as
+    /// "no weighting by how many subjects an attester vouches for, or how often". In-memory
+    /// only, so a restart resets it.
+    pub membership_attestation_limiter: Arc<RateLimiter>,
 }
 
 impl MeshState {
@@ -229,6 +240,10 @@ impl MeshState {
             instance_id: random_instance_id(),
             sync_heads: Arc::new(RwLock::new(HashMap::new())),
             anonymous_event_relay_target: None,
+            membership_attestation_limiter: Arc::new(RateLimiter::new(
+                MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW,
+                MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX,
+            )),
         }
     }
 
@@ -300,6 +315,10 @@ impl MeshState {
             instance_id: random_instance_id(),
             sync_heads: Arc::new(RwLock::new(HashMap::new())),
             anonymous_event_relay_target: None,
+            membership_attestation_limiter: Arc::new(RateLimiter::new(
+                MEMBERSHIP_ATTESTATION_RATE_LIMIT_WINDOW,
+                MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX,
+            )),
         })
     }
 }
@@ -528,9 +547,28 @@ async fn receive_membership_attestation(
     Json(submission): Json<MembershipAttestationSubmission>,
 ) -> Response {
     let now = now_unix();
+    let (attester_peer_id, subject_peer_id) = match crate::membership::verify(&submission.attestation, now) {
+        Ok(ids) => ids,
+        Err(e) => return membership_error_response(e),
+    };
+    // Rate limiting by attester -- the gap spec/09 names as "no weighting by how many subjects
+    // an attester vouches for, or how often". Checked after verification, so an invalid
+    // signature never costs a token.
+    if let Err(retry_after) = state.membership_attestation_limiter.check(&attester_peer_id.to_string()) {
+        let retry_after_seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_seconds.to_string())],
+            Json(serde_json::json!({
+                "error": "membership attestation rate limit exceeded",
+                "retry_after_seconds": retry_after_seconds,
+            })),
+        )
+            .into_response();
+    }
     let result = {
         let mut registry = state.membership_registry.write().unwrap();
-        registry.add(&submission.attestation, submission.pow, now)
+        registry.add_verified(&submission.attestation, submission.pow, attester_peer_id, subject_peer_id)
     };
     match result {
         Ok((attester_peer_id, subject_peer_id)) => {
@@ -1991,6 +2029,44 @@ mod tests {
         let err = push_membership_attestation(&reqwest::Client::new(), &addr_a, &attestation, pow).await.unwrap_err();
         assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
         assert!(!state_a.membership_registry.read().unwrap().is_attested_member("tampered", &subject.peer_id(), 1));
+    }
+
+    #[tokio::test]
+    async fn membership_attestation_rate_limiter_rejects_a_burst_per_attester() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let attester = PeerIdentity::generate();
+        let http = reqwest::Client::new();
+
+        for i in 0..MEMBERSHIP_ATTESTATION_RATE_LIMIT_MAX {
+            let subject = PeerIdentity::generate();
+            let attestation = crate::membership::build_and_sign(
+                &attester,
+                subject.peer_id(),
+                &format!("cluster-{i}"),
+                now_unix(),
+            )
+            .unwrap();
+            let pow = solve_membership_pow(&state_a, &attestation);
+            push_membership_attestation(&http, &addr_a, &attestation, pow).await.unwrap();
+        }
+
+        // The attester's window is full: the next attestation is rejected with 429.
+        let subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&attester, subject.peer_id(), "cluster-over", now_unix()).unwrap();
+        let pow = solve_membership_pow(&state_a, &attestation);
+        let err = push_membership_attestation(&http, &addr_a, &attestation, pow).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::TOO_MANY_REQUESTS));
+        assert!(!state_a.membership_registry.read().unwrap().is_attested_member("cluster-over", &subject.peer_id(), 1));
+
+        // A different attester has its own window.
+        let other = PeerIdentity::generate();
+        let other_subject = PeerIdentity::generate();
+        let attestation =
+            crate::membership::build_and_sign(&other, other_subject.peer_id(), "cluster-other", now_unix())
+                .unwrap();
+        let pow = solve_membership_pow(&state_a, &attestation);
+        push_membership_attestation(&http, &addr_a, &attestation, pow).await.unwrap();
     }
 
     #[tokio::test]
