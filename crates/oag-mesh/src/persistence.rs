@@ -13,17 +13,30 @@
 //! temp file and renames it over the destination, so a crash mid-write leaves the previous file
 //! intact and the temp file orphaned, rather than a truncated destination. On Windows the
 //! rename does not replace an existing file, so the destination is removed first; that window is
-//! not atomic and is the platform's best effort. Not a database: no concurrent-writer safety
-//! beyond whatever the caller's own locking already provides (`MeshState`'s `RwLock`s) -- two
-//! processes saving the same file still race on the same temp name -- no WAL, no incremental
+//! not atomic and is the platform's best effort. Each save uses a unique temp name
+//! (`<name>.<pid>.<counter>.tmp`), so two processes saving the same file never clobber each
+//! other's partial write; the final rename is atomic, so the destination is always one writer's
+//! complete file. Not a database: no cross-process locking beyond that, no WAL, no incremental
 //! writes -- a save rewrites the entire store every time. Fine for this crate's current scale
 //! and the fact that losing any of this state only means re-learning it from the mesh over
 //! time, not losing anything irrecoverable; not fine to build on if that stops being true.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A unique sibling temp path for a save: `<name>.<pid>.<counter>.tmp`. Two writers saving the
+/// same file never share a temp name, so neither can clobber the other's partial write before the
+/// rename. The final rename is atomic, so the destination is always one writer's complete file.
+fn tmp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("store");
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!("{name}.{}.{n}.tmp", std::process::id()))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
@@ -44,7 +57,7 @@ pub enum PersistenceError {
 pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), PersistenceError> {
     let json = serde_json::to_vec_pretty(value)
         .map_err(|source| PersistenceError::Serialize { path: path.display().to_string(), source })?;
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, json)
         .map_err(|source| PersistenceError::Write { path: tmp.display().to_string(), source })?;
     if cfg!(windows) {
@@ -104,7 +117,8 @@ mod tests {
 
         save_json(&path, &Example { a: "hello".to_string(), b: 42 }).unwrap();
         assert!(path.exists());
-        assert!(!dir.join("example.tmp").exists());
+        // No `<name>.*.tmp` file is left behind.
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
 
         std::fs::remove_dir_all(&dir).ok();
     }

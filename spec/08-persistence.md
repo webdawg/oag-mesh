@@ -45,10 +45,11 @@ string form, the same convention every signed message in this crate already uses
   than a truncated destination. On Windows, `rename` does not replace an existing file, so the
   destination is removed first -- that window is not atomic, and is the platform's best effort.
   There is no fsync, so a power loss could still lose the rename; no write-ahead log.
-- **Not a database.** No concurrent-writer safety beyond whatever `MeshState`'s own `RwLock`s
-  already provide for in-memory access, no incremental writes -- every save rewrites the entire
-  store from scratch, which is fine at this crate's current scale and becomes a real cost long
-  before any of the other gaps in this crate do.
+- **Not a database.** Each save uses a unique temp name (`<name>.<pid>.<counter>.tmp`), so two
+  processes saving the same file never clobber each other's partial write, and the final rename
+  is atomic -- but there is no cross-process locking beyond that, and no incremental writes:
+  every save rewrites the entire store from scratch, which is fine at this crate's current scale
+  and becomes a real cost long before any of the other gaps in this crate do.
 - **No migration/versioning.** A snapshot's shape changes if `BridgeEdgeSnapshot`/`ClaimSnapshot`
   ever change; there's no `schema_version` field and no migrate-or-shim path like the base
   project's own (`future_legacy_compatibility_and_versioning.md` memory there) -- loading an
@@ -58,7 +59,8 @@ string form, the same convention every signed message in this crate already uses
 
 `crates/oag-mesh/src/persistence.rs` (4 unit tests): save then load round-trips a value exactly;
 loading a file that doesn't exist returns `None`, not an error; loading malformed JSON returns a
-`PersistenceError::Parse`; and a save leaves no `.tmp` file behind (the rename consumed it). `crates/oag-mesh/src/membership.rs` adds 1 more:
+`PersistenceError::Parse`; and a save leaves no `.tmp` file behind (the rename consumed it),
+  using a unique per-save temp name. `crates/oag-mesh/src/membership.rs` adds 1 more:
 `MembershipRegistry::snapshot` round-trips through `from_snapshot` directly.
 `crates/oag-mesh/src/responder.rs` adds 1 more: `ResponderAcknowledgmentLog::snapshot`
 round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs` adds 3 more:
