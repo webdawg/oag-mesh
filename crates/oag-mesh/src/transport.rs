@@ -42,6 +42,7 @@ use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, Pro
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::dispatch::{ResponderInbox, ResponderSubscriptionRegistry};
+use crate::onion::{OnionLayer, OnionPayload};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
 use crate::rate_limit::{RateLimiter, TokenBucket};
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
@@ -370,6 +371,8 @@ pub fn router(state: MeshState) -> Router {
             "/oag-mesh/v1/responder-inbox/{subscription_id}",
             get(get_responder_inbox),
         )
+        .route("/oag-mesh/v1/onion-key", get(get_onion_key))
+        .route("/oag-mesh/v1/onion", post(receive_onion_layer))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
         .route("/oag-mesh/v1/responder-acknowledgment", post(receive_responder_acknowledgment))
@@ -459,6 +462,13 @@ async fn receive_anonymous_event(
     State(state): State<MeshState>,
     Json(submission): Json<AnonymousEventSubmission>,
 ) -> Response {
+    record_anonymous_event(&state, submission).await
+}
+
+/// Records a verified anonymous event, dispatches it to matching blinded responder inboxes, and
+/// forwards it to this node's one-hop anonymity relay if one is configured. Shared by the direct
+/// endpoint and the onion layer's final hop.
+async fn record_anonymous_event(state: &MeshState, submission: AnonymousEventSubmission) -> Response {
     // Clone before `record` moves them, so a relay can forward the identical verified event.
     let relay_event = submission.event.clone();
     let relay_pow = submission.pow;
@@ -487,6 +497,40 @@ async fn receive_anonymous_event(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// Read-only: this node's X25519 public key for onion routing, derived from its Ed25519
+/// identity. A reporter computes the same key from the relay's Ed25519 public key. See
+/// `spec/15-onion-routing.md`.
+async fn get_onion_key(State(state): State<MeshState>) -> Response {
+    let key = crate::onion::x25519_public_key(&state.identity);
+    Json(serde_json::json!({
+        "peer_id": state.identity.peer_id().to_string(),
+        "x25519_public_key": hex::encode(key.to_bytes()),
+    }))
+    .into_response()
+}
+
+/// Peels one onion layer. A relay forwards the inner layer to the next hop; the exit relay
+/// forwards the recovered submission to the target's direct endpoint. See `spec/15`.
+async fn receive_onion_layer(State(state): State<MeshState>, Json(layer): Json<OnionLayer>) -> Response {
+    let inner = match crate::onion::peel_layer(&layer, &state.identity) {
+        Ok(inner) => inner,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    };
+    match inner.payload {
+        OnionPayload::Layer(next_layer) => match push_onion_layer(&state.http, &inner.next_hop, &next_layer).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        },
+        OnionPayload::Submission { event, pow } => match push_anonymous_event(&state.http, &inner.next_hop, &event, pow).await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        },
     }
 }
 
@@ -1074,6 +1118,8 @@ pub enum PushError {
     Request(String, reqwest::Error),
     #[error("{0} rejected the submission with status {1}")]
     Rejected(String, StatusCode),
+    #[error("onion error: {0}")]
+    Onion(String),
 }
 
 pub async fn push_bridge_declaration(
@@ -1174,6 +1220,63 @@ pub async fn push_anonymous_event(
         return Err(PushError::Rejected(address.to_string(), response.status()));
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct OnionKeyResponse {
+    #[allow(dead_code)]
+    peer_id: String,
+    x25519_public_key: String,
+}
+
+/// Fetches a relay's X25519 public key for onion routing -- derived from the relay's Ed25519
+/// identity, so the reporter can compute it from a key it already knows. See `spec/15`.
+pub async fn fetch_onion_key(http: &reqwest::Client, address: &str) -> Result<x25519_dalek::PublicKey, PushError> {
+    let url = format!("{}/oag-mesh/v1/onion-key", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PushError::Rejected(address.to_string(), response.status()));
+    }
+    let key: OnionKeyResponse = response.json().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    let bytes = hex::decode(&key.x25519_public_key).map_err(|e| PushError::Onion(e.to_string()))?;
+    let array: [u8; 32] = bytes.try_into().map_err(|_| PushError::Onion("bad key length".to_string()))?;
+    Ok(x25519_dalek::PublicKey::from(array))
+}
+
+/// Sends one onion layer to a relay. See `spec/15`.
+pub async fn push_onion_layer(
+    http: &reqwest::Client,
+    address: &str,
+    layer: &OnionLayer,
+) -> Result<(), PushError> {
+    let url = format!("{}/oag-mesh/v1/onion", address.trim_end_matches('/'));
+    let response = http.post(&url).json(layer).send().await.map_err(|e| PushError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PushError::Rejected(address.to_string(), response.status()));
+    }
+    Ok(())
+}
+
+/// Submits an anonymous event through an onion path: fetches each relay's X25519 key, builds
+/// the layered onion, and sends the outermost layer to the guard. No single relay learns both
+/// the reporter and the target. See `spec/15`.
+pub async fn push_anonymous_event_onion(
+    http: &reqwest::Client,
+    path: &[String],
+    target: &str,
+    event: &AnonymousEvent,
+    pow: ProofOfWork,
+) -> Result<(), PushError> {
+    if path.is_empty() {
+        return Err(PushError::Onion("empty relay path".to_string()));
+    }
+    let mut relay_keys = Vec::with_capacity(path.len());
+    for address in path {
+        relay_keys.push(fetch_onion_key(http, address).await?);
+    }
+    let guard_layer =
+        crate::onion::build_onion(path, target, event, pow, &relay_keys).map_err(|e| PushError::Onion(e.to_string()))?;
+    push_onion_layer(http, &path[0], &guard_layer).await
 }
 
 /// Pushes `decl` to every configured mesh peer, best-effort -- one unreachable peer doesn't stop
@@ -1933,6 +2036,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_onion_path_delivers_an_event_to_the_target_only() {
+        let (addr_target, state_target) = spawn(vec![]).await;
+        let (addr_r1, state_r1) = spawn(vec![]).await;
+        let (addr_r2, state_r2) = spawn(vec![]).await;
+
+        let event = valid_event("onion-wire");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        let path = vec![addr_r1.clone(), addr_r2.clone()];
+        push_anonymous_event_onion(&reqwest::Client::new(), &path, &addr_target, &event, pow)
+            .await
+            .unwrap();
+
+        // The target records it.
+        assert_eq!(state_target.event_log.read().unwrap().corroboration_for("onion-wire"), 1);
+        // The relays only forwarded encrypted layers; they never see the event.
+        assert_eq!(state_r1.event_log.read().unwrap().corroboration_for("onion-wire"), 0);
+        assert_eq!(state_r2.event_log.read().unwrap().corroboration_for("onion-wire"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_relay_rejects_a_layer_it_cannot_peel() {
+        let (addr_r1, _state_r1) = spawn(vec![]).await;
+        let (addr_r2, state_r2) = spawn(vec![]).await;
+
+        // Build a layer for r1's key, but send it to r2.
+        let event = valid_event("onion-wrong-relay");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        let r1_key = fetch_onion_key(&reqwest::Client::new(), &addr_r1).await.unwrap();
+        let layer = crate::onion::build_onion(
+            std::slice::from_ref(&addr_r1),
+            "http://target",
+            &event,
+            pow,
+            &[r1_key],
+        )
+        .unwrap();
+
+        let err = push_onion_layer(&reqwest::Client::new(), &addr_r2, &layer).await.unwrap_err();
+        assert!(matches!(err, PushError::Rejected(_, status) if status == StatusCode::BAD_REQUEST));
+        assert_eq!(state_r2.event_log.read().unwrap().corroboration_for("onion-wrong-relay"), 0);
     }
 
     #[tokio::test]

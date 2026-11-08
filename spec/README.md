@@ -21,6 +21,7 @@ repository's `spec/NN`; don't cross-reference by number between the two, only by
 | [12-responder-acknowledgment.md](12-responder-acknowledgment.md) | A signed, identity-bearing claim that a responder is handling an event — advisory, not a lock; no proof-of-work (there's no corroboration count to protect); the first mechanism here to carry a real `PeerIdentity` on the responder side while the reporter side stays anonymous |
 | [13-distributed-route-search.md](13-distributed-route-search.md) | Finding a path across the mesh by asking peer after peer when one node's own knowledge isn't enough — bounded strictly by a hop budget, not by perfect deduplication; cannot stitch together knowledge split across multiple peers (that needs `10`'s anti-entropy first) |
 | [14-responder-dispatch.md](14-responder-dispatch.md) | Blinded responder subscriptions and a poll inbox — the narrowest slice of "reaching a responder": the node never learns which `PeerIdentity` stands behind a subscription |
+| [15-onion-routing.md](15-onion-routing.md) | Multi-hop onion routing for anonymous-event submission — layered ChaCha20-Poly1305 over X25519 keys derived from each relay's Ed25519 identity, so no single relay sees both ends |
 
 ## Proposed research-data extension (not implemented)
 

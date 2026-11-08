@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod corroboration;
 pub mod dispatch;
 pub mod membership;
+pub mod onion;
 pub mod persistence;
 pub mod rate_limit;
 pub mod responder;
@@ -40,6 +41,7 @@ pub use membership::{
     UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
 pub use dispatch::{ResponderInbox, ResponderSubscriptionRegistry};
+pub use onion::{OnionError, OnionInner, OnionLayer, OnionPayload};
 pub use persistence::PersistenceError;
 pub use rate_limit::{RateLimiter, TokenBucket};
 pub use responder::{

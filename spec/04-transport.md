@@ -61,10 +61,10 @@ protocol entirely. Nothing in the base project needs to know this exists.
   B," never as "hides who submitted it." A one-hop relay is now available as an explicit
   configuration (`MeshState::anonymous_event_relay_target`): a node configured with a target
   forwards every verified event to it, so the target sees the relay's address rather than the
-  original submitter's. That is a single trusted intermediary, not onion-style layered relaying
-  -- the relay itself sees the submitter's address and must be trusted not to log the
-  correlation. Full traffic-analysis resistance (the base project's `spec/22-future-work.md`
-  "never ending morphing encryption") remains unresolved. `GET
+  original submitter's. And onion routing (`spec/15-onion-routing.md`) wraps the submission in
+  layered encryption through a path of relays, so no single relay sees both ends. Neither is
+  traffic-analysis resistance (the base project's `spec/22-future-work.md` "never ending
+  morphing encryption") -- that remains unresolved. `GET
   /oag-mesh/v1/anonymous-event/search` reads
   back this node's own log, filtered by kind/minimum severity/location prefix/recency -- see
   `spec/11-responder-search.md` for exactly what that is (a discovery primitive) and is not
@@ -143,10 +143,10 @@ in `spec/13-distributed-route-search.md`'s own "Tests" section.
 
 - **Network-level anonymity for `AnonymousEvent` submission.** Stated above, repeated here
   because it's the single most important gap in this file: a plain POST reveals the reporter's
-  source IP to the peer they submit to, and proof-of-work is orthogonal. A one-hop relay
-  (`MeshState::anonymous_event_relay_target`) now hides the reporter's address from the final
-  target, but the relay itself sees it and must be trusted not to log the correlation. Onion-style
-  layered relaying and traffic-analysis resistance remain unresolved.
+  source IP to the peer they submit to, and proof-of-work is orthogonal. Two layers now exist --
+  a one-hop relay (`MeshState::anonymous_event_relay_target`) hides the reporter from the final
+  target, and onion routing (`spec/15-onion-routing.md`) hides both ends from any single relay.
+  Traffic-analysis resistance remains unresolved.
 - **Pull-based anti-entropy exists now (`spec/10-anti-entropy.md`), but it's a weaker trust
   model than push, not a free upgrade.** Merging a pulled snapshot trusts the source peer's own
   prior verification instead of re-deriving it -- see `spec/10`'s own "trade-off" section for

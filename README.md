@@ -97,7 +97,7 @@ record correctness. Global coverage does not grant unrestricted access or author
 
 ## Status
 
-Seven mechanisms are implemented: cluster nesting with its own escalating proof-of-work
+Eight mechanisms are implemented: cluster nesting with its own escalating proof-of-work
 anti-sybil protection (`spec/02-cluster-nesting.md`), the anonymous-event RFC schema with
 escalating proof-of-work anti-spam/anti-replay protection (`spec/03-anonymous-event-rfc.md`),
 federated corroboration weighted by distinct cluster rather than distinct peer, also with its own
@@ -125,7 +125,11 @@ slices of "reaching a responder," neither of them dispatch, notification, or a g
 claimed response is real. A seventh mechanism, blinded responder dispatch
 (`spec/14-responder-dispatch.md`), adds the missing delivery: a responder registers a filter
 under a random id and polls a per-subscription inbox, and the node never learns which
-`PeerIdentity` stands behind that id. A sixth mechanism, distributed route search
+`PeerIdentity` stands behind that id. An eighth mechanism, onion routing
+(`spec/15-onion-routing.md`), wraps an anonymous-event submission in layered
+ChaCha20-Poly1305 encryption through a path of relays, under X25519 keys derived from each
+relay's Ed25519 identity, so no single relay sees both the reporter and the target. A sixth
+mechanism, distributed route search
 (`spec/13-distributed-route-search.md`), extends cluster nesting's own `shortest_path` across
 the network: `find_route_across_mesh` asks peer after peer, bounded by a hop budget, when one
 node's local knowledge isn't enough — the concrete realization of this repository's own founding
@@ -135,7 +139,9 @@ identity, all the way down — even an attester's own standing in a cluster is i
 a bad-faith responder falsely claiming to handle events (proof-of-work wouldn't help here
 either; a per-identity rate limit now bounds the flood, but it is not a reputation system or
 an allowlist — see `spec/12`), full push notification and durable delivery for responders (a
-blinded subscription and poll inbox now exist — see `spec/14`), pull-based anti-entropy's own stated
+blinded subscription and poll inbox now exist — see `spec/14`), onion-routing's own residual gap
+traffic-analysis resistance (the relays' addresses and timing are still observable — see
+`spec/15`), pull-based anti-entropy's own stated
 trade-off — it trusts a peer's prior verification instead of re-checking a signature, a weaker
 guarantee than push — and distributed route search's own residual limits: a per-search fan-out
 budget and a node-wide rate limiter now bound its amplification cost, but neither

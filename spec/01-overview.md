@@ -9,7 +9,9 @@ mechanism (1)'s own `shortest_path` across the network -- asking peer after peer
 hop budget, when one node's own local knowledge of the mesh isn't enough to answer alone, and a
 seventh, `spec/14-responder-dispatch.md`, that gives a responder a blinded subscription and a
 poll inbox -- the narrowest slice of "reaching a responder" that does not reveal which
-`PeerIdentity` is responding. A real
+`PeerIdentity` is responding, and an eighth, `spec/15-onion-routing.md`, that wraps an
+anonymous-event submission in layered encryption through a path of relays so no single relay
+sees both the reporter and the target. A real
 HTTP transport covers all five message-bearing mechanisms
 (`spec/04-transport.md`), with both push (`broadcast_*`) and pull-based anti-entropy
 (`pull_and_merge`/`sync_with_all_peers`/`spawn_periodic_sync`, `spec/10-anti-entropy.md`) now
@@ -35,7 +37,7 @@ is stated in `spec/10`'s own section on exactly that.**
 
 ## What this layer is
 
-Seven related mechanisms, one level above a single `oag` peer or peer cluster:
+Eight related mechanisms, one level above a single `oag` peer or peer cluster:
 
 1. **Clusters within clusters, implemented — see `spec/02-cluster-nesting.md`.** The base
    project's peer clustering (`spec/26-peer-clustering.md` there) gives a peer exactly one flat
@@ -123,6 +125,11 @@ Seven related mechanisms, one level above a single `oag` peer or peer cluster:
    that a subscription exists. The narrowest slice of `spec/03`'s "Reaching a responder" open
    question: not a push notification, not durable, and the node does see the responder's network
    address even though it does not learn their identity.
+8. **Onion routing, implemented — see `spec/15-onion-routing.md`.** A reporter wraps an
+   anonymous-event submission in one ChaCha20-Poly1305 layer per relay, under X25519 keys
+   derived from each relay's Ed25519 identity. No single relay learns both the reporter and the
+   target. Not traffic-analysis resistance, not a defense against a global adversary, and the
+   exit relay still sees the submission in plaintext.
 
 ## What this layer explicitly is not
 

@@ -26,3 +26,8 @@ hex = "0.4"
 blake3 = "1"
 axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Onion routing for anonymous-event submission (`spec/15-onion-routing.md`). X25519 for the
+# per-hop key exchange (derived from each relay's Ed25519 identity), ChaCha20-Poly1305 for
+# the layered encryption.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"

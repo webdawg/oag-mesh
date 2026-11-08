@@ -175,11 +175,11 @@ identity-free check can ever guarantee.
   work to submit, but a plain HTTP POST (`spec/04-transport.md`,
   `POST /oag-mesh/v1/anonymous-event`) still reveals the submitting connection's source IP to the
   receiving peer — proof-of-work does nothing about this, it's an orthogonal property. A one-hop
-  relay (`MeshState::anonymous_event_relay_target` in `spec/04-transport.md`) now hides the
-  reporter's address from the final target, but the relay itself sees it and must be trusted not
-  to log the correlation. Onion-style layered relaying and traffic-analysis resistance — the base
-  project's own "never ending morphing encryption" entry in `spec/22-future-work.md` — remain
-  unresolved.
+  relay (`MeshState::anonymous_event_relay_target`, `spec/04-transport.md`) hides the reporter's
+  address from the final target, and onion routing (`spec/15-onion-routing.md`) wraps the
+  submission in layered encryption through a path of relays so no single relay sees both ends.
+  Neither is traffic-analysis resistance — the base project's own "never ending morphing
+  encryption" entry in `spec/22-future-work.md` — which remains unresolved.
 - **Reaching a responder.** A `MedicalEmergency` report is only useful for "life-saving actions"
   if it reaches someone who can act on it — and *that* delivery mechanism needs its own answer for
   "how does this happen without identifying the reporter or the responder." `spec/11`'s
