@@ -670,7 +670,18 @@ async fn search_for_route(
     while let Some(result) = tasks.join_next().await {
         if let Ok(Some(path)) = result {
             if best.as_ref().is_none_or(|current_best| path.len() < current_best.len()) {
+                // A path of two members is a direct edge -- the shortest possible
+                // path for distinct `from`/`target`, so no other branch can beat
+                // it. Stop the fan-out early rather than waiting for every peer
+                // to answer; the "shortest among those found" guarantee is
+                // preserved because a direct edge is the global minimum. See
+                // `spec/13`'s "deduplication" note.
+                let is_direct = path.len() <= 2;
                 best = Some(path);
+                if is_direct {
+                    tasks.abort_all();
+                    break;
+                }
             }
         }
     }

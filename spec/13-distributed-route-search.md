@@ -100,10 +100,13 @@ cost of triggering fan-out; they do not authenticate anyone.
   verifies who is asking, and the token bucket is node-wide because the transport has no
   requester identity. A real deployment exposing this to anything less trusted than its own
   operator-configured peer list still needs its own authentication and per-requester limits.
-- **No deduplication against results already in flight.** If two different branches both
-  eventually find *a* path to the same target, both are collected and compared by length; there's
-  no short-circuiting the moment the first result arrives, so a search can do more network work
-  than the minimum needed to answer the question.
+- **No general deduplication against results already in flight.** If two different branches
+  both eventually find *a* path to the same target, both are collected and compared by length.
+  The one exception is a direct edge: a two-member path is the shortest possible for distinct
+  `from`/`target`, so the fan-out stops as soon as one arrives rather than waiting for every
+  peer -- the "shortest among those found" guarantee is preserved because a direct edge is the
+  global minimum. A broader short-circuit-on-first-result would trade that guarantee for less
+  work, and that trade is not made here.
 
 ## Tests
 
