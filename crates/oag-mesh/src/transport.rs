@@ -58,6 +58,11 @@ pub const RESPONDER_ACK_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Dura
 /// Default cap on responder acknowledgments per identity per window. A starting point, not a
 /// derived value -- a real deployment should tune it to its own responder traffic.
 pub const RESPONDER_ACK_RATE_LIMIT_MAX: u32 = 60;
+/// Default maximum number of events `GET /oag-mesh/v1/anonymous-event/search` returns in one
+/// response -- see `spec/11-responder-search.md`'s own pagination section.
+pub const DEFAULT_EVENT_SEARCH_LIMIT: usize = 100;
+/// Hard ceiling on a single search response, even when a caller asks for more.
+pub const MAX_EVENT_SEARCH_LIMIT: usize = 1000;
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -352,16 +357,42 @@ async fn receive_anonymous_event(
     }
 }
 
+/// The query-string shape for `GET /oag-mesh/v1/anonymous-event/search`: the filter fields plus
+/// pagination. `limit` defaults to `DEFAULT_EVENT_SEARCH_LIMIT` and is clamped to
+/// `MAX_EVENT_SEARCH_LIMIT`; `offset` defaults to `0`.
+#[derive(Debug, Deserialize)]
+struct EventSearchQuery {
+    #[serde(flatten)]
+    filter: EventFilter,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
 /// Read-only: every event in this node's own `AnonymousEventLog` matching the query-string filter
-/// (`kind`, `min_severity`, `location_prefix`, `since` -- see `anonymous_event::EventFilter`).
-/// This is the one piece of `spec/03-anonymous-event-rfc.md`'s "Reaching a responder" open
-/// question this crate actually answers, and it is a narrow one -- see
-/// `spec/11-responder-search.md` for exactly what it is and is not. Same node-local-only,
-/// no-auth scope as every other `GET` endpoint in this file: it searches this node's own log,
-/// not the wider mesh, and anyone who can reach the listen address can run any search.
-async fn search_anonymous_events(State(state): State<MeshState>, Query(filter): Query<EventFilter>) -> Response {
+/// (`kind`, `min_severity`, `location_prefix`, `since` -- see `anonymous_event::EventFilter`),
+/// paginated by `limit`/`offset`. This is the one piece of
+/// `spec/03-anonymous-event-rfc.md`'s "Reaching a responder" open question this crate actually
+/// answers, and it is a narrow one -- see `spec/11-responder-search.md` for exactly what it is
+/// and is not. Same node-local-only, no-auth scope as every other `GET` endpoint in this file:
+/// it searches this node's own log, not the wider mesh, and anyone who can reach the listen
+/// address can run any search. The response includes `total` (all matches, before pagination)
+/// so a caller can page through a large result set.
+async fn search_anonymous_events(State(state): State<MeshState>, Query(query): Query<EventSearchQuery>) -> Response {
     let log = state.event_log.read().unwrap();
-    Json(serde_json::json!({ "events": log.search(&filter) })).into_response()
+    let matches = log.search(&query.filter);
+    let total = matches.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query.limit.unwrap_or(DEFAULT_EVENT_SEARCH_LIMIT).min(MAX_EVENT_SEARCH_LIMIT);
+    let events: Vec<&AnonymousEvent> = matches.into_iter().skip(offset).take(limit).collect();
+    Json(serde_json::json!({
+        "events": events,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }))
+    .into_response()
 }
 
 /// Receives a `ClaimReportSubmission` (the report plus its proof-of-work) and records it into
@@ -1342,6 +1373,68 @@ mod tests {
         let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search")).await.unwrap();
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_anonymous_events_paginates_and_reports_total() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        for i in 0..5 {
+            let event = valid_event(&format!("search-page-{i}"));
+            let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+            push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap();
+        }
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?limit=2&offset=0"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+        assert_eq!(body["total"], 5);
+        assert_eq!(body["limit"], 2);
+        assert_eq!(body["offset"], 0);
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?limit=2&offset=2"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+        assert_eq!(body["total"], 5);
+        assert_eq!(body["offset"], 2);
+
+        // The last page is short.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?limit=2&offset=4"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["total"], 5);
+    }
+
+    #[tokio::test]
+    async fn search_anonymous_events_default_limit_bounds_the_response() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        for i in 0..DEFAULT_EVENT_SEARCH_LIMIT + 10 {
+            let event = valid_event(&format!("search-default-{i}"));
+            let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+            push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap();
+        }
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), DEFAULT_EVENT_SEARCH_LIMIT);
+        assert_eq!(body["total"], DEFAULT_EVENT_SEARCH_LIMIT + 10);
+        assert_eq!(body["limit"], DEFAULT_EVENT_SEARCH_LIMIT);
+
+        // A caller asking for more than the hard ceiling is clamped to it.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?limit=99999"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["limit"], MAX_EVENT_SEARCH_LIMIT);
     }
 
     #[tokio::test]

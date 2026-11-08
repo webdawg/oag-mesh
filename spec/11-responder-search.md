@@ -53,10 +53,10 @@ still apply unchanged) -- search only narrows what's already there, it cannot re
 - **Claim-to-avoid-duplicate-response now exists (`spec/12-responder-acknowledgment.md`), but
   it's advisory, not a lock.** A responder can sign a `ResponderAcknowledgment` saying "I am
   handling this," queryable alongside a search, so a second responder checking first can stand
-  down -- but nothing *enforces* that, nothing verifies the claim reflects real action, and
-  nothing stops a bad-faith identity from acknowledging events it never intends to act on
-  specifically to suppress real responders. See `spec/12`'s own "what this explicitly is not"
-  for that stated plainly.
+  down -- but nothing *enforces* that, nothing verifies the claim reflects real action, and a
+  per-identity rate limit (`spec/12`) only bounds how fast a bad-faith identity can acknowledge
+  events it never intends to act on, not whether it can. See `spec/12`'s own "what this
+  explicitly is not" for that stated plainly.
 - **Node-local only, same as every other `GET` endpoint in this crate.** Search answers from
   whatever this one node's `AnonymousEventLog` holds -- its own received submissions, plus
   whatever `spec/10-anti-entropy.md`'s pull-based sync has merged in from peers. It does not fan
@@ -65,9 +65,12 @@ still apply unchanged) -- search only narrows what's already there, it cannot re
   address can run any search. Whether that's acceptable depends on what's actually flowing
   through a real deployment's event log -- unchanged from the posture `spec/04-transport.md`
   already states for its other read endpoints.
-- **No pagination or result limits.** `search` returns every match in one response; fine at this
-  crate's current scale, a real cost once a log grows large, same category of gap as
-  `spec/10-anti-entropy.md`'s "not incremental" pull.
+- **Pagination and a default result bound now exist, but they are a ceiling, not a dispatch
+  mechanism.** `limit`/`offset` page through a search, `limit` defaults to
+  `DEFAULT_EVENT_SEARCH_LIMIT` (100) and is clamped to `MAX_EVENT_SEARCH_LIMIT` (1000), and the
+  response carries `total` so a caller can page through a large result set. A caller can still
+  page the entire log, one page at a time -- the bound is on one response, not on total access,
+  and the endpoint remains node-local, no-auth, and unauthenticated.
 
 ## Tests
 
@@ -75,6 +78,8 @@ still apply unchanged) -- search only narrows what's already there, it cannot re
 event; a `kind` filter matches `MedicalEmergency` regardless of its `MedicalEmergencyKind`
 payload while excluding other kinds; a `min_severity` filter keeps only events at least that
 urgent; `location_prefix` and `since` each narrow results independently.
-`crates/oag-mesh/src/transport.rs` adds 1 integration test, over a real HTTP round trip: searching
+`crates/oag-mesh/src/transport.rs` adds 3 integration tests, over real HTTP round trips: searching
 by `kind` and separately by `min_severity` each return only the matching event, while an empty
-query string returns both.
+query string returns both; `limit`/`offset` page through a five-event result set and report the
+`total` across pages; and the default limit bounds a response to `DEFAULT_EVENT_SEARCH_LIMIT`
+while a request for more than `MAX_EVENT_SEARCH_LIMIT` is clamped to it.
