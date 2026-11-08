@@ -185,13 +185,19 @@ identity-free check can ever guarantee.
   notification, responder identity/subscription, and duplicate-response prevention are all still
   unattempted -- see `spec/11`'s own "what this explicitly is not" for exactly what's still
   missing.
-- **Retention/expiry.** Nothing here specifies how long an `AnonymousEventLog` keeps old reports,
-  or when/how an `AllClear` actually removes a resolved situation from view rather than just
-  adding one more entry under the same nonce.
+- **Retention/expiry now has a primitive, but no automatic policy.**
+  `AnonymousEventLog::prune_before(cutoff)` removes every event older than a cutoff (and empties
+  nonce entries), returning the count removed; `prune_expired(now, max_age_seconds)` is the
+  common "keep the last N seconds" convenience. `POST /oag-mesh/v1/anonymous-event/prune`
+  exposes it over the wire as an explicit operator action. Nothing prunes automatically -- the
+  policy (what cutoff, how often) is deliberately left to the caller, and
+  `DEFAULT_EVENT_RETENTION_SECONDS` (30 days) is a starting point, not a derived value. The
+  `AllClear` half of this question is still open: an `AllClear` still adds an entry under a
+  nonce rather than removing the resolved situation from view.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (14 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (17 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
 recorded into the log (checked before any proof-of-work is even considered); independent reports
 sharing a `corroboration_nonce` corroborate each other while an unrelated nonce stays separate; a
@@ -200,8 +206,10 @@ report with no proof-of-work is rejected; required difficulty escalates with eac
 report under one nonce (and a proof solved for an earlier, lower difficulty is correctly rejected
 against the new, higher one); a proof-of-work solved for one event cannot be reused for a
 different one; `merge` adds genuinely new events and skips an exact duplicate while keeping an
-unrelated nonce distinct (see `spec/10-anti-entropy.md`); and 4 more for `search`/`EventFilter`
-(see `spec/11-responder-search.md`). `crates/oag-mesh/src/transport.rs` adds 2 more over the
-wire: a submission with insufficient proof-of-work is rejected with `400`, never recorded; and
+unrelated nonce distinct (see `spec/10-anti-entropy.md`); 4 more for `search`/`EventFilter`
+(see `spec/11-responder-search.md`); and 3 more for `prune_before`/`prune_expired` (see the
+retention bullet above). `crates/oag-mesh/src/transport.rs` adds 3 more over the wire: a
+submission with insufficient proof-of-work is rejected with `400`, never recorded;
 `GET .../search` filters correctly by kind and by minimum severity, with an empty query string
-returning everything.
+returning everything; and `POST .../prune` removes events older than the given cutoff while
+keeping newer ones.

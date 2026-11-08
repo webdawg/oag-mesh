@@ -64,6 +64,9 @@ pub const RESPONDER_ACK_RATE_LIMIT_MAX: u32 = 60;
 pub const DEFAULT_EVENT_SEARCH_LIMIT: usize = 100;
 /// Hard ceiling on a single search response, even when a caller asks for more.
 pub const MAX_EVENT_SEARCH_LIMIT: usize = 1000;
+/// A starting point for `spec/03`'s retention/expiry open question -- 30 days. Not a derived
+/// value; a deployment should choose its own retention and call the prune endpoint.
+pub const DEFAULT_EVENT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -300,6 +303,7 @@ pub fn router(state: MeshState) -> Router {
         .route("/oag-mesh/v1/bridge-declaration", post(receive_bridge_declaration))
         .route("/oag-mesh/v1/anonymous-event", post(receive_anonymous_event))
         .route("/oag-mesh/v1/anonymous-event/search", get(search_anonymous_events))
+        .route("/oag-mesh/v1/anonymous-event/prune", post(prune_anonymous_events))
         .route("/oag-mesh/v1/claim-report", post(receive_claim_report))
         .route("/oag-mesh/v1/membership-attestation", post(receive_membership_attestation))
         .route("/oag-mesh/v1/responder-acknowledgment", post(receive_responder_acknowledgment))
@@ -435,6 +439,21 @@ async fn search_anonymous_events(State(state): State<MeshState>, Query(query): Q
         "offset": offset,
     }))
     .into_response()
+}
+
+/// The body for `POST /oag-mesh/v1/anonymous-event/prune` -- an explicit operator action to
+/// prune events older than `before` (unix seconds). See `spec/03`'s "Retention/expiry".
+#[derive(Debug, Deserialize)]
+struct PruneRequest {
+    before: i64,
+}
+
+/// Prunes this node's own `AnonymousEventLog` before `before` (unix seconds), returning the
+/// number of events removed. Explicit, not automatic -- same node-local, no-auth scope as every
+/// other endpoint here. See `spec/03-anonymous-event-rfc.md`'s "Retention/expiry" open question.
+async fn prune_anonymous_events(State(state): State<MeshState>, Json(request): Json<PruneRequest>) -> Response {
+    let removed = state.event_log.write().unwrap().prune_before(request.before);
+    Json(serde_json::json!({ "removed": removed })).into_response()
 }
 
 /// Receives a `ClaimReportSubmission` (the report plus its proof-of-work) and records it into
@@ -1581,6 +1600,35 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(body["limit"], MAX_EVENT_SEARCH_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn prune_endpoint_removes_old_events() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        let mut old = valid_event("prune-wire-old");
+        old.observed_at = 999_900; // divisible by 300, before the cutoff
+        let pow_old = ProofOfWork::solve(&old, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &old, pow_old).await.unwrap();
+
+        let mut recent = valid_event("prune-wire-recent");
+        recent.observed_at = 2_000_100; // divisible by 300, after the cutoff
+        let pow_recent = ProofOfWork::solve(&recent, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &recent, pow_recent).await.unwrap();
+
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/anonymous-event/prune"))
+            .json(&serde_json::json!({ "before": 1_500_000 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["removed"], 1);
+
+        assert_eq!(state_a.event_log.read().unwrap().corroboration_for("prune-wire-old"), 0);
+        assert_eq!(state_a.event_log.read().unwrap().corroboration_for("prune-wire-recent"), 1);
     }
 
     #[tokio::test]

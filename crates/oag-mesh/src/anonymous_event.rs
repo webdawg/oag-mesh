@@ -396,6 +396,34 @@ impl AnonymousEventLog {
         }
         changed
     }
+
+    /// Removes every event with `observed_at < cutoff`, returning the number of events removed.
+    /// Empty nonce entries are removed too, and the store's sequence is bumped if anything was
+    /// removed -- so a prune is visible to `pull_and_merge`'s heads check like any other change.
+    ///
+    /// This is the retention primitive `spec/03-anonymous-event-rfc.md`'s "Retention/expiry" open
+    /// question names. The policy -- what cutoff to use, and when to call this -- is deliberately
+    /// left to the caller; nothing here prunes automatically.
+    pub fn prune_before(&mut self, cutoff: i64) -> usize {
+        let mut removed = 0;
+        self.events.retain(|_nonce, events| {
+            let before = events.len();
+            events.retain(|event| event.observed_at >= cutoff);
+            removed += before - events.len();
+            !events.is_empty()
+        });
+        if removed > 0 {
+            self.sequence += 1;
+        }
+        removed
+    }
+
+    /// `prune_before` with a maximum age in seconds, relative to `now` -- a convenience for the
+    /// common "keep the last N seconds" policy. `saturating_sub` avoids underflow on a clock set
+    /// before the epoch.
+    pub fn prune_expired(&mut self, now: i64, max_age_seconds: i64) -> usize {
+        self.prune_before(now.saturating_sub(max_age_seconds))
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +568,47 @@ mod tests {
             err,
             AnonymousEventError::InsufficientProofOfWork { required_bits: BASE_DIFFICULTY_BITS + 2 * DIFFICULTY_STEP_BITS }
         );
+    }
+
+    #[test]
+    fn prune_before_removes_old_events_and_keeps_recent() {
+        let mut log = AnonymousEventLog::new();
+        let mut old = valid_event("prune-old");
+        old.observed_at = 999_900; // divisible by 300
+        record_with_fresh_pow(&mut log, old).unwrap();
+        let mut recent = valid_event("prune-recent");
+        recent.observed_at = 2_000_100; // divisible by 300
+        record_with_fresh_pow(&mut log, recent).unwrap();
+
+        assert_eq!(log.prune_before(1_500_000), 1);
+        assert_eq!(log.corroboration_for("prune-old"), 0);
+        assert_eq!(log.corroboration_for("prune-recent"), 1);
+    }
+
+    #[test]
+    fn prune_before_with_no_matches_changes_nothing() {
+        let mut log = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut log, valid_event("prune-keep")).unwrap();
+        let sequence = log.sequence();
+
+        assert_eq!(log.prune_before(1), 0);
+        assert_eq!(log.corroboration_for("prune-keep"), 1);
+        assert_eq!(log.sequence(), sequence);
+    }
+
+    #[test]
+    fn prune_expired_uses_now_and_max_age() {
+        let mut log = AnonymousEventLog::new();
+        let mut old = valid_event("prune-expired-old");
+        old.observed_at = 999_900; // divisible by 300
+        record_with_fresh_pow(&mut log, old).unwrap();
+        let mut recent = valid_event("prune-expired-recent");
+        recent.observed_at = 2_000_100; // divisible by 300
+        record_with_fresh_pow(&mut log, recent).unwrap();
+
+        assert_eq!(log.prune_expired(2_000_100, 1_000_000), 1);
+        assert_eq!(log.corroboration_for("prune-expired-old"), 0);
+        assert_eq!(log.corroboration_for("prune-expired-recent"), 1);
     }
 
     #[test]

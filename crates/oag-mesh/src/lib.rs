@@ -48,7 +48,8 @@ pub use transport::{
     find_route_across_mesh, find_route_across_mesh_with_budget, spawn_periodic_sync,
     spawn_periodic_sync_with_jitter, pull_heads, BridgeDeclarationSubmission, ClaimReportSubmission,
     MembershipAttestationSubmission, MeshState, PullError, PushError, ResponderAcknowledgmentSubmission,
-    RouteSearchRequest, RouteSearchResponse, StoreHeads, DEFAULT_EVENT_SEARCH_LIMIT,
-    DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET, MAX_EVENT_SEARCH_LIMIT, RESPONDER_ACK_RATE_LIMIT_MAX,
-    RESPONDER_ACK_RATE_LIMIT_WINDOW, ROUTE_SEARCH_RATE_LIMIT_CAPACITY, ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+    RouteSearchRequest, RouteSearchResponse, StoreHeads, DEFAULT_EVENT_RETENTION_SECONDS,
+    DEFAULT_EVENT_SEARCH_LIMIT, DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET, MAX_EVENT_SEARCH_LIMIT,
+    RESPONDER_ACK_RATE_LIMIT_MAX, RESPONDER_ACK_RATE_LIMIT_WINDOW, ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
+    ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
 };
