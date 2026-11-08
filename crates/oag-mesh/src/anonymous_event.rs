@@ -87,6 +87,37 @@ pub struct EventFilter {
     /// Matches events with `observed_at >= since` (unix seconds) -- a recency bound, not a
     /// precise one given `observed_at` is already rounded to `TIME_ROUNDING_SECONDS`.
     pub since: Option<i64>,
+    /// Whether to include events under a nonce that has since been resolved by an `AllClear`.
+    /// Defaults to `false` -- a resolved situation is removed from view, not just appended to.
+    #[serde(default, deserialize_with = "deserialize_bool_from_str_or_bool")]
+    pub include_resolved: bool,
+}
+
+/// Deserializes a boolean from either a JSON boolean or a query-string `"true"`/`"false"`.
+/// `serde_urlencoded` hands a `#[serde(flatten)]` field to a `Content` buffer as a string, so a
+/// plain `bool` fails there; this accepts both shapes.
+fn deserialize_bool_from_str_or_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoolOrStr;
+    impl<'de> serde::de::Visitor<'de> for BoolOrStr {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean or a string \"true\"/\"false\"")
+        }
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<bool, E> {
+            Ok(value)
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<bool, E> {
+            match value.to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(E::custom("expected \"true\" or \"false\"")),
+            }
+        }
+    }
+    deserializer.deserialize_any(BoolOrStr)
 }
 
 impl EventFilter {
@@ -307,8 +338,12 @@ impl AnonymousEvent {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AnonymousEventLog {
     events: std::collections::HashMap<String, Vec<AnonymousEvent>>,
-    /// Monotonic version, bumped whenever `events` actually changes -- the heads check in
-    /// `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
+    /// Nonces that have since been resolved by an `AllClear` -- the situation is removed from
+    /// view (`search` hides them by default) rather than just appended to. The events
+    /// themselves are kept, so the record is not destroyed.
+    resolved: std::collections::HashSet<String>,
+    /// Monotonic version, bumped whenever `events` or `resolved` actually changes -- the heads
+    /// check in `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
     sequence: u64,
 }
 
@@ -337,8 +372,14 @@ impl AnonymousEventLog {
         if !pow.satisfies(&event, required_bits) {
             return Err(AnonymousEventError::InsufficientProofOfWork { required_bits });
         }
-        self.events.entry(event.corroboration_nonce.clone()).or_default().push(event);
+        let nonce = event.corroboration_nonce.clone();
+        let is_all_clear = event.kind == EventKind::AllClear;
+        self.events.entry(nonce.clone()).or_default().push(event);
         self.sequence += 1;
+        if is_all_clear {
+            self.resolved.insert(nonce);
+            self.sequence += 1;
+        }
         Ok(())
     }
 
@@ -346,6 +387,12 @@ impl AnonymousEventLog {
     /// `spec/10-anti-entropy.md`.
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Whether `corroboration_nonce` has been resolved by an `AllClear` -- see `search`'s
+    /// `include_resolved` default.
+    pub fn is_resolved(&self, corroboration_nonce: &str) -> bool {
+        self.resolved.contains(corroboration_nonce)
     }
 
     /// How many reports share this nonce -- the corroboration count for an anonymous event. Each
@@ -369,7 +416,12 @@ impl AnonymousEventLog {
     /// responder identity, no notification/push to anyone, no claim-to-avoid-duplicate-response,
     /// and this searches only this one node's own local log, not the wider mesh.
     pub fn search(&self, filter: &EventFilter) -> Vec<&AnonymousEvent> {
-        self.events.values().flatten().filter(|event| filter.matches(event)).collect()
+        self.events
+            .iter()
+            .filter(|(nonce, _)| filter.include_resolved || !self.resolved.contains(nonce.as_str()))
+            .flat_map(|(_, events)| events.iter())
+            .filter(|event| filter.matches(event))
+            .collect()
     }
 
     /// Merges every event in `other` into `self`, skipping anything already present (exact
@@ -392,6 +444,14 @@ impl AnonymousEventLog {
                     changed = true;
                     self.sequence += 1;
                 }
+            }
+        }
+        // A resolved nonce resolves here too -- the AllClear is a property of the real event,
+        // not of the node that first saw it.
+        for nonce in other.resolved {
+            if self.resolved.insert(nonce) {
+                changed = true;
+                self.sequence += 1;
             }
         }
         changed
@@ -631,6 +691,51 @@ mod tests {
 
         assert_eq!(local.corroboration_for("merge-test"), 2);
         assert_eq!(local.corroboration_for("remote-only-nonce"), 1);
+    }
+
+    #[test]
+    fn all_clear_resolves_a_nonce_and_hides_it_from_search() {
+        let mut log = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut log, valid_event("resolve-nonce")).unwrap();
+        let mut all_clear = valid_event("resolve-nonce");
+        all_clear.kind = EventKind::AllClear;
+        all_clear.event_id = "evt-all-clear".to_string();
+        record_with_fresh_pow(&mut log, all_clear).unwrap();
+
+        assert!(log.is_resolved("resolve-nonce"));
+        assert_eq!(log.search(&EventFilter::default()).len(), 0);
+        assert_eq!(
+            log.search(&EventFilter { include_resolved: true, ..Default::default() }).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn all_clear_under_one_nonce_does_not_resolve_another() {
+        let mut log = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut log, valid_event("nonce-a")).unwrap();
+        let mut all_clear = valid_event("nonce-b");
+        all_clear.kind = EventKind::AllClear;
+        record_with_fresh_pow(&mut log, all_clear).unwrap();
+
+        assert!(log.is_resolved("nonce-b"));
+        assert!(!log.is_resolved("nonce-a"));
+        assert_eq!(log.search(&EventFilter::default()).len(), 1);
+    }
+
+    #[test]
+    fn merge_carries_the_resolved_set() {
+        let mut local = AnonymousEventLog::new();
+        record_with_fresh_pow(&mut local, valid_event("merge-resolve")).unwrap();
+
+        let mut remote = AnonymousEventLog::new();
+        let mut all_clear = valid_event("merge-resolve");
+        all_clear.kind = EventKind::AllClear;
+        record_with_fresh_pow(&mut remote, all_clear).unwrap();
+
+        local.merge(remote);
+        assert!(local.is_resolved("merge-resolve"));
+        assert_eq!(local.search(&EventFilter::default()).len(), 0);
     }
 
     #[test]

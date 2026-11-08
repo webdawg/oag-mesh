@@ -195,12 +195,14 @@ identity-free check can ever guarantee.
   exposes it over the wire as an explicit operator action. Nothing prunes automatically -- the
   policy (what cutoff, how often) is deliberately left to the caller, and
   `DEFAULT_EVENT_RETENTION_SECONDS` (30 days) is a starting point, not a derived value. The
-  `AllClear` half of this question is still open: an `AllClear` still adds an entry under a
-  nonce rather than removing the resolved situation from view.
+  `AllClear` half now has a concrete behavior: recording an `AllClear` marks its nonce resolved,
+  and `search` hides resolved nonces by default (`include_resolved=true` shows them). The events
+  are kept, not destroyed -- the record is preserved, the situation is removed from view.
+  Whether that is the right semantic for a real deployment is still a policy question.
 
 ## Tests
 
-`crates/oag-mesh/src/anonymous_event.rs` (17 unit tests): a well-formed event validates; an
+`crates/oag-mesh/src/anonymous_event.rs` (20 unit tests): a well-formed event validates; an
 over-precise location is rejected; an unrounded timestamp is rejected; an invalid event is never
 recorded into the log (checked before any proof-of-work is even considered); independent reports
 sharing a `corroboration_nonce` corroborate each other while an unrelated nonce stays separate; a
@@ -211,8 +213,10 @@ against the new, higher one); a proof-of-work solved for one event cannot be reu
 different one; `merge` adds genuinely new events and skips an exact duplicate while keeping an
 unrelated nonce distinct (see `spec/10-anti-entropy.md`); 4 more for `search`/`EventFilter`
 (see `spec/11-responder-search.md`); and 3 more for `prune_before`/`prune_expired` (see the
-retention bullet above). `crates/oag-mesh/src/transport.rs` adds 3 more over the wire: a
+retention bullet above); and 3 more for `AllClear`'s resolved-nonce behavior (see the
+retention bullet above). `crates/oag-mesh/src/transport.rs` adds 4 more over the wire: a
 submission with insufficient proof-of-work is rejected with `400`, never recorded;
 `GET .../search` filters correctly by kind and by minimum severity, with an empty query string
-returning everything; and `POST .../prune` removes events older than the given cutoff while
-keeping newer ones.
+returning everything; `POST .../prune` removes events older than the given cutoff while keeping
+newer ones; and an `AllClear` hides its nonce from the default search while
+`include_resolved=true` shows it again.

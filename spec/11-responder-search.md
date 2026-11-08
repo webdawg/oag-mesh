@@ -15,8 +15,9 @@ dispatch system could be built on top of," not as dispatch itself.
 
 ## The mechanism
 
-`EventFilter { kind, min_severity, location_prefix, since }` -- every field optional, `None`
-meaning "no constraint on this dimension":
+`EventFilter { kind, min_severity, location_prefix, since, include_resolved }` -- every field
+optional (`None` meaning "no constraint on this dimension"), except `include_resolved`, which
+defaults to `false`:
 
 - `kind: Option<EventKindCategory>` -- `EventKindCategory` mirrors `EventKind` without its
   `MedicalEmergencyKind` payload, so a filter can ask "any `MedicalEmergency`, regardless of
@@ -29,11 +30,14 @@ meaning "no constraint on this dimension":
   geohash-style string, so a responder covering one region searches by that region's prefix.
 - `since: Option<i64>` -- matches `observed_at >= since` (unix seconds); only as precise as
   `observed_at` already is, given it's rounded to `TIME_ROUNDING_SECONDS`.
+- `include_resolved: bool` -- whether to include events under a nonce that an `AllClear` has
+  since resolved. Defaults to `false`: a resolved situation is removed from view, not just
+  appended to. The events are still in the log; `true` shows them again.
 
 `AnonymousEventLog::search(filter)` applies this across every recorded event, regardless of
 nonce. `GET /oag-mesh/v1/anonymous-event/search?kind=MedicalEmergency&min_severity=High&...`
 exposes it over the wire -- query-string parameters map directly onto `EventFilter`'s fields, all
-optional, an empty query string returning every event the node has.
+optional, an empty query string returning every unresolved event the node has.
 
 This adds **no new identifying surface**. Every field a filter can match on was already part of
 `AnonymousEvent`'s own schema (`spec/03`'s closed-enum, coarsened-location-and-time constraints

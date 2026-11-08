@@ -1699,6 +1699,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_clear_hides_a_nonce_from_search_over_the_wire() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+
+        let event = valid_event("all-clear-wire");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&http, &addr_a, &event, pow).await.unwrap();
+
+        let mut all_clear = valid_event("all-clear-wire");
+        all_clear.kind = crate::anonymous_event::EventKind::AllClear;
+        all_clear.event_id = "evt-all-clear".to_string();
+        // The second report under the same nonce pays the escalated difficulty.
+        let required = _state_a.event_log.read().unwrap().required_difficulty_bits("all-clear-wire");
+        let pow = ProofOfWork::solve(&all_clear, required);
+        push_anonymous_event(&http, &addr_a, &all_clear, pow).await.unwrap();
+
+        // The default search hides the resolved nonce.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search")).await.unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 0);
+
+        // `include_resolved=true` shows both events.
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/anonymous-event/search?include_resolved=true"))
+            .await
+            .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn an_invalid_anonymous_event_is_rejected_over_the_wire() {
         let (addr_a, state_a) = spawn(vec![]).await;
         let mut event = valid_event("transport-test-nonce-2");
