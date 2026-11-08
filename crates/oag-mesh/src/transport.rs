@@ -201,6 +201,10 @@ pub struct MeshState {
     /// The last heads this node pulled from each peer, so unchanged stores can be skipped on
     /// the next pull. Keyed by peer address. In-memory only, so a restart re-pulls once.
     pub sync_heads: Arc<RwLock<HashMap<String, StoreHeads>>>,
+    /// If set, this node acts as a one-hop anonymous relay: every verified anonymous event it
+    /// receives is also forwarded to this address, which sees the relay's address rather than
+    /// the original submitter's. See `spec/04-transport.md`'s anonymity section.
+    pub anonymous_event_relay_target: Option<String>,
 }
 
 impl MeshState {
@@ -224,6 +228,7 @@ impl MeshState {
             )),
             instance_id: random_instance_id(),
             sync_heads: Arc::new(RwLock::new(HashMap::new())),
+            anonymous_event_relay_target: None,
         }
     }
 
@@ -294,6 +299,7 @@ impl MeshState {
             )),
             instance_id: random_instance_id(),
             sync_heads: Arc::new(RwLock::new(HashMap::new())),
+            anonymous_event_relay_target: None,
         })
     }
 }
@@ -393,12 +399,25 @@ async fn receive_anonymous_event(
     State(state): State<MeshState>,
     Json(submission): Json<AnonymousEventSubmission>,
 ) -> Response {
+    // Clone before `record` moves them, so a relay can forward the identical verified event.
+    let relay_event = submission.event.clone();
+    let relay_pow = submission.pow;
     let result = {
         let mut log = state.event_log.write().unwrap();
         log.record(submission.event, submission.pow)
     };
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // One-hop anonymity relay: the target sees this node's address, not the original
+            // submitter's. Best-effort -- a relay failure never rejects the submission, which
+            // the relay already recorded. See `spec/04-transport.md`.
+            if let Some(target) = state.anonymous_event_relay_target.clone() {
+                if let Err(e) = push_anonymous_event(&state.http, &target, &relay_event, relay_pow).await {
+                    tracing::warn!(target, error = %e, "failed to relay anonymous event");
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
 }
@@ -1385,7 +1404,10 @@ mod tests {
     use oag_crypto::PeerIdentity;
 
     async fn spawn(peers: Vec<String>) -> (String, MeshState) {
-        let state = MeshState::new(PeerIdentity::generate(), peers);
+        spawn_with_state(MeshState::new(PeerIdentity::generate(), peers)).await
+    }
+
+    async fn spawn_with_state(state: MeshState) -> (String, MeshState) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let router = router(state.clone());
@@ -1640,6 +1662,40 @@ mod tests {
 
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("prune-wire-old"), 0);
         assert_eq!(state_a.event_log.read().unwrap().corroboration_for("prune-wire-recent"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_configured_relay_forwards_anonymous_events_to_its_target() {
+        let (addr_target, state_target) = spawn(vec![]).await;
+
+        let mut relay_state = MeshState::new(PeerIdentity::generate(), vec![]);
+        relay_state.anonymous_event_relay_target = Some(addr_target.clone());
+        let (addr_relay, state_relay) = spawn_with_state(relay_state).await;
+
+        let event = valid_event("relay-test");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        push_anonymous_event(&reqwest::Client::new(), &addr_relay, &event, pow).await.unwrap();
+
+        // The relay recorded it locally, and the target received it via the relay.
+        assert_eq!(state_relay.event_log.read().unwrap().corroboration_for("relay-test"), 1);
+        assert_eq!(state_target.event_log.read().unwrap().corroboration_for("relay-test"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_relay_failure_does_not_reject_the_submission() {
+        let (_addr_target, _state_target) = spawn(vec![]).await;
+
+        // The relay is configured with an address that is not listening (port 0).
+        let mut relay_state = MeshState::new(PeerIdentity::generate(), vec![]);
+        relay_state.anonymous_event_relay_target = Some("http://127.0.0.1:0".to_string());
+        let (addr_relay, state_relay) = spawn_with_state(relay_state).await;
+
+        let event = valid_event("relay-failure-test");
+        let pow = ProofOfWork::solve(&event, crate::anonymous_event::BASE_DIFFICULTY_BITS);
+        // The submission still succeeds: the relay recorded it, and the failed forward is
+        // best-effort.
+        push_anonymous_event(&reqwest::Client::new(), &addr_relay, &event, pow).await.unwrap();
+        assert_eq!(state_relay.event_log.read().unwrap().corroboration_for("relay-failure-test"), 1);
     }
 
     #[tokio::test]

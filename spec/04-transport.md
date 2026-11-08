@@ -58,11 +58,14 @@ protocol entirely. Nothing in the base project needs to know this exists.
   a plain HTTP POST, not a choice the handler makes. The *payload* carries no identity by
   `anonymous_event.rs`'s own design — the *transport* carrying it here provides zero additional
   anonymity on top of that. Treat this endpoint as "gets an already-anonymous payload from A to
-  B," never as "hides who submitted it." A real anonymizing submission path (routing through an
-  intermediary that doesn't log source-to-content correlation, onion-style layered relaying, or
-  similar) is explicitly not built here — see "Open questions" below, and the identical
-  unresolved gap in the base project's own `spec/22-future-work.md` ("never ending morphing
-  encryption," traffic-analysis resistance). `GET /oag-mesh/v1/anonymous-event/search` reads
+  B," never as "hides who submitted it." A one-hop relay is now available as an explicit
+  configuration (`MeshState::anonymous_event_relay_target`): a node configured with a target
+  forwards every verified event to it, so the target sees the relay's address rather than the
+  original submitter's. That is a single trusted intermediary, not onion-style layered relaying
+  -- the relay itself sees the submitter's address and must be trusted not to log the
+  correlation. Full traffic-analysis resistance (the base project's `spec/22-future-work.md`
+  "never ending morphing encryption") remains unresolved. `GET
+  /oag-mesh/v1/anonymous-event/search` reads
   back this node's own log, filtered by kind/minimum severity/location prefix/recency -- see
   `spec/11-responder-search.md` for exactly what that is (a discovery primitive) and is not
   (dispatch, notification, or anything that identifies a responder).
@@ -139,9 +142,11 @@ in `spec/13-distributed-route-search.md`'s own "Tests" section.
 ## Open questions (genuinely unresolved)
 
 - **Network-level anonymity for `AnonymousEvent` submission.** Stated above, repeated here
-  because it's the single most important gap in this file: nothing here hides a reporter's
-  source IP from the peer they submit to. Proof-of-work (below) is an orthogonal mechanism and
-  does nothing about this.
+  because it's the single most important gap in this file: a plain POST reveals the reporter's
+  source IP to the peer they submit to, and proof-of-work is orthogonal. A one-hop relay
+  (`MeshState::anonymous_event_relay_target`) now hides the reporter's address from the final
+  target, but the relay itself sees it and must be trusted not to log the correlation. Onion-style
+  layered relaying and traffic-analysis resistance remain unresolved.
 - **Pull-based anti-entropy exists now (`spec/10-anti-entropy.md`), but it's a weaker trust
   model than push, not a free upgrade.** Merging a pulled snapshot trusts the source peer's own
   prior verification instead of re-deriving it -- see `spec/10`'s own "trade-off" section for
