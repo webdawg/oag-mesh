@@ -158,6 +158,9 @@ struct RecordedAcknowledgment {
 #[derive(Debug, Default)]
 pub struct ResponderAcknowledgmentLog {
     acknowledgments: HashMap<String, HashMap<PeerId, RecordedAcknowledgment>>,
+    /// Monotonic version, bumped whenever `acknowledgments` actually changes -- the heads check
+    /// in `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
+    sequence: u64,
 }
 
 impl ResponderAcknowledgmentLog {
@@ -188,8 +191,15 @@ impl ResponderAcknowledgmentLog {
             }
             _ => {
                 entry.insert(peer_id, candidate);
+                self.sequence += 1;
             }
         }
+    }
+
+    /// The current version stamp for the heads check -- see `transport::pull_and_merge` and
+    /// `spec/10-anti-entropy.md`.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Every responder currently claiming to handle `corroboration_nonce` (`active == true` in
@@ -242,7 +252,8 @@ impl ResponderAcknowledgmentLog {
     /// trust note as every other `merge_snapshot` in this crate: no signature is re-checked here,
     /// because a snapshot has already collapsed past the original signed
     /// `ResponderAcknowledgment` -- merging trusts the source peer's own prior verification.
-    pub fn merge_snapshot(&mut self, snapshot: Vec<ResponderAcknowledgmentSnapshot>) {
+    pub fn merge_snapshot(&mut self, snapshot: Vec<ResponderAcknowledgmentSnapshot>) -> bool {
+        let mut changed = false;
         for entry in snapshot {
             let by_peer = self.acknowledgments.entry(entry.corroboration_nonce).or_default();
             for rec in entry.acknowledgments {
@@ -258,10 +269,13 @@ impl ResponderAcknowledgmentLog {
                     Some(existing) if existing.acknowledged_at > candidate.acknowledged_at => {}
                     _ => {
                         by_peer.insert(peer_id, candidate);
+                        changed = true;
+                        self.sequence += 1;
                     }
                 }
             }
         }
+        changed
     }
 }
 

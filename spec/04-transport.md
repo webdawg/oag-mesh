@@ -91,10 +91,11 @@ partial guarantee.
 `broadcast_responder_acknowledgment` push to every configured peer, best-effort (one unreachable
 peer doesn't stop the others reaching it). A
 peer offline at broadcast time doesn't get left behind forever, though: pull-based anti-entropy
-now exists (`spec/10-anti-entropy.md`) -- `pull_and_merge`/`sync_with_all_peers` fetch a peer's
-*entire* current store and merge it in, closing that gap at the cost of a weaker, unverified
-trust model than push's own re-verification (see `spec/10`'s own "trade-off" section). Nothing
-calls this automatically; a caller decides when and how often.
+now exists (`spec/10-anti-entropy.md`) -- `pull_and_merge`/`sync_with_all_peers` check a peer's
+`GET /oag-mesh/v1/sync/heads` stamps and pull only the stores whose sequence changed, merging
+each into the puller's own, closing that gap at the cost of a weaker, unverified trust model
+than push's own re-verification (see `spec/10`'s own "trade-off" section). Nothing calls this
+automatically; a caller decides when and how often.
 
 `POST /oag-mesh/v1/anonymous-event` carries an `AnonymousEventSubmission { event, pow }` --
 `anonymous_event::AnonymousEventLog::record` enforces the escalating proof-of-work check
@@ -144,9 +145,12 @@ in `spec/13-distributed-route-search.md`'s own "Tests" section.
 - **Pull-based anti-entropy exists now (`spec/10-anti-entropy.md`), but it's a weaker trust
   model than push, not a free upgrade.** Merging a pulled snapshot trusts the source peer's own
   prior verification instead of re-deriving it -- see `spec/10`'s own "trade-off" section for
-  exactly what that costs. It's also still not incremental (every pull fetches a peer's whole
-  store, and `spawn_periodic_sync` just means doing that more often) -- a scheduling opt-in now
-  exists (`spawn_periodic_sync`), but with no default cadence, jitter, or cross-node coordination.
+  exactly what that costs. It's still not a delta sync -- a changed store is fetched whole --
+  but a heads check (`GET /oag-mesh/v1/sync/heads`) now skips stores that haven't changed since
+  the last pull, so an unchanged store costs one small stamp rather than a full snapshot. A
+  scheduling opt-in exists (`spawn_periodic_sync`, plus
+  `spawn_periodic_sync_with_jitter` for a random phase), with no default cadence or cross-node
+  coordination.
 - **Four of five submission types now cost real, escalating proof-of-work, but none of them stop
   a well-resourced attacker, and the fifth has a different problem entirely.**
   `AnonymousEvent` (`spec/03`'s "Anti-spam and anti-replay"), `ClaimReport` (`spec/05`'s

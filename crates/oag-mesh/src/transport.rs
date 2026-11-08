@@ -25,6 +25,7 @@
 //!   and does not verify, and `receive_membership_attestation`'s doc comment for its transport
 //!   treatment (signed, same as `BridgeDeclaration`/`ClaimReport`, same proof-of-work posture).
 
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, RwLock};
 
@@ -136,6 +137,36 @@ pub struct RouteSearchResponse {
     pub path: Option<Vec<MeshMember>>,
 }
 
+/// The wire shape for `GET /oag-mesh/v1/sync/heads` -- a cheap per-store version stamp so a
+/// puller can skip stores that haven't changed since its last pull, instead of fetching all
+/// five whole snapshots every time. See `spec/10-anti-entropy.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreHeads {
+    /// Identifies this process's lifetime. A restart gets a new instance id even if the
+    /// per-store sequences happen to line up, so a puller never mistakes a restarted peer's
+    /// state for unchanged.
+    pub instance_id: u64,
+    pub bridge_tree: u64,
+    pub claim_corroboration: u64,
+    pub membership_registry: u64,
+    pub anonymous_events: u64,
+    pub responder_acknowledgments: u64,
+}
+
+/// A per-process random id for `StoreHeads::instance_id`, from the same per-process random
+/// seed the jitter helper uses -- it only has to be unique per process lifetime, not
+/// cryptographic.
+fn random_instance_id() -> u64 {
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    hasher.finish()
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
@@ -161,6 +192,12 @@ pub struct MeshState {
     /// the griefing mitigation `spec/12-responder-acknowledgment.md` names as "rate limiting by
     /// identity". In-memory only, so a restart resets it.
     pub responder_ack_limiter: Arc<RateLimiter>,
+    /// Identifies this process's lifetime for the heads check -- see `StoreHeads` and
+    /// `spec/10-anti-entropy.md`.
+    pub instance_id: u64,
+    /// The last heads this node pulled from each peer, so unchanged stores can be skipped on
+    /// the next pull. Keyed by peer address. In-memory only, so a restart re-pulls once.
+    pub sync_heads: Arc<RwLock<HashMap<String, StoreHeads>>>,
 }
 
 impl MeshState {
@@ -182,6 +219,8 @@ impl MeshState {
                 RESPONDER_ACK_RATE_LIMIT_WINDOW,
                 RESPONDER_ACK_RATE_LIMIT_MAX,
             )),
+            instance_id: random_instance_id(),
+            sync_heads: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -250,6 +289,8 @@ impl MeshState {
                 RESPONDER_ACK_RATE_LIMIT_WINDOW,
                 RESPONDER_ACK_RATE_LIMIT_MAX,
             )),
+            instance_id: random_instance_id(),
+            sync_heads: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -276,6 +317,7 @@ pub fn router(state: MeshState) -> Router {
             "/oag-mesh/v1/claim-report/{claim_id}/best-fully-cross-checked",
             get(get_best_corroborated_value_fully_cross_checked),
         )
+        .route("/oag-mesh/v1/sync/heads", get(get_sync_heads))
         .route("/oag-mesh/v1/sync/bridge-tree", get(get_bridge_tree_snapshot))
         .route("/oag-mesh/v1/sync/claim-corroboration", get(get_claim_corroboration_snapshot))
         .route("/oag-mesh/v1/sync/membership-registry", get(get_membership_registry_snapshot))
@@ -800,6 +842,21 @@ async fn get_best_corroborated_value_fully_cross_checked(
     Json(serde_json::json!({ "result": result })).into_response()
 }
 
+/// Read-only: this node's per-store version stamps, for `pull_and_merge`'s heads check -- the
+/// cheap first step of a pull, so unchanged stores can be skipped. See
+/// `spec/10-anti-entropy.md`.
+async fn get_sync_heads(State(state): State<MeshState>) -> Response {
+    Json(StoreHeads {
+        instance_id: state.instance_id,
+        bridge_tree: state.tree.read().unwrap().sequence(),
+        claim_corroboration: state.claim_corroboration.read().unwrap().sequence(),
+        membership_registry: state.membership_registry.read().unwrap().sequence(),
+        anonymous_events: state.event_log.read().unwrap().sequence(),
+        responder_acknowledgments: state.responder_acknowledgments.read().unwrap().sequence(),
+    })
+    .into_response()
+}
+
 /// Read-only: this node's entire current `bridge::MeshTree`, as a snapshot -- the pull side of
 /// pull-based anti-entropy (`spec/10-anti-entropy.md`). Unlike the `best`/`best-cross-checked`
 /// endpoints, this isn't a computed answer to one query, it's this node's whole store, meant to
@@ -1047,26 +1104,106 @@ pub async fn broadcast_claim_report(state: &MeshState, report: &ClaimReport) {
 /// peer on that list could report corroboration it never actually received proof of; this
 /// function has no way to catch that. See `spec/10-anti-entropy.md` for this stated in full.
 pub async fn pull_and_merge(state: &MeshState, address: &str) {
-    match pull_bridge_tree(&state.http, address).await {
-        Ok(snapshot) => state.tree.write().unwrap().merge_snapshot(snapshot),
-        Err(e) => tracing::warn!(address, error = %e, "failed to pull bridge tree from peer"),
+    let remote_heads = match pull_heads(&state.http, address).await {
+        Ok(heads) => heads,
+        Err(e) => {
+            tracing::warn!(address, error = %e, "failed to pull sync heads from peer; falling back to a full pull");
+            pull_changed_stores(state, address, [true; 5]).await;
+            return;
+        }
+    };
+
+    let last_heads = state.sync_heads.read().unwrap().get(address).copied();
+    let changed = heads_changed(last_heads, remote_heads);
+    let all_ok = pull_changed_stores(state, address, changed).await;
+    if all_ok {
+        state.sync_heads.write().unwrap().insert(address.to_string(), remote_heads);
     }
-    match pull_claim_corroboration(&state.http, address).await {
-        Ok(snapshot) => state.claim_corroboration.write().unwrap().merge_snapshot(snapshot),
-        Err(e) => tracing::warn!(address, error = %e, "failed to pull claim corroboration from peer"),
+}
+
+/// Which of the five stores differ between the last heads this node pulled from a peer and
+/// the peer's current heads. A peer never seen before (or a restarted one, identified by a new
+/// `instance_id`) is fully pulled.
+fn heads_changed(last: Option<StoreHeads>, remote: StoreHeads) -> [bool; 5] {
+    match last {
+        None => [true; 5],
+        Some(last) => {
+            let instance_changed = last.instance_id != remote.instance_id;
+            [
+                instance_changed || last.bridge_tree != remote.bridge_tree,
+                instance_changed || last.claim_corroboration != remote.claim_corroboration,
+                instance_changed || last.membership_registry != remote.membership_registry,
+                instance_changed || last.anonymous_events != remote.anonymous_events,
+                instance_changed || last.responder_acknowledgments != remote.responder_acknowledgments,
+            ]
+        }
     }
-    match pull_membership_registry(&state.http, address).await {
-        Ok(snapshot) => state.membership_registry.write().unwrap().merge_snapshot(snapshot),
-        Err(e) => tracing::warn!(address, error = %e, "failed to pull membership registry from peer"),
+}
+
+/// Pulls and merges only the stores marked `true` in `changed`, returning whether every pull
+/// that was attempted succeeded. A failed store is left at its old state and, because the
+/// caller only records the remote heads when this returns `true`, retried on the next pull.
+async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5]) -> bool {
+    let [bridge, claims, membership, events, acks] = changed;
+    let mut all_ok = true;
+
+    if bridge {
+        match pull_bridge_tree(&state.http, address).await {
+            Ok(snapshot) => {
+                state.tree.write().unwrap().merge_snapshot(snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(address, error = %e, "failed to pull bridge tree from peer");
+                all_ok = false;
+            }
+        }
     }
-    match pull_anonymous_events(&state.http, address).await {
-        Ok(log) => state.event_log.write().unwrap().merge(log),
-        Err(e) => tracing::warn!(address, error = %e, "failed to pull anonymous events from peer"),
+    if claims {
+        match pull_claim_corroboration(&state.http, address).await {
+            Ok(snapshot) => {
+                state.claim_corroboration.write().unwrap().merge_snapshot(snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(address, error = %e, "failed to pull claim corroboration from peer");
+                all_ok = false;
+            }
+        }
     }
-    match pull_responder_acknowledgments(&state.http, address).await {
-        Ok(snapshot) => state.responder_acknowledgments.write().unwrap().merge_snapshot(snapshot),
-        Err(e) => tracing::warn!(address, error = %e, "failed to pull responder acknowledgments from peer"),
+    if membership {
+        match pull_membership_registry(&state.http, address).await {
+            Ok(snapshot) => {
+                state.membership_registry.write().unwrap().merge_snapshot(snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(address, error = %e, "failed to pull membership registry from peer");
+                all_ok = false;
+            }
+        }
     }
+    if events {
+        match pull_anonymous_events(&state.http, address).await {
+            Ok(log) => {
+                state.event_log.write().unwrap().merge(log);
+            }
+            Err(e) => {
+                tracing::warn!(address, error = %e, "failed to pull anonymous events from peer");
+                all_ok = false;
+            }
+        }
+    }
+    if acks {
+        match pull_responder_acknowledgments(&state.http, address).await {
+            Ok(snapshot) => {
+                state.responder_acknowledgments.write().unwrap().merge_snapshot(snapshot);
+            }
+            Err(e) => {
+                tracing::warn!(address, error = %e, "failed to pull responder acknowledgments from peer");
+                all_ok = false;
+            }
+        }
+    }
+
+    all_ok
 }
 
 /// Same best-effort pull-and-merge as `pull_and_merge`, against every peer on `state.peers` in
@@ -1142,6 +1279,15 @@ pub enum PullError {
     Request(String, reqwest::Error),
     #[error("{0} rejected the request with status {1}")]
     Rejected(String, StatusCode),
+}
+
+pub async fn pull_heads(http: &reqwest::Client, address: &str) -> Result<StoreHeads, PullError> {
+    let url = format!("{}/oag-mesh/v1/sync/heads", address.trim_end_matches('/'));
+    let response = http.get(&url).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+    if !response.status().is_success() {
+        return Err(PullError::Rejected(address.to_string(), response.status()));
+    }
+    response.json().await.map_err(|e| PullError::Request(address.to_string(), e))
 }
 
 pub async fn pull_bridge_tree(
@@ -2057,6 +2203,125 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_heads_reports_per_store_sequences() {
+        let (addr_a, state_a) = spawn(vec![]).await;
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("heads-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_a, &decl);
+        state_a.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let response = reqwest::get(format!("{addr_a}/oag-mesh/v1/sync/heads")).await.unwrap();
+        let heads: StoreHeads = response.json().await.unwrap();
+        assert!(heads.bridge_tree > 0);
+        assert_eq!(heads.claim_corroboration, 0);
+        assert_eq!(heads.membership_registry, 0);
+        assert_eq!(heads.anonymous_events, 0);
+        assert_eq!(heads.responder_acknowledgments, 0);
+        assert_ne!(heads.instance_id, 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_pull_after_no_changes_is_a_no_op() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("heads-noop".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        pull_and_merge(&state_catcher, &addr_source).await;
+        let first = state_catcher
+            .tree
+            .read()
+            .unwrap()
+            .corroboration_for("global", &MeshMember::BaseCluster("heads-noop".into()));
+
+        // Nothing changed on the source: the second pull must not regress anything.
+        pull_and_merge(&state_catcher, &addr_source).await;
+        let second = state_catcher
+            .tree
+            .read()
+            .unwrap()
+            .corroboration_for("global", &MeshMember::BaseCluster("heads-noop".into()));
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn a_change_to_one_store_is_picked_up_on_the_next_pull() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        // First pull: nothing to catch up on.
+        pull_and_merge(&state_catcher, &addr_source).await;
+
+        // Add a claim report to the source only.
+        let identity = PeerIdentity::generate();
+        let report =
+            crate::corroboration::build_and_sign(&identity, "heads-claim", "cluster-a", "blake3:abc", now_unix())
+                .unwrap();
+        let pow = solve_claim_pow(&state_source, &report);
+        state_source.claim_corroboration.write().unwrap().add(&report, pow, now_unix()).unwrap();
+
+        pull_and_merge(&state_catcher, &addr_source).await;
+        assert_eq!(
+            state_catcher
+                .claim_corroboration
+                .read()
+                .unwrap()
+                .cluster_corroboration_for("heads-claim", "blake3:abc"),
+            1
+        );
+    }
+
+    #[test]
+    fn heads_changed_treats_a_new_peer_as_fully_changed() {
+        let remote = StoreHeads {
+            instance_id: 1,
+            bridge_tree: 5,
+            claim_corroboration: 0,
+            membership_registry: 0,
+            anonymous_events: 0,
+            responder_acknowledgments: 0,
+        };
+        assert_eq!(heads_changed(None, remote), [true; 5]);
+    }
+
+    #[test]
+    fn heads_changed_detects_a_changed_store_and_a_restart() {
+        let last = StoreHeads {
+            instance_id: 1,
+            bridge_tree: 5,
+            claim_corroboration: 3,
+            membership_registry: 0,
+            anonymous_events: 0,
+            responder_acknowledgments: 0,
+        };
+        let remote = StoreHeads {
+            instance_id: 1,
+            bridge_tree: 6,
+            claim_corroboration: 3,
+            membership_registry: 0,
+            anonymous_events: 0,
+            responder_acknowledgments: 0,
+        };
+        assert_eq!(heads_changed(Some(last), remote), [true, false, false, false, false]);
+
+        let restarted = StoreHeads { instance_id: 2, ..remote };
+        assert_eq!(heads_changed(Some(last), restarted), [true, true, true, true, true]);
     }
 
     #[tokio::test]

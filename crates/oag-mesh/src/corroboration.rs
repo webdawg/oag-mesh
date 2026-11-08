@@ -272,6 +272,9 @@ pub struct FullyCrossCheckedAgreement {
 #[derive(Debug, Default)]
 pub struct ClaimCorroboration {
     reports: HashMap<String, Vec<RecordedReport>>,
+    /// Monotonic version, bumped whenever `reports` actually changes -- the heads check in
+    /// `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
+    sequence: u64,
 }
 
 impl ClaimCorroboration {
@@ -317,7 +320,14 @@ impl ClaimCorroboration {
             reporter_cluster: report.unsigned.reporter_cluster.clone(),
             observed_value_hash: report.unsigned.observed_value_hash.clone(),
         });
+        self.sequence += 1;
         Ok(peer_id)
+    }
+
+    /// The current version stamp for the heads check -- see `transport::pull_and_merge` and
+    /// `spec/10-anti-entropy.md`.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Groups every report recorded for `claim_id` by `observed_value_hash`, counts the number
@@ -513,7 +523,8 @@ impl ClaimCorroboration {
     /// down past its original signed `ClaimReport`. This trusts the source peer the same way
     /// `MeshState.peers`'s static configuration already does, but it is a weaker guarantee than
     /// `add`'s own independent verification. See `spec/10-anti-entropy.md`.
-    pub fn merge_snapshot(&mut self, snapshot: Vec<ClaimSnapshot>) {
+    pub fn merge_snapshot(&mut self, snapshot: Vec<ClaimSnapshot>) -> bool {
+        let mut changed = false;
         for claim in snapshot {
             let entry = self.reports.entry(claim.claim_id).or_default();
             for r in claim.reports {
@@ -526,12 +537,15 @@ impl ClaimCorroboration {
                         };
                         if !entry.contains(&recorded) {
                             entry.push(recorded);
+                            changed = true;
+                            self.sequence += 1;
                         }
                     }
                     Err(e) => tracing::warn!(peer_id = %r.peer_id, error = %e, "dropping unparsable peer id from persisted claim corroboration snapshot"),
                 }
             }
         }
+        changed
     }
 }
 

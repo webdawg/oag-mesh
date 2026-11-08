@@ -241,6 +241,9 @@ pub struct MembershipRegistry {
     /// count, for the same reason `bridge::MeshTree::edges` is -- the same attester re-asserting
     /// the same fact must not inflate corroboration.
     attestations: HashMap<(String, PeerId), HashSet<PeerId>>,
+    /// Monotonic version, bumped whenever `attestations` actually changes -- the heads check in
+    /// `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
+    sequence: u64,
 }
 
 impl MembershipRegistry {
@@ -280,11 +283,21 @@ impl MembershipRegistry {
         if !pow.satisfies(&attestation.unsigned, required_bits) {
             return Err(MembershipError::InsufficientProofOfWork { required_bits });
         }
-        self.attestations
+        let changed = self
+            .attestations
             .entry((attestation.unsigned.cluster.clone(), subject_peer_id))
             .or_default()
             .insert(attester_peer_id);
+        if changed {
+            self.sequence += 1;
+        }
         Ok((attester_peer_id, subject_peer_id))
+    }
+
+    /// The current version stamp for the heads check -- see `transport::pull_and_merge` and
+    /// `spec/10-anti-entropy.md`.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// How many *distinct* peers have attested that `subject_peer_id` belongs to `cluster`. `0`
@@ -339,7 +352,8 @@ impl MembershipRegistry {
     /// attestation down past its original signed `MembershipAttestation`. This trusts the source
     /// peer the same way `MeshState.peers`'s static configuration already does, but it is a
     /// weaker guarantee than `add`'s own independent verification. See `spec/10-anti-entropy.md`.
-    pub fn merge_snapshot(&mut self, snapshot: Vec<MembershipSnapshot>) {
+    pub fn merge_snapshot(&mut self, snapshot: Vec<MembershipSnapshot>) -> bool {
+        let mut changed = false;
         for entry in snapshot {
             let subject_peer_id: PeerId = match entry.subject_peer_id.parse() {
                 Ok(peer_id) => peer_id,
@@ -357,8 +371,16 @@ impl MembershipRegistry {
                     Err(e) => tracing::warn!(peer_id = %peer_id_str, error = %e, "dropping unparsable attester peer id from persisted membership snapshot"),
                 }
             }
-            self.attestations.entry((entry.cluster, subject_peer_id)).or_default().extend(attesters);
+            let key = (entry.cluster, subject_peer_id);
+            let before = self.attestations.get(&key).map(HashSet::len).unwrap_or(0);
+            let set = self.attestations.entry(key).or_default();
+            set.extend(attesters);
+            if set.len() > before {
+                changed = true;
+                self.sequence += 1;
+            }
         }
+        changed
     }
 }
 

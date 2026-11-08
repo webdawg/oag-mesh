@@ -25,7 +25,12 @@ snapshot rather than an answer to one query:
   directly, same as this store's disk persistence)
 - `GET /oag-mesh/v1/sync/responder-acknowledgments` → `Vec<responder::ResponderAcknowledgmentSnapshot>`
 
-`pull_and_merge(state, address)` fetches all five from one peer and merges each into `state`'s
+A sixth, cheaper endpoint, `GET /oag-mesh/v1/sync/heads`, returns a `StoreHeads` stamp: a
+per-process `instance_id` plus one monotonic sequence per store, bumped whenever that store's
+state actually changes. `pull_and_merge` fetches heads first and pulls only the stores whose
+sequence changed since its last pull from that peer, instead of all five every time.
+
+`pull_and_merge(state, address)` merges each store into `state`'s
 own store via a new `merge_snapshot`/`merge` method on each: `MeshTree::merge_snapshot` **unions**
 each edge's declaring-peer set, `ClaimCorroboration::merge_snapshot` appends any `(peer_id,
 reporter_cluster, observed_value_hash)` not already present for its `claim_id`,
@@ -74,12 +79,15 @@ with -- this crate takes no position on that, beyond stating the trade-off exist
 
 ## What this explicitly is not (yet)
 
-- **Not incremental.** Every pull fetches a peer's *entire* store, every time -- no "since
-  sequence number N" delta sync like the base project's own `oag-sync` `hello`/`heads` protocol
-  uses. Fine at this crate's current scale, a real cost once any store grows large.
-  `spawn_periodic_sync` makes this worse in one specific way worth naming: running it on a short
-  interval means re-fetching every store's *entire* contents that often, not just the since-last-
-  tick delta -- the convenience of scheduling and the cost of non-incremental pulls compound.
+- **Not a delta sync, but no longer a full pull every time.** `GET /oag-mesh/v1/sync/heads`
+  returns a per-store version stamp, and `pull_and_merge` pulls only the stores whose stamp
+  changed since its last pull from that peer -- the cheap "who's changed" check the base
+  project's `oag-sync` `hello`/`heads` protocol uses. When a store *has* changed, the pull
+  still fetches that store's entire current snapshot, not a delta of what changed; a store that
+  hasn't changed costs one small heads response instead of a full snapshot. A peer that restarts
+  gets a new `instance_id`, so a puller never mistakes its reloaded state for unchanged.
+  `spawn_periodic_sync` still re-fetches a changed store's whole contents on a short interval --
+  the convenience of scheduling and the cost of whole-store pulls compound.
 - **Scheduling now exists (`spawn_periodic_sync`), but it's still an explicit opt-in with no
   default cadence.** Nothing constructs a `MeshState` and starts syncing on its own; a caller
   calls `spawn_periodic_sync` and picks an `interval` appropriate to its own deployment. No
@@ -111,7 +119,7 @@ unions attester sets the same way. `crates/oag-mesh/src/anonymous_event.rs` adds
 genuinely new events and skips an exact duplicate, while keeping an unrelated nonce distinct.
 `crates/oag-mesh/src/responder.rs` adds 1: `merge_snapshot` keeps whichever of a local and
 incoming entry is more recent per responder, in both directions (see `spec/12`'s own tests for
-the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 8 tests, real axum
+the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 13 tests, real axum
 servers, real HTTP round trips: `pull_and_merge` brings a node that started completely empty
 fully up to date across all five stores in one call, and a second, repeated call doesn't inflate
 anything (idempotent); `sync_with_all_peers` pulls from every configured peer and merges both;
@@ -121,5 +129,10 @@ that's added to a peer only *after* the schedule already started, across real wa
 (not just a single pull at spawn time); aborting the returned handle actually stops further
 syncing -- data added to a peer after the abort never reaches the catcher even after waiting
 long enough that further ticks would otherwise have occurred; `spawn_periodic_sync_with_jitter`
-still syncs across real wall-clock ticks with a random phase; and two unit tests pin the jitter
-helper's bounds (always below the maximum, and zero when the maximum is zero).
+still syncs across real wall-clock ticks with a random phase; two unit tests pin the jitter
+helper's bounds (always below the maximum, and zero when the maximum is zero); the heads
+endpoint reports a per-store sequence and a nonzero instance id after a store changes; a
+second pull with no source changes is a no-op; a change to one store is picked up on the next
+pull; and two unit tests pin `heads_changed`'s logic (a new peer is fully pulled; a changed
+store is pulled while unchanged stores are skipped; a restarted peer's new instance id forces
+a full pull).

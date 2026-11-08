@@ -307,6 +307,9 @@ impl AnonymousEvent {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AnonymousEventLog {
     events: std::collections::HashMap<String, Vec<AnonymousEvent>>,
+    /// Monotonic version, bumped whenever `events` actually changes -- the heads check in
+    /// `transport::pull_and_merge`; see `spec/10-anti-entropy.md`.
+    sequence: u64,
 }
 
 impl AnonymousEventLog {
@@ -335,7 +338,14 @@ impl AnonymousEventLog {
             return Err(AnonymousEventError::InsufficientProofOfWork { required_bits });
         }
         self.events.entry(event.corroboration_nonce.clone()).or_default().push(event);
+        self.sequence += 1;
         Ok(())
+    }
+
+    /// The current version stamp for the heads check -- see `transport::pull_and_merge` and
+    /// `spec/10-anti-entropy.md`.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// How many reports share this nonce -- the corroboration count for an anonymous event. Each
@@ -372,15 +382,19 @@ impl AnonymousEventLog {
     /// trusted peer, not raw untrusted submissions. See that spec file for exactly what trust
     /// this assumption rests on, and why it's weaker than the push path's per-message
     /// verification.
-    pub fn merge(&mut self, other: AnonymousEventLog) {
+    pub fn merge(&mut self, other: AnonymousEventLog) -> bool {
+        let mut changed = false;
         for (nonce, events) in other.events {
             let existing = self.events.entry(nonce).or_default();
             for event in events {
                 if !existing.contains(&event) {
                     existing.push(event);
+                    changed = true;
+                    self.sequence += 1;
                 }
             }
         }
+        changed
     }
 }
 

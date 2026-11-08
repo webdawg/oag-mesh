@@ -236,6 +236,10 @@ pub struct MeshTree {
     /// would make corroboration free to fake by simply repeating yourself), only genuinely
     /// distinct peers asserting it independently do.
     edges: HashMap<(String, MeshMember), HashSet<PeerId>>,
+    /// Monotonic version, bumped whenever `edges` actually changes. The heads check in
+    /// `transport::pull_and_merge` compares these across peers to skip unchanged stores; see
+    /// `spec/10-anti-entropy.md`.
+    sequence: u64,
 }
 
 impl MeshTree {
@@ -273,11 +277,21 @@ impl MeshTree {
         if !pow.satisfies(&declaration.unsigned, required_bits)? {
             return Err(BridgeError::InsufficientProofOfWork { required_bits });
         }
-        self.edges
+        let changed = self
+            .edges
             .entry((declaration.unsigned.mesh_group.clone(), declaration.unsigned.member.clone()))
             .or_default()
             .insert(peer_id);
+        if changed {
+            self.sequence += 1;
+        }
         Ok(peer_id)
+    }
+
+    /// The current version stamp for the heads check -- see `transport::pull_and_merge` and
+    /// `spec/10-anti-entropy.md`.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// How many *distinct* peers have declared that `member` belongs to `mesh_group`. `0` if
@@ -462,7 +476,8 @@ impl MeshTree {
     /// any peer on `MeshState.peers`'s static list, not a new or weaker boundary introduced here
     /// -- but it is a different (weaker) guarantee than `add`'s own independent verification, and
     /// callers should not confuse the two. See `spec/10-anti-entropy.md` for this stated plainly.
-    pub fn merge_snapshot(&mut self, snapshot: Vec<BridgeEdgeSnapshot>) {
+    pub fn merge_snapshot(&mut self, snapshot: Vec<BridgeEdgeSnapshot>) -> bool {
+        let mut changed = false;
         for edge in snapshot {
             let mut peers = HashSet::new();
             for peer_id_str in edge.peers {
@@ -473,8 +488,16 @@ impl MeshTree {
                     Err(e) => tracing::warn!(peer_id = %peer_id_str, error = %e, "dropping unparsable peer id from persisted bridge snapshot"),
                 }
             }
-            self.edges.entry((edge.mesh_group, edge.member)).or_default().extend(peers);
+            let key = (edge.mesh_group, edge.member);
+            let before = self.edges.get(&key).map(HashSet::len).unwrap_or(0);
+            let set = self.edges.entry(key).or_default();
+            set.extend(peers);
+            if set.len() > before {
+                changed = true;
+                self.sequence += 1;
+            }
         }
+        changed
     }
 }
 
