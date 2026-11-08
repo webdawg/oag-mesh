@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod corroboration;
 pub mod membership;
 pub mod persistence;
+pub mod rate_limit;
 pub mod responder;
 pub mod transport;
 
@@ -38,12 +39,14 @@ pub use membership::{
     UnsignedMembershipAttestation, BASE_MEMBERSHIP_DIFFICULTY_BITS, MEMBERSHIP_DIFFICULTY_STEP_BITS,
 };
 pub use persistence::PersistenceError;
+pub use rate_limit::TokenBucket;
 pub use responder::{
     RecordedAcknowledgmentSnapshot, ResponderAcknowledgment, ResponderAcknowledgmentError,
     ResponderAcknowledgmentLog, ResponderAcknowledgmentSnapshot, UnsignedResponderAcknowledgment,
 };
 pub use transport::{
-    find_route_across_mesh, spawn_periodic_sync, BridgeDeclarationSubmission, ClaimReportSubmission,
-    MembershipAttestationSubmission, MeshState, PullError, PushError, ResponderAcknowledgmentSubmission,
-    RouteSearchRequest, RouteSearchResponse,
+    find_route_across_mesh, find_route_across_mesh_with_budget, spawn_periodic_sync,
+    BridgeDeclarationSubmission, ClaimReportSubmission, MembershipAttestationSubmission, MeshState,
+    PullError, PushError, ResponderAcknowledgmentSubmission, RouteSearchRequest, RouteSearchResponse,
+    DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET, ROUTE_SEARCH_RATE_LIMIT_CAPACITY, ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
 };

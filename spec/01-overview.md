@@ -201,11 +201,13 @@ collection, vault, or release capability. See that RFC for current requirements 
 - **Distributed route search (`spec/13-distributed-route-search.md`) trades amplification cost
   for a chance at finding a path no single node knows end-to-end, and cannot stitch together
   knowledge split across peers who haven't already consolidated it.** `find_route_across_mesh`'s
-  hop budget is the only hard termination guarantee -- its own "already asked" bookkeeping
-  reduces redundant re-contacting of the same peer within one search, it does not bound the
-  total fan-out across the whole search tree, so a request can issue real network traffic
-  proportional to `branching_factor^hops` in the worst case, with no rate limiting on the
-  receiving endpoint. And because each hop's answer comes from exactly one node's own complete
-  local `shortest_path`, a path whose two halves are known only by two *different* peers that
-  haven't pulled each other's data (`spec/10-anti-entropy.md`) is invisible to this search even
-  though it's real -- demonstrated directly by one of `spec/13`'s own tests, not just asserted.
+  hop budget is the hard termination guarantee, and a per-search fan-out budget now caps the
+  total outbound requests a single search can cause -- divided among a node's peers as the
+  search propagates, so the sum is bounded no matter how the branches split. A node-wide token
+  bucket rate-limits inbound requests with `429`/`Retry-After`; it is not per-requester, because
+  the transport has no requester identity, and it does not authenticate anyone. See `spec/13`'s
+  own "Anti-amplification" section. And because each hop's answer comes from exactly one node's
+  own complete local `shortest_path`, a path whose two halves are known only by two *different*
+  peers that haven't pulled each other's data (`spec/10-anti-entropy.md`) is invisible to this
+  search even though it's real -- demonstrated directly by one of `spec/13`'s own tests, not
+  just asserted.

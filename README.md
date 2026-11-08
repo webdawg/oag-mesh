@@ -132,6 +132,7 @@ identity, all the way down — even an attester's own standing in a cluster is i
 a bad-faith responder falsely claiming to handle events (proof-of-work wouldn't help here
 either — see `spec/12`), full dispatch-to-a-responder, pull-based anti-entropy's own stated
 trade-off — it trusts a peer's prior verification instead of re-checking a signature, a weaker
-guarantee than push — and distributed route search's own amplification cost and inability to
-stitch together knowledge split across peers who haven't already synced. See
-`spec/01-overview.md`.
+guarantee than push — and distributed route search's own residual limits: a per-search fan-out
+budget and a node-wide rate limiter now bound its amplification cost, but neither
+authenticates callers (the transport has no requester identity), and it still cannot stitch
+together knowledge split across peers who haven't already synced. See `spec/01-overview.md`.

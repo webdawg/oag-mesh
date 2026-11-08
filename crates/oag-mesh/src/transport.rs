@@ -40,7 +40,17 @@ use crate::anonymous_event::{AnonymousEvent, AnonymousEventLog, EventFilter, Pro
 use crate::bridge::{BridgeDeclaration, BridgeError, BridgeProofOfWork, MeshMember, MeshTree};
 use crate::corroboration::{ClaimCorroboration, ClaimReport, ClaimReportError, ClaimReportProofOfWork};
 use crate::membership::{MembershipAttestation, MembershipError, MembershipProofOfWork, MembershipRegistry};
+use crate::rate_limit::TokenBucket;
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
+
+/// Default cap on how many outbound `route-search` requests one distributed search may trigger
+/// across its whole fan-out tree -- see `spec/13-distributed-route-search.md`'s
+/// "Anti-amplification" section.
+pub const DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET: u32 = 256;
+/// Default token-bucket capacity for inbound `route-search` requests on one node.
+pub const ROUTE_SEARCH_RATE_LIMIT_CAPACITY: u32 = 8;
+/// Default token-bucket refill rate, in tokens per second, for inbound `route-search` requests.
+pub const ROUTE_SEARCH_RATE_LIMIT_PER_SEC: f64 = 2.0;
 
 /// The wire shape for `POST /oag-mesh/v1/anonymous-event` -- the event plus the proof-of-work
 /// that must satisfy `AnonymousEventLog::required_difficulty_bits` for this event's nonce
@@ -95,7 +105,10 @@ pub struct ResponderAcknowledgmentSubmission {
 /// address already contacted *in this search*, so the same peer isn't asked twice as the query
 /// fans out across hops -- a best-effort redundancy reducer, not what actually bounds the
 /// search; `remaining_hops` reaching `0` is what guarantees this always terminates, covered in
-/// `spec/13-distributed-route-search.md`.
+/// `spec/13-distributed-route-search.md`. `fanout_budget` is the total number of outbound
+/// `route-search` requests this search may still trigger across its whole fan-out tree,
+/// divided among a node's peers as it propagates -- the anti-amplification bound covered in
+/// that same file's "Anti-amplification" section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteSearchRequest {
     pub from: MeshMember,
@@ -103,6 +116,7 @@ pub struct RouteSearchRequest {
     pub min_corroboration: usize,
     pub remaining_hops: u32,
     pub already_asked: Vec<String>,
+    pub fanout_budget: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +141,10 @@ pub struct MeshState {
     /// the base project's own `[transfer].relay_peers`/`[gateway].query_peers`.
     pub peers: Arc<Vec<String>>,
     pub http: Arc<reqwest::Client>,
+    /// Node-wide token bucket for inbound `POST /oag-mesh/v1/route-search` requests -- the one
+    /// endpoint that can turn a single request into real outbound fan-out traffic. In-memory
+    /// only, so a restart resets it; see `spec/13`'s "Anti-amplification" section.
+    pub route_search_limiter: Arc<RwLock<TokenBucket>>,
 }
 
 impl MeshState {
@@ -140,6 +158,10 @@ impl MeshState {
             responder_acknowledgments: Arc::new(RwLock::new(ResponderAcknowledgmentLog::new())),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
+            route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
+                ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
+                ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+            ))),
         }
     }
 
@@ -200,6 +222,10 @@ impl MeshState {
             responder_acknowledgments: Arc::new(RwLock::new(responder_acknowledgments)),
             peers: Arc::new(peers),
             http: Arc::new(reqwest::Client::new()),
+            route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
+                ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
+                ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+            ))),
         })
     }
 }
@@ -473,31 +499,47 @@ async fn search_for_route(
     min_corroboration: usize,
     remaining_hops: u32,
     already_asked: &[String],
+    fanout_budget: u32,
 ) -> Option<Vec<MeshMember>> {
     if let Some(path) = state.tree.read().unwrap().shortest_path(from, target, min_corroboration) {
         return Some(path);
     }
-    if remaining_hops == 0 {
+    if remaining_hops == 0 || fanout_budget == 0 {
         return None;
     }
 
-    let mut newly_asked = already_asked.to_vec();
     let peers_to_ask: Vec<String> =
         state.peers.iter().filter(|peer| !already_asked.contains(peer)).cloned().collect();
+    if peers_to_ask.is_empty() {
+        return None;
+    }
+
+    // Spend one unit of the search's fan-out budget per outbound request, and divide what is
+    // left among the peers this node asks -- so the sum of all outbound requests a single
+    // search can cause is bounded by the budget it started with, no matter how the fan-out
+    // branches. See `spec/13`'s "Anti-amplification" section.
+    let ask_count = peers_to_ask.len().min(fanout_budget as usize);
+    let peers_to_ask: Vec<String> = peers_to_ask.into_iter().take(ask_count).collect();
+    let remaining_for_children = fanout_budget - ask_count as u32;
+    let per_child_budget = remaining_for_children / ask_count as u32;
+
+    let mut newly_asked = already_asked.to_vec();
     newly_asked.extend(peers_to_ask.iter().cloned());
+
+    let child_request = RouteSearchRequest {
+        from: from.clone(),
+        target: target.clone(),
+        min_corroboration,
+        remaining_hops: remaining_hops - 1,
+        already_asked: newly_asked,
+        fanout_budget: per_child_budget,
+    };
 
     let mut tasks = tokio::task::JoinSet::new();
     for peer in peers_to_ask {
         let http = state.http.clone();
-        let from = from.clone();
-        let target = target.clone();
-        let asked = newly_asked.clone();
-        tasks.spawn(async move {
-            push_route_search(&http, &peer, &from, &target, min_corroboration, remaining_hops - 1, &asked)
-                .await
-                .ok()
-                .flatten()
-        });
+        let request = child_request.clone();
+        tasks.spawn(async move { push_route_search(&http, &peer, &request).await.ok().flatten() });
     }
 
     let mut best: Option<Vec<MeshMember>> = None;
@@ -516,6 +558,30 @@ async fn search_for_route(
 /// the fan-out to this node's own peers if its own local `MeshTree` doesn't already have an
 /// answer.
 async fn receive_route_search(State(state): State<MeshState>, Json(request): Json<RouteSearchRequest>) -> Response {
+    // Node-wide token bucket: this transport has no requester identity, so it cannot tell one
+    // caller from another. See `spec/13`'s "Anti-amplification" section for exactly what this
+    // does and does not bound.
+    let retry_after = {
+        let mut limiter = state.route_search_limiter.write().unwrap();
+        if limiter.try_take() {
+            None
+        } else {
+            Some(limiter.retry_after())
+        }
+    };
+    if let Some(retry_after) = retry_after {
+        let retry_after_seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_seconds.to_string())],
+            Json(serde_json::json!({
+                "error": "route search rate limit exceeded",
+                "retry_after_seconds": retry_after_seconds,
+            })),
+        )
+            .into_response();
+    }
+
     let path = search_for_route(
         &state,
         &request.from,
@@ -523,6 +589,7 @@ async fn receive_route_search(State(state): State<MeshState>, Json(request): Jso
         request.min_corroboration,
         request.remaining_hops,
         &request.already_asked,
+        request.fanout_budget,
     )
     .await;
     Json(RouteSearchResponse { path }).into_response()
@@ -549,28 +616,42 @@ pub async fn find_route_across_mesh(
     min_corroboration: usize,
     max_hops: u32,
 ) -> Option<Vec<MeshMember>> {
-    search_for_route(state, from, target, min_corroboration, max_hops, &[]).await
+    find_route_across_mesh_with_budget(
+        state,
+        from,
+        target,
+        min_corroboration,
+        max_hops,
+        DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET,
+    )
+    .await
+}
+
+/// Same as `find_route_across_mesh`, with an explicit cap on how many outbound `route-search`
+/// requests this search may trigger across its whole fan-out tree -- divided among a node's
+/// peers as the search propagates, so the total is bounded by `fanout_budget` no matter how the
+/// branches split. `DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET` is what `find_route_across_mesh` uses;
+/// `0` disables all forwarding (local knowledge only). See `spec/13`'s "Anti-amplification"
+/// section.
+pub async fn find_route_across_mesh_with_budget(
+    state: &MeshState,
+    from: &MeshMember,
+    target: &MeshMember,
+    min_corroboration: usize,
+    max_hops: u32,
+    fanout_budget: u32,
+) -> Option<Vec<MeshMember>> {
+    search_for_route(state, from, target, min_corroboration, max_hops, &[], fanout_budget).await
 }
 
 pub async fn push_route_search(
     http: &reqwest::Client,
     address: &str,
-    from: &MeshMember,
-    target: &MeshMember,
-    min_corroboration: usize,
-    remaining_hops: u32,
-    already_asked: &[String],
+    request: &RouteSearchRequest,
 ) -> Result<Option<Vec<MeshMember>>, PullError> {
     let url = format!("{}/oag-mesh/v1/route-search", address.trim_end_matches('/'));
-    let request = RouteSearchRequest {
-        from: from.clone(),
-        target: target.clone(),
-        min_corroboration,
-        remaining_hops,
-        already_asked: already_asked.to_vec(),
-    };
     let response =
-        http.post(&url).json(&request).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
+        http.post(&url).json(request).send().await.map_err(|e| PullError::Request(address.to_string(), e))?;
     if !response.status().is_success() {
         return Err(PullError::Rejected(address.to_string(), response.status()));
     }
@@ -1909,5 +1990,107 @@ mod tests {
             state_a.tree.read().unwrap().shortest_path(&from, &to, 1),
             Some(vec![from, MeshMember::MeshGroup("north-america".into()), to])
         );
+    }
+
+    #[tokio::test]
+    async fn find_route_across_mesh_with_zero_fanout_budget_makes_no_network_call() {
+        let (addr_b, state_b) = spawn(vec![]).await;
+        let (_addr_a, state_a) = spawn(vec![addr_b.clone()]).await;
+
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("budget-zero".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_b, &decl);
+        state_b.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("budget-zero".into());
+
+        // B knows the path; A has a peer but a fan-out budget of 0, so it must not ask anyone.
+        assert!(state_a.tree.read().unwrap().shortest_path(&from, &to, 1).is_none());
+        assert_eq!(
+            find_route_across_mesh_with_budget(&state_a, &from, &to, 1, 8, 0).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_budget_is_divided_across_hops() {
+        let (addr_c, state_c) = spawn(vec![]).await;
+        let (addr_b, _state_b) = spawn(vec![addr_c.clone()]).await;
+        let (_addr_a, state_a) = spawn(vec![addr_b.clone()]).await;
+
+        // Only C -- two hops away from A, through B -- has the data.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("budget-chain".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_c, &decl);
+        state_c.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("budget-chain".into());
+
+        // Budget 1: A asks B (spends its only unit), B gets 0 and cannot forward to C.
+        assert_eq!(
+            find_route_across_mesh_with_budget(&state_a, &from, &to, 1, 8, 1).await,
+            None
+        );
+
+        // Budget 2: A asks B (spends 1), B gets 1 and forwards to C (spends 1).
+        assert_eq!(
+            find_route_across_mesh_with_budget(&state_a, &from, &to, 1, 8, 2).await,
+            Some(vec![from, to])
+        );
+    }
+
+    #[tokio::test]
+    async fn route_search_rate_limiter_rejects_a_burst_and_recovers() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+        let request = RouteSearchRequest {
+            from: MeshMember::MeshGroup("global".into()),
+            target: MeshMember::BaseCluster("rate-limit".into()),
+            min_corroboration: 1,
+            remaining_hops: 0,
+            already_asked: vec![],
+            fanout_budget: 1,
+        };
+
+        // Capacity is 8: the first 8 succeed, the 9th is rejected with 429 + Retry-After.
+        for _ in 0..ROUTE_SEARCH_RATE_LIMIT_CAPACITY {
+            let response = http
+                .post(format!("{addr_a}/oag-mesh/v1/route-search"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/route-search"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+
+        // After the bucket refills, requests succeed again.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/route-search"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -173,9 +173,10 @@ in `spec/13-distributed-route-search.md`'s own "Tests" section.
   "aggregate, nothing sensitive" posture in the base project) or needs gating depends on what real
   `claim_id`/`observed_value_hash` content ends up flowing through a real deployment, which isn't
   decided yet.
-- **`POST /oag-mesh/v1/route-search` has no auth and no rate limiting, with a sharper
-  consequence than the other endpoints' lack of auth: it triggers real outbound network traffic
-  to a node's own peers.** Anyone who can reach the listen address can start a search that fans
-  out across however many hops they ask for, bounded only by `max_hops` and however many peers
-  each node along the way happens to have configured -- see `spec/13-distributed-route-search.md`
-  for the worst-case amplification this allows.
+- **`POST /oag-mesh/v1/route-search` now has a per-search fan-out budget and a node-wide rate
+  limiter, but neither is authentication.** See `spec/13-distributed-route-search.md`'s
+  "Anti-amplification" section: the fan-out budget caps the total outbound requests a single
+  search can cause, and the token bucket rate-limits inbound requests with
+  `429`/`Retry-After`. The bucket is node-wide, not per-requester, because the transport has no
+  requester identity. A real deployment exposing this to anything less trusted than its own
+  operator-configured peer list still needs its own authentication and per-requester limits.
