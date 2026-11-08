@@ -25,6 +25,7 @@
 //!   and does not verify, and `receive_membership_attestation`'s doc comment for its transport
 //!   treatment (signed, same as `BridgeDeclaration`/`ClaimReport`, same proof-of-work posture).
 
+use std::hash::{BuildHasher, Hasher};
 use std::sync::{Arc, RwLock};
 
 use axum::extract::{Path, Query, State};
@@ -1030,13 +1031,47 @@ pub async fn sync_with_all_peers(state: &MeshState) {
 /// what `tokio::task::JoinHandle::abort`'s usual "cancel at the next `.await` point" already
 /// gives.
 pub fn spawn_periodic_sync(state: MeshState, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+    spawn_periodic_sync_with_jitter(state, interval, std::time::Duration::ZERO)
+}
+
+/// Same as `spawn_periodic_sync`, with an added random jitter of up to `max_jitter` on each
+/// tick -- the specific thing `spec/10-anti-entropy.md`'s "no jitter/coordination" gap named.
+/// Without jitter, every node that starts a periodic sync at the same wall-clock moment pulls
+/// from every other peer at the same moment, forever; a per-node random phase breaks that
+/// synchronization. `spawn_periodic_sync` keeps the old fixed-interval behavior; this variant
+/// lets a caller pick its own jitter range, and `max_jitter = 0` is exactly the old behavior.
+///
+/// The jitter is drawn from `std::collections::hash_map::RandomState`'s per-process random seed,
+/// not a cryptographic RNG -- it only has to desynchronize independent nodes, not resist an
+/// adversary. It is not persisted, so a restart re-randomizes the phase.
+pub fn spawn_periodic_sync_with_jitter(
+    state: MeshState,
+    interval: std::time::Duration,
+    max_jitter: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
         loop {
-            ticker.tick().await;
             sync_with_all_peers(&state).await;
+            let jitter = random_jitter(max_jitter);
+            tokio::time::sleep(interval + jitter).await;
         }
     })
+}
+
+/// A random duration in `[0, max)`, or `Duration::ZERO` when `max` is zero.
+fn random_jitter(max: std::time::Duration) -> std::time::Duration {
+    if max.is_zero() {
+        return std::time::Duration::ZERO;
+    }
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    let nanos = max.as_nanos().max(1) as u64;
+    std::time::Duration::from_nanos(hasher.finish() % nanos)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1867,6 +1902,53 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_periodic_sync_with_jitter_still_syncs() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        let handle = spawn_periodic_sync_with_jitter(
+            state_catcher.clone(),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(50),
+        );
+
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("jitter-sync-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            state_catcher
+                .tree
+                .read()
+                .unwrap()
+                .corroboration_for("global", &MeshMember::BaseCluster("jitter-sync-test".into())),
+            1
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn random_jitter_is_bounded_by_the_maximum() {
+        let max = std::time::Duration::from_millis(500);
+        for _ in 0..100 {
+            assert!(random_jitter(max) < max);
+        }
+    }
+
+    #[test]
+    fn zero_maximum_jitter_is_zero() {
+        assert_eq!(random_jitter(std::time::Duration::ZERO), std::time::Duration::ZERO);
     }
 
     #[tokio::test]

@@ -83,8 +83,13 @@ with -- this crate takes no position on that, beyond stating the trade-off exist
 - **Scheduling now exists (`spawn_periodic_sync`), but it's still an explicit opt-in with no
   default cadence.** Nothing constructs a `MeshState` and starts syncing on its own; a caller
   calls `spawn_periodic_sync` and picks an `interval` appropriate to its own deployment. No
-  jitter/backoff, no adaptive interval, no coordination across multiple nodes to avoid every peer
-  pulling from every other peer at the same wall-clock moment.
+  adaptive interval, no cross-node coordination, and no backoff remain; jitter now exists as
+  `spawn_periodic_sync_with_jitter`, which adds a random phase of up to a caller-chosen
+  `max_jitter` per tick so nodes that start together don't pull from each other at the same
+  wall-clock moment forever. `spawn_periodic_sync` keeps the old fixed-interval behavior, and
+  `max_jitter = 0` is exactly that. The jitter is drawn from a per-process random seed, not a
+  cryptographic RNG -- it only has to desynchronize independent nodes, not resist an adversary,
+  and a restart re-randomizes the phase.
 - **Does not re-verify anything.** Stated above, the central caveat: a pull trusts the source
   peer's own verification, it does not re-derive it.
 - **Mostly no conflict resolution beyond union -- `ResponderAcknowledgmentLog` is the one
@@ -106,8 +111,8 @@ unions attester sets the same way. `crates/oag-mesh/src/anonymous_event.rs` adds
 genuinely new events and skips an exact duplicate, while keeping an unrelated nonce distinct.
 `crates/oag-mesh/src/responder.rs` adds 1: `merge_snapshot` keeps whichever of a local and
 incoming entry is more recent per responder, in both directions (see `spec/12`'s own tests for
-the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 5 integration tests, real
-axum servers, real HTTP round trips: `pull_and_merge` brings a node that started completely empty
+the rest of that mechanism). `crates/oag-mesh/src/transport.rs` adds 8 tests, real axum
+servers, real HTTP round trips: `pull_and_merge` brings a node that started completely empty
 fully up to date across all five stores in one call, and a second, repeated call doesn't inflate
 anything (idempotent); `sync_with_all_peers` pulls from every configured peer and merges both;
 pulling from an unreachable address logs a warning and leaves the puller's state untouched rather
@@ -115,4 +120,6 @@ than panicking or stopping other stores from being attempted; `spawn_periodic_sy
 that's added to a peer only *after* the schedule already started, across real wall-clock ticks
 (not just a single pull at spawn time); aborting the returned handle actually stops further
 syncing -- data added to a peer after the abort never reaches the catcher even after waiting
-long enough that further ticks would otherwise have occurred.
+long enough that further ticks would otherwise have occurred; `spawn_periodic_sync_with_jitter`
+still syncs across real wall-clock ticks with a random phase; and two unit tests pin the jitter
+helper's bounds (always below the maximum, and zero when the maximum is zero).
