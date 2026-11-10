@@ -3011,6 +3011,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_route_across_mesh_terminates_on_a_cyclic_peer_graph() {
+        // A <-> B, B -> C, C -> B: the peer graph has a cycle, so a naive fan-out could
+        // ping-pong between A and B forever. `already_asked` plus `remaining_hops` must still
+        // bound it -- this is the termination guarantee spec/13 names.
+        let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_c = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = format!("http://{}", listener_a.local_addr().unwrap());
+        let addr_b = format!("http://{}", listener_b.local_addr().unwrap());
+        let addr_c = format!("http://{}", listener_c.local_addr().unwrap());
+
+        let state_a = MeshState::new(PeerIdentity::generate(), vec![addr_b.clone()]);
+        let state_b = MeshState::new(PeerIdentity::generate(), vec![addr_a.clone(), addr_c.clone()]);
+        let state_c = MeshState::new(PeerIdentity::generate(), vec![addr_b.clone()]);
+
+        for (state, listener) in [
+            (state_a.clone(), listener_a),
+            (state_b.clone(), listener_b),
+            (state_c.clone(), listener_c),
+        ] {
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap(); });
+        }
+
+        // Only C -- reachable from A only by going A -> B -> C -- has the data.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("known-by-c".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_c, &decl);
+        state_c.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("known-by-c".into());
+
+        // The cycle must not hang the search, and the path must still come back.
+        let path = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            find_route_across_mesh(&state_a, &from, &to, 1, 3),
+        )
+        .await
+        .expect("the search must terminate on a cyclic peer graph");
+        assert_eq!(path, Some(vec![from, to]));
+    }
+
+    #[tokio::test]
     async fn find_route_across_mesh_cannot_assemble_a_path_split_across_two_peers_with_no_shared_knowledge() {
         // A real, honest limitation: each hop's answer comes from ONE node's own complete local
         // shortest_path, never several different peers' partial knowledge stitched together.
