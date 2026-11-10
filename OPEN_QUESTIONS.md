@@ -110,6 +110,18 @@ Format: question, assumption being run with, status.
   store and change the commit-marker set for a value that is by nature ephemeral. Status: resolved
   (accepted trade-off).
 
+## Onion relay volume (spec/15)
+
+- **A relay forwards to a caller-chosen address, so is it an open proxy?** Assumption: no, and the
+  distinction matters. The peeled `next_hop` is attacker-chosen and the endpoint is deliberately
+  unauthenticated, but the payload is limited to an identity-stripped event plus proof-of-work, or
+  one more encrypted layer -- arbitrary traffic cannot be sent through it. The target still enforces
+  its own escalating proof-of-work. What *was* unbounded was volume: the relay's own bandwidth could
+  be spent directing pushes at third parties. Now bounded by a node-wide token bucket
+  (`ONION_RATE_LIMIT_CAPACITY`/`ONION_RATE_LIMIT_PER_SEC`), same shape as route search's. Status:
+  resolved as a volume bound; the unauthenticated, arbitrary-target design is deliberate and
+  unchanged.
+
 ## Cross-store consistency
 
 - **No atomic multi-store *writes*.** Assumption: the commit marker (`spec/08`) makes a saved set

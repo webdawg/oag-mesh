@@ -48,6 +48,16 @@ exit sees R(n-1) and the target; a middle relay sees only its neighbours.
   still enforced by the target when it records the submission.
 - **Node-local, no auth** -- same posture as every other endpoint here. The `/oag-mesh/v1/onion`
   endpoint accepts any layer; a relay that cannot peel it rejects it.
+- **Volume-bounded, not authenticated.** This endpoint is the one in this crate that makes the node
+  send traffic to an address *chosen by the caller*: the peeled `next_hop` is forwarded to, whether
+  it is another relay or the final target. That is inherent to the feature -- an exit relay must be
+  able to reach an arbitrary target -- but without a bound it also makes the relay a constrained
+  proxy for directing anonymous-event pushes at third parties. A node-wide token bucket
+  (`ONION_RATE_LIMIT_CAPACITY`/`ONION_RATE_LIMIT_PER_SEC`, 16 at 0.5/s) bounds the volume. It does
+  **not** authenticate anyone, and it does **not** make the relay an open proxy: the payload is
+  limited to an identity-stripped event plus proof-of-work, or one more layer, and the target still
+  enforces its own escalating proof-of-work. It is a bound on an intentional capability, not a
+  permission system.
 
 ## Tests
 

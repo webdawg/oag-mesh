@@ -47,9 +47,6 @@ use crate::membership::{MembershipAttestation, MembershipError, MembershipProofO
 use crate::rate_limit::{RateLimiter, TokenBucket};
 use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, ResponderAcknowledgmentLog};
 
-/// Default cap on how many outbound `route-search` requests one distributed search may trigger
-/// across its whole fan-out tree -- see `spec/13-distributed-route-search.md`'s
-/// "Anti-amplification" section.
 /// How long a TCP connection to a peer may take to establish before the attempt is abandoned.
 ///
 /// This is the timeout that matters most in practice: a peer that is unreachable *and* silently
@@ -80,7 +77,25 @@ pub fn build_http_client(
         .expect("building a reqwest client with static timeout configuration cannot fail")
 }
 
+/// Default cap on how many outbound `route-search` requests one distributed search may trigger
+/// across its whole fan-out tree -- see `spec/13-distributed-route-search.md`'s
+/// "Anti-amplification" section.
 pub const DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET: u32 = 256;
+/// Default token-bucket capacity for inbound onion layers on one node.
+///
+/// The onion endpoint is the one endpoint in this crate that makes the node send traffic to an
+/// address *chosen by the caller*: the peeled `next_hop` is forwarded to, whether it is another
+/// relay or the final target. That is inherent to the feature -- an exit relay must be able to
+/// reach an arbitrary target -- but without a bound it also makes the relay a constrained proxy
+/// for directing anonymous-event pushes at third parties. The payload is limited (an
+/// identity-stripped event plus proof-of-work, or one more layer) and the target still enforces
+/// its own proof-of-work, so this is not an open relay; it is a volume bound on an intentional
+/// capability. See `spec/15-onion-routing.md`.
+pub const ONION_RATE_LIMIT_CAPACITY: u32 = 16;
+
+/// Default token-bucket refill rate, in tokens per second, for inbound onion layers.
+pub const ONION_RATE_LIMIT_PER_SEC: f64 = 0.5;
+
 /// Default token-bucket capacity for inbound `route-search` requests on one node.
 pub const ROUTE_SEARCH_RATE_LIMIT_CAPACITY: u32 = 8;
 /// Default token-bucket refill rate, in tokens per second, for inbound `route-search` requests.
@@ -229,6 +244,10 @@ pub struct MeshState {
     /// endpoint that can turn a single request into real outbound fan-out traffic. In-memory
     /// only, so a restart resets it; see `spec/13`'s "Anti-amplification" section.
     pub route_search_limiter: Arc<RwLock<TokenBucket>>,
+    /// Node-wide token bucket for inbound `POST /oag-mesh/v1/onion` requests -- the one endpoint
+    /// that makes this node send traffic to a caller-chosen address. In-memory only, so a restart
+    /// resets it. See `ONION_RATE_LIMIT_CAPACITY` for what this does and does not bound.
+    pub onion_limiter: Arc<RwLock<TokenBucket>>,
     /// Per-identity fixed-window limiter for `POST /oag-mesh/v1/responder-acknowledgment` --
     /// the griefing mitigation `spec/12-responder-acknowledgment.md` names as "rate limiting by
     /// identity". In-memory only, so a restart resets it.
@@ -277,6 +296,10 @@ impl MeshState {
             route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+            ))),
+            onion_limiter: Arc::new(RwLock::new(TokenBucket::new(
+                ONION_RATE_LIMIT_CAPACITY,
+                ONION_RATE_LIMIT_PER_SEC,
             ))),
             responder_ack_limiter: Arc::new(RateLimiter::new(
                 RESPONDER_ACK_RATE_LIMIT_WINDOW,
@@ -403,6 +426,10 @@ impl MeshState {
             route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
+            ))),
+            onion_limiter: Arc::new(RwLock::new(TokenBucket::new(
+                ONION_RATE_LIMIT_CAPACITY,
+                ONION_RATE_LIMIT_PER_SEC,
             ))),
             responder_ack_limiter: Arc::new(RateLimiter::new(
                 RESPONDER_ACK_RATE_LIMIT_WINDOW,
@@ -586,6 +613,31 @@ async fn get_onion_key(State(state): State<MeshState>) -> Response {
 /// Peels one onion layer. A relay forwards the inner layer to the next hop; the exit relay
 /// forwards the recovered submission to the target's direct endpoint. See `spec/15`.
 async fn receive_onion_layer(State(state): State<MeshState>, Json(layer): Json<OnionLayer>) -> Response {
+    // Node-wide token bucket, same shape as `receive_route_search`'s and for a related reason:
+    // this endpoint makes *this node* send traffic to an address the caller chose (the peeled
+    // `next_hop`). The bound is on volume, not on who may use the feature -- the feature is
+    // deliberately unauthenticated, and the target still enforces its own proof-of-work.
+    let retry_after = {
+        let mut limiter = state.onion_limiter.write().unwrap();
+        if limiter.try_take() {
+            None
+        } else {
+            Some(limiter.retry_after())
+        }
+    };
+    if let Some(retry_after) = retry_after {
+        let retry_after_seconds = retry_after.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_seconds.to_string())],
+            Json(serde_json::json!({
+                "error": "onion rate limit exceeded",
+                "retry_after_seconds": retry_after_seconds,
+            })),
+        )
+            .into_response();
+    }
+
     let inner = match crate::onion::peel_layer(&layer, &state.identity) {
         Ok(inner) => inner,
         Err(e) => {
@@ -2158,6 +2210,56 @@ mod tests {
         // The relays only forwarded encrypted layers; they never see the event.
         assert_eq!(state_r1.event_log.read().unwrap().corroboration_for("onion-wire"), 0);
         assert_eq!(state_r2.event_log.read().unwrap().corroboration_for("onion-wire"), 0);
+    }
+
+    /// The onion endpoint makes this node send traffic to a caller-chosen address (the peeled
+    /// `next_hop`), so it needs a volume bound like route search's -- the feature is deliberately
+    /// unauthenticated, and the target still enforces its own proof-of-work. A dummy layer is
+    /// enough to exercise the limiter because the check runs before peeling: the first
+    /// `ONION_RATE_LIMIT_CAPACITY` requests are rejected as unpeelable (400), and the next one is
+    /// rejected as rate-limited (429).
+    #[tokio::test]
+    async fn onion_rate_limiter_rejects_a_burst_and_recovers() {
+        let (addr_a, _state_a) = spawn(vec![]).await;
+        let http = reqwest::Client::new();
+        let dummy_layer = serde_json::json!({
+            "ephemeral_public_key": "00".repeat(32),
+            "nonce": "00".repeat(12),
+            "ciphertext": "00".repeat(32),
+        });
+
+        for _ in 0..ONION_RATE_LIMIT_CAPACITY {
+            let response = http
+                .post(format!("{addr_a}/oag-mesh/v1/onion"))
+                .json(&dummy_layer)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "below the limit a layer is rejected for being unpeelable, not rate-limited"
+            );
+        }
+
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/onion"))
+            .json(&dummy_layer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(axum::http::header::RETRY_AFTER));
+
+        // It recovers: the bucket refills, so a later request is answered on its merits again.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let response = http
+            .post(format!("{addr_a}/oag-mesh/v1/onion"))
+            .json(&dummy_layer)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
