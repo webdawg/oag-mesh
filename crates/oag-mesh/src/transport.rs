@@ -1582,9 +1582,20 @@ async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5
 /// turn -- the periodic, pull-side counterpart to the `broadcast_*` functions' push-side
 /// best-effort fan-out. A caller decides when and how often to call this (e.g. on a timer);
 /// nothing in this crate schedules it automatically.
+/// Pulls and merges every configured peer, best-quality first.
+///
+/// The order matters because this loop is **sequential**: a peer that is black-holed costs a full
+/// connect/request timeout before the next one is tried, so pulling in configuration order means
+/// the live peers' data arrives only after every dead peer has been waited out. Asking the peers
+/// this node has actually been reaching first means a periodic tick gets the useful data early and
+/// spends whatever is left on the ones that are probably down.
+///
+/// Ordering only -- every configured peer is still pulled, exactly as before. `link_quality` never
+/// removes an address; see its own module docs and `spec/13`.
 pub async fn sync_with_all_peers(state: &MeshState) {
-    for peer in state.peers.iter() {
-        pull_and_merge(state, peer).await;
+    let ordered = state.link_quality.ordered(&state.peers.iter().cloned().collect::<Vec<_>>());
+    for peer in ordered {
+        pull_and_merge(state, &peer).await;
     }
 }
 
@@ -3288,6 +3299,109 @@ mod tests {
         let q = state.link_quality.quality(&addr).expect("the failure must be recorded");
         assert_eq!(q.attempts, 1);
         assert_eq!(q.successes, 0);
+    }
+
+    /// A peer that accepts the connection and never answers, so the pull against it blocks for the
+    /// client's whole request timeout rather than failing fast.
+    async fn spawn_hanging_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                std::mem::forget(stream);
+            }
+        });
+        addr
+    }
+
+    /// A peer holding one real declaration, served over the mesh's normal router.
+    async fn spawn_live_peer_with_data(cluster: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let state = MeshState::new(PeerIdentity::generate(), vec![]);
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster(cluster.to_string()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state, &decl);
+        state.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        addr
+    }
+
+    /// The pull loop is sequential, so the order it pulls in decides whether the live peers' data
+    /// arrives before the dead peers' timeouts are paid. Both halves of this test use the same
+    /// hanging peer and the same live peer; the only difference is whether the ledger has an
+    /// opinion. With one, the live data lands within a second while the hanging peer is still
+    /// blocking; without one, it cannot land until the hanging peer's timeout expires.
+    #[tokio::test]
+    async fn an_ordered_pull_loop_gets_live_data_before_paying_a_dead_peers_timeout() {
+        let hang = spawn_hanging_peer().await;
+        let live = spawn_live_peer_with_data("ordered-pull-target").await;
+        let cluster = MeshMember::BaseCluster("ordered-pull-target".into());
+
+        // A long request timeout, so "the hanging peer is still blocking" is a wide window rather
+        // than a race.
+        let build_state = |primed: bool| {
+            let mut state = MeshState::new(PeerIdentity::generate(), vec![hang.clone(), live.clone()]);
+            state.http = Arc::new(build_http_client(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_secs(5),
+            ));
+            if primed {
+                // Primed directly: how records arise is covered by the ledger's own unit tests and
+                // by the route-search tests above; this test isolates the ordering effect.
+                state.link_quality.record(&hang, false, crate::link_quality::now_unix());
+                state.link_quality.record(&live, true, crate::link_quality::now_unix());
+            }
+            state
+        };
+
+        // Control: no history, so configuration order applies and the hanging peer is pulled first.
+        // The live data must NOT arrive while it is blocking.
+        let unprimed = build_state(false);
+        let unprimed_task_state = unprimed.clone();
+        let unprimed_task = tokio::spawn(async move { sync_with_all_peers(&unprimed_task_state).await });
+        let control = async {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if unprimed.tree.read().unwrap().members_of("global", 1).contains(&cluster) {
+                    return true;
+                }
+            }
+            false
+        }
+        .await;
+        assert!(
+            !control,
+            "without a quality history the hanging peer is pulled first, so live data cannot arrive"
+        );
+        unprimed_task.abort();
+
+        // With history, the live peer is asked first and its data lands while the hanging peer is
+        // still blocking.
+        let primed = build_state(true);
+        let primed_task_state = primed.clone();
+        let primed_task = tokio::spawn(async move { sync_with_all_peers(&primed_task_state).await });
+        let ordered = async {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if primed.tree.read().unwrap().members_of("global", 1).contains(&cluster) {
+                    return true;
+                }
+            }
+            false
+        }
+        .await;
+        assert!(
+            ordered,
+            "with a quality history the live peer must be pulled before the hanging one, so its data lands first"
+        );
+        primed_task.abort();
     }
 
     #[tokio::test]

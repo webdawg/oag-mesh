@@ -45,6 +45,12 @@ regresses state. `sync_with_all_peers(state)` is the convenience wrapper: pull-a
 every configured peer in turn, best-effort, the pull-side mirror of the `broadcast_*` functions'
 push-side fan-out.
 
+`sync_with_all_peers` pulls **best-quality first**, ordering its peers by the `link_quality`
+ledger (`spec/13`) before pulling any of them. The loop is sequential, so the order decides whether
+the live peers' data arrives before the dead peers' timeouts are paid: pulling in configuration
+order means every dead peer is waited out before a single live one is reached. Ordering only --
+every configured peer is still pulled, exactly as before.
+
 Nothing in this crate calls `sync_with_all_peers` *by default* -- same "caller decides" posture
 as `MeshState::save_to_dir`. `spawn_periodic_sync(state, interval)` is the opt-in: it spawns a
 background task that calls `sync_with_all_peers` once immediately, then again every `interval`,
