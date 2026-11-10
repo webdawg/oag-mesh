@@ -226,6 +226,11 @@ pub struct MeshState {
     /// responder drains it by polling. In-memory only -- a restart clears it, and the responder
     /// can re-search the log. See `spec/14`.
     pub responder_inbox: Arc<RwLock<ResponderInbox>>,
+    /// What this node has observed about each peer's deliverability, used to order route-search
+    /// fan-out so the fan-out budget is spent on peers that have been answering. In-memory only,
+    /// so a restart re-learns it; it orders and never excludes. See `spec/13` and
+    /// `link_quality`'s own module docs.
+    pub link_quality: Arc<crate::link_quality::LinkQualityLedger>,
 }
 
 impl MeshState {
@@ -256,6 +261,7 @@ impl MeshState {
             )),
             responder_subscriptions: Arc::new(RwLock::new(ResponderSubscriptionRegistry::new())),
             responder_inbox: Arc::new(RwLock::new(ResponderInbox::new())),
+            link_quality: Arc::new(crate::link_quality::LinkQualityLedger::default()),
         }
     }
 
@@ -383,6 +389,7 @@ impl MeshState {
                 subscriptions,
             ))),
             responder_inbox: Arc::new(RwLock::new(ResponderInbox::from_inbox(inbox))),
+            link_quality: Arc::new(crate::link_quality::LinkQualityLedger::default()),
         })
     }
 }
@@ -858,8 +865,13 @@ async fn search_for_route(
         return None;
     }
 
-    let peers_to_ask: Vec<String> =
-        state.peers.iter().filter(|peer| !already_asked.contains(peer)).cloned().collect();
+    // Order by observed deliverability before taking the first `ask_count`: the fan-out budget
+    // is the scarce resource here, and spending it on a peer that has been failing for hours is
+    // the one waste this search can avoid. Ordering only -- every peer stays in the list, so a
+    // healthy-looking peer that is actually down is still tried when the budget allows.
+    let peers_to_ask: Vec<String> = state
+        .link_quality
+        .ordered(&state.peers.iter().filter(|peer| !already_asked.contains(peer)).cloned().collect::<Vec<_>>());
     if peers_to_ask.is_empty() {
         return None;
     }
@@ -889,7 +901,15 @@ async fn search_for_route(
     for peer in peers_to_ask {
         let http = state.http.clone();
         let request = child_request.clone();
-        tasks.spawn(async move { push_route_search(&http, &peer, &request).await.ok().flatten() });
+        let link_quality = state.link_quality.clone();
+        tasks.spawn(async move {
+            let result = push_route_search(&http, &peer, &request).await.ok().flatten();
+            // Record the outcome either way: a peer that did not answer is exactly the
+            // observation the next search needs, and it is invisible if only successes are
+            // recorded.
+            link_quality.record(&peer, result.is_some(), crate::link_quality::now_unix());
+            result
+        });
     }
 
     let mut best: Option<Vec<MeshMember>> = None;
@@ -1418,22 +1438,29 @@ pub async fn broadcast_claim_report(state: &MeshState, report: &ClaimReport) {
 /// target already sits inside -- did its own verification honestly. A compromised or malicious
 /// peer on that list could report corroboration it never actually received proof of; this
 /// function has no way to catch that. See `spec/10-anti-entropy.md` for this stated in full.
-pub async fn pull_and_merge(state: &MeshState, address: &str) {
+/// Pulls and merges one peer, returning whether the interaction *delivered* something usable --
+/// which is what `link_quality` records. The boolean is not a new requirement on callers: it is
+/// the difference between "answered" and "failed", and until now that distinction was dropped on
+/// the floor even though the fan-out budget is spent on exactly it.
+pub async fn pull_and_merge(state: &MeshState, address: &str) -> bool {
     let remote_heads = match pull_heads(&state.http, address).await {
         Ok(heads) => heads,
         Err(e) => {
             tracing::warn!(address, error = %e, "failed to pull sync heads from peer; falling back to a full pull");
-            pull_changed_stores(state, address, [true; 5]).await;
-            return;
+            let delivered = pull_changed_stores(state, address, [true; 5]).await;
+            state.link_quality.record(address, delivered, crate::link_quality::now_unix());
+            return delivered;
         }
     };
 
     let last_heads = state.sync_heads.read().unwrap().get(address).copied();
     let changed = heads_changed(last_heads, remote_heads);
     let all_ok = pull_changed_stores(state, address, changed).await;
+    state.link_quality.record(address, all_ok, crate::link_quality::now_unix());
     if all_ok {
         state.sync_heads.write().unwrap().insert(address.to_string(), remote_heads);
     }
+    all_ok
 }
 
 /// Which of the five stores differ between the last heads this node pulled from a peer and
@@ -3108,6 +3135,97 @@ mod tests {
         // Two hops is enough to go A -> B -> C and back with an answer.
         let path = find_route_across_mesh(&state_a, &from, &to, 1, 2).await;
         assert_eq!(path, Some(vec![from, to]));
+    }
+
+    /// A real measurement of the link-quality feedback path: with a fan-out budget of one, the
+    /// first search spends its only slot on the configured-first peer -- which is dead -- and
+    /// fails. That failure is recorded. The *next* search, with the same budget, puts the proven
+    /// peer first and succeeds. The adaptation is observable, not just present in the code.
+    #[tokio::test]
+    async fn a_failed_fan_out_is_recorded_and_the_next_search_spends_its_budget_better() {
+        // A closed port: the connection is refused immediately, so the failure is fast.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = format!("http://{}", live_listener.local_addr().unwrap());
+
+        // Configuration order deliberately puts the dead peer first, so the *initial* ordering
+        // has no reason to prefer the live one.
+        let state_a = MeshState::new(PeerIdentity::generate(), vec![dead_addr.clone(), live_addr.clone()]);
+        let state_b = MeshState::new(PeerIdentity::generate(), vec![]);
+
+        // Only B knows about the target, and B is one hop away with a fan-out budget of zero for
+        // its own children -- so it can answer from local knowledge alone.
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("quality-target".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_b, &decl);
+        state_b.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+        tokio::spawn(async move { axum::serve(live_listener, router(state_b)).await.unwrap() });
+
+        let from = MeshMember::MeshGroup("global".into());
+        let to = MeshMember::BaseCluster("quality-target".into());
+
+        // First search: budget 1, configuration order, so the dead peer is asked and fails.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            find_route_across_mesh_with_budget(&state_a, &from, &to, 1, 2, 1),
+        )
+        .await
+        .expect("search must not hang");
+        assert!(first.is_none(), "the first search should fail: its one slot went to the dead peer");
+
+        let dead_quality = state_a.link_quality.quality(&dead_addr).expect("the failure must be recorded");
+        assert_eq!(dead_quality.attempts, 1);
+        assert_eq!(dead_quality.successes, 0);
+
+        // Second search: same budget, but the live peer now outranks the proven-dead one.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            find_route_across_mesh_with_budget(&state_a, &from, &to, 1, 2, 1),
+        )
+        .await
+        .expect("search must not hang");
+        assert!(second.is_some(), "the second search should succeed now that the live peer is asked first");
+    }
+
+    #[tokio::test]
+    async fn pull_and_merge_records_a_failure_against_an_unreachable_peer() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let state = MeshState::new(PeerIdentity::generate(), vec![dead_addr.clone()]);
+        let delivered = pull_and_merge(&state, &dead_addr).await;
+        assert!(!delivered, "an unreachable peer must report a failed delivery");
+
+        let q = state.link_quality.quality(&dead_addr).expect("the failure must be recorded");
+        assert_eq!(q.attempts, 1);
+        assert_eq!(q.successes, 0);
+        assert!(q.score < crate::link_quality::UNKNOWN_PEER_SCORE);
+    }
+
+    #[tokio::test]
+    async fn pull_and_merge_records_a_success_against_a_live_peer() {
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = format!("http://{}", live_listener.local_addr().unwrap());
+        let state = MeshState::new(PeerIdentity::generate(), vec![live_addr.clone()]);
+        let peer_state = MeshState::new(PeerIdentity::generate(), vec![]);
+        tokio::spawn(async move { axum::serve(live_listener, router(peer_state)).await.unwrap() });
+
+        let delivered = pull_and_merge(&state, &live_addr).await;
+        assert!(delivered, "a live peer must report a successful delivery");
+
+        let q = state.link_quality.quality(&live_addr).expect("the success must be recorded");
+        assert_eq!(q.attempts, 1);
+        assert_eq!(q.successes, 1);
+        assert!(q.score > crate::link_quality::UNKNOWN_PEER_SCORE);
     }
 
     #[tokio::test]

@@ -73,6 +73,29 @@ Format: question, assumption being run with, status.
   (there is no fsync), and a caller that saves rarely can still lose up to a whole save's worth of
   in-memory state. Status: resolved for torn-set detection; open for fsync/durability.
 
+## Link quality and adaptive ordering (spec/13)
+
+- **Does observed deliverability actually improve routing?** Assumption: yes for the one thing it
+  can improve -- which peer a scarce fan-out budget is spent on. `link_quality` records whether
+  each interaction delivered and route search asks its peers best-first. It is *not* a routing
+  table: it does not pick the next hop, it does not change what "shortest path" means, and it does
+  not discover peers. `a_failed_fan_out_is_recorded_and_the_next_search_spends_its_budget_better`
+  measures the effect on a real loopback network (one dead peer, budget of one: the first search
+  fails, the second succeeds after a single observation). Status: implemented and measured on that
+  one axis; open on the axes it deliberately does not touch.
+- **A peer that is down is asked last, never not asked.** Assumption: "degrade, don't drop" applies
+  to connectivity, not only to federation. The ordering function is a permutation of the input --
+  every configured address appears exactly once -- and that is asserted as a property test rather
+  than left as a comment. Status: resolved.
+- **The score is a liveness signal, not a trust signal.** Assumption: a peer that answers with
+  garbage scores exactly as well as one that answers correctly. Honesty is `spec/05`'s
+  corroboration layer's job. Nothing here feeds `trust_score` or any federation decision.
+  Status: resolved (deliberate scope).
+- **Quality is forgotten on restart.** Assumption: re-learning it costs a little wasted fan-out,
+  which is the same posture as the crate's other limiter state. Persisting it would add an eighth
+  store and change the commit-marker set for a value that is by nature ephemeral. Status: resolved
+  (accepted trade-off).
+
 ## Cross-store consistency
 
 - **No atomic multi-store *writes*.** Assumption: the commit marker (`spec/08`) makes a saved set

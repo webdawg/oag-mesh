@@ -73,6 +73,50 @@ Two independent bounds, both stated plainly rather than oversold:
 Neither is a substitute for not exposing the endpoint to untrusted callers. Both only raise the
 cost of triggering fan-out; they do not authenticate anyone.
 
+## Ordering the fan-out by observed deliverability
+
+The fan-out budget is the scarce resource here: a search that spends its one allowed request on a
+peer that has been refusing connections for hours learns nothing. `link_quality` records whether
+each interaction actually delivered -- a route-search reply, or a completed `pull_and_merge` -- and
+the search asks its peers best-first.
+
+**It orders; it never excludes.** A peer at score `0.0` is asked *last*, not dropped. This is the
+standing "degrade, don't drop" decision applied to connectivity: a peer that is down today may be
+the only path tomorrow, and nothing here gives this node a reason to forget an address its
+operator configured. The guarantee is a property of the ordering function -- it is a permutation
+of the input, tested as such -- not a convention.
+
+The score is an exponential moving average of the 1.0/0.0 outcome, with the same learning rate as
+the base project's tensor pad (`0.1`). That value is deliberately conservative: a single dropped
+packet moves a healthy peer's score by one tenth of the gap to the observation, so routing does not
+oscillate, while a peer that fails consistently is demoted within a handful of rounds. A peer this
+node has never interacted with scores `0.5` -- neutral, not optimistic -- so a node with no
+history yet spreads its fan-out across everyone rather than preferring whichever address was
+configured first.
+
+Outcomes are recorded on **both** sides of every interaction: a peer that did not answer is
+exactly the observation the next search needs, and it is invisible if only successes are counted.
+`pull_and_merge` returns whether the interaction delivered, which is the distinction the fan-out
+budget is spent on.
+
+**In-memory only.** A restart forgets every peer's quality and re-learns it within a few rounds.
+That is consistent with this crate's posture on its other limiter state (`route_search_limiter`,
+`responder_ack_limiter`): losing it costs a little wasted fan-out, not anything irrecoverable. It
+also avoids adding an eighth persisted store, which would change the commit-marker set
+(`spec/08-persistence.md`) for a value that is by nature ephemeral.
+
+**This is a liveness signal, not a trust signal.** A peer that replies with garbage scores exactly
+as well as one that replies correctly. Honesty is `spec/05`'s corroboration layer's job, and
+nothing here should be read as a reputation system.
+
+### Measured
+
+`a_failed_fan_out_is_recorded_and_the_next_search_spends_its_budget_better` is a real network
+measurement, not a unit test of the ordering function: a node configured with `[dead, live]`, a
+fan-out budget of one, and no history spends its only slot on the dead peer and fails; the *next*
+search, same budget, puts the now-proven live peer first and succeeds. The adaptation is
+observable in behaviour, and it happens after a single observation.
+
 ## What this explicitly is not
 
 - **Not a global shortest path, even when it finds one.** A path this returns is real --every
@@ -125,3 +169,8 @@ direct peer knows the path; a fan-out budget of 1 cannot cross a two-hop chain w
 a burst with `429`/`Retry-After` and recovers after the bucket refills.
 `crates/oag-mesh/src/rate_limit.rs` adds 4 unit tests for the token bucket itself: capacity,
 refill at the configured rate, the reported wait when empty, and never exceeding capacity.
+`crates/oag-mesh/src/link_quality.rs` adds 6 unit tests for the ledger: an unseen peer is neutral
+rather than zero; a consistently-dead peer sorts last and a consistently-healthy one first; the
+ordering is a permutation that never drops an address, asserted as a property; the score is
+smoothed rather than a raw ratio; a recovered peer climbs back above an unknown one; and with a
+budget of one the proven peer is the one asked.

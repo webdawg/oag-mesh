@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod corroboration;
 pub mod dispatch;
 pub mod membership;
+pub mod link_quality;
 pub mod onion;
 pub mod persistence;
 pub mod rate_limit;
