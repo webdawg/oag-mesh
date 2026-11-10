@@ -48,6 +48,20 @@ Format: question, assumption being run with, status.
   allowlist; the defaults (60 per 60s) are a starting point. Status: open (revisit if a real
   deployment needs reputation).
 
+## Timeouts (spec/04)
+
+- **No HTTP timeout anywhere.** Found while checking what a non-responding peer costs: every
+  outbound request used `reqwest::Client::new()`, which sets no timeout at all, so a peer that
+  silently drops packets holds the request open until the OS gives up. Because
+  `sync_with_all_peers` is sequential and `search_for_route`'s fan-out sits behind an *inbound*
+  endpoint, one broken peer could stall a whole sync tick or hang a third party's request.
+  Fixed with a 5s connect timeout and a 30s total request timeout on a shared client, both named
+  constants. A timed-out request counts as a failed delivery for `link_quality`. Status: resolved.
+- **A timed-out request is still a full timeout, not a cancellation.** The request is abandoned
+  from this node's point of view; the peer may still complete it and merge the state, which is
+  fine because every merge is idempotent (`spec/10`). Status: resolved (accepted, and it is why
+  idempotence matters).
+
 ## Resource bounds and proof-of-work (spec/03, spec/10, spec/13)
 
 - **Proof-of-work difficulty is untuned.** Assumption: `BASE_DIFFICULTY_BITS`/

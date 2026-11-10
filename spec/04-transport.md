@@ -110,6 +110,31 @@ difference left between them is what each proof is actually bound to and what re
 (see each mechanism's own "Anti-spam"/"Anti-sybil resistance" section). `ResponderAcknowledgment`
 is the deliberate exception -- see `spec/12-responder-acknowledgment.md` for why one doesn't fit.
 
+## Every outbound request is bounded by a timeout
+
+`reqwest::Client::new()` sets no timeout at all. For a client talking to an operator-configured
+list of arbitrary peer addresses, that is not a theoretical concern: a peer that is unreachable
+*and silently dropping packets* -- rather than refusing the connection -- holds the request open
+until the operating system gives up, which can be minutes. Two things in this crate make that
+worse than a slow pull:
+
+- `sync_with_all_peers` pulls peers **sequentially**, so one black-holed peer stalls the whole
+  tick before any live peer is reached.
+- `search_for_route` fans out by calling `push_route_search` directly, and that fan-out is on the
+  path of an *inbound* `POST /oag-mesh/v1/route-search`. One broken peer can therefore hang a
+  request from a third party, not only this node's own background work.
+
+Every outbound request now goes through `build_http_client`, which sets both a connect timeout
+(`HTTP_CONNECT_TIMEOUT`, 5s -- the case where the peer never answers the TCP handshake) and a
+total request timeout (`HTTP_REQUEST_TIMEOUT`, 30s -- the case where the connection succeeds and
+then nothing arrives). Both are named constants so a deployment can retune them, and
+`build_http_client` takes them as parameters so a test can prove the bound holds without waiting
+the production value out.
+
+A timed-out request is an ordinary failed interaction: `pull_and_merge` reports it as a failed
+delivery and `link_quality` records it, which is exactly the observation that makes the next
+fan-out spend its budget better.
+
 ## Tests
 
 `crates/oag-mesh/src/transport.rs` (33 integration tests, real axum servers bound to real

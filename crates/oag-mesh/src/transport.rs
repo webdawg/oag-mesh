@@ -50,6 +50,36 @@ use crate::responder::{ResponderAcknowledgment, ResponderAcknowledgmentError, Re
 /// Default cap on how many outbound `route-search` requests one distributed search may trigger
 /// across its whole fan-out tree -- see `spec/13-distributed-route-search.md`'s
 /// "Anti-amplification" section.
+/// How long a TCP connection to a peer may take to establish before the attempt is abandoned.
+///
+/// This is the timeout that matters most in practice: a peer that is unreachable *and* silently
+/// dropping packets (rather than refusing the connection) would otherwise hold the request open
+/// until the operating system gives up, which can be minutes.
+pub const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Total time budget for one HTTP request to a peer, connect included.
+///
+/// `reqwest::Client::new()` sets no timeout at all, so without this a single non-responding peer
+/// can stall a `sync_with_all_peers` tick or a route search indefinitely -- and both of those are
+/// on the path of an *inbound* request, so one broken peer can hang a request from a third party
+/// rather than only this node's own background work.
+pub const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Builds this crate's HTTP client with bounded connect and total-request timeouts.
+///
+/// Separate from `MeshState::new` so a test can build a client with short timeouts and prove the
+/// bound actually holds without waiting the production value out.
+pub fn build_http_client(
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+        .expect("building a reqwest client with static timeout configuration cannot fail")
+}
+
 pub const DEFAULT_ROUTE_SEARCH_FANOUT_BUDGET: u32 = 256;
 /// Default token-bucket capacity for inbound `route-search` requests on one node.
 pub const ROUTE_SEARCH_RATE_LIMIT_CAPACITY: u32 = 8;
@@ -243,7 +273,7 @@ impl MeshState {
             membership_registry: Arc::new(RwLock::new(MembershipRegistry::new())),
             responder_acknowledgments: Arc::new(RwLock::new(ResponderAcknowledgmentLog::new())),
             peers: Arc::new(peers),
-            http: Arc::new(reqwest::Client::new()),
+            http: Arc::new(build_http_client(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)),
             route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
@@ -369,7 +399,7 @@ impl MeshState {
             membership_registry: Arc::new(RwLock::new(membership_registry)),
             responder_acknowledgments: Arc::new(RwLock::new(responder_acknowledgments)),
             peers: Arc::new(peers),
-            http: Arc::new(reqwest::Client::new()),
+            http: Arc::new(build_http_client(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)),
             route_search_limiter: Arc::new(RwLock::new(TokenBucket::new(
                 ROUTE_SEARCH_RATE_LIMIT_CAPACITY,
                 ROUTE_SEARCH_RATE_LIMIT_PER_SEC,
@@ -3193,6 +3223,71 @@ mod tests {
         .await
         .expect("search must not hang");
         assert!(second.is_some(), "the second search should succeed now that the live peer is asked first");
+    }
+
+    /// The black-hole case: the peer accepts the TCP connection and then never sends a byte. A
+    /// connect timeout alone cannot catch this -- the connection *succeeded* -- so it is the total
+    /// request timeout that bounds the wait. Without it, `sync_with_all_peers` (sequential) would
+    /// stall on this one peer for as long as the OS cares to wait.
+    #[tokio::test]
+    async fn a_peer_that_accepts_but_never_responds_is_abandoned_at_the_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                // Hold the connection open deliberately, responding with nothing.
+                std::mem::forget(stream);
+            }
+        });
+
+        let client = build_http_client(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+        );
+        let started = std::time::Instant::now();
+        let result = client.get(format!("http://{addr}/")).send().await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a non-responding peer must produce an error, not hang");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the request timeout should fire well before this, took {elapsed:?}"
+        );
+    }
+
+    /// End to end through the mesh's own pull path: a black-holed peer costs one timeout and the
+    /// pull reports a failed delivery, which is exactly what `link_quality` records. Before the
+    /// client had a timeout this call had no bound at all.
+    #[tokio::test]
+    async fn pull_and_merge_against_a_black_holed_peer_is_bounded_and_recorded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                std::mem::forget(stream);
+            }
+        });
+
+        let mut state = MeshState::new(PeerIdentity::generate(), vec![addr.clone()]);
+        state.http = Arc::new(build_http_client(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+        ));
+
+        let started = std::time::Instant::now();
+        let delivered = pull_and_merge(&state, &addr).await;
+        let elapsed = started.elapsed();
+
+        assert!(!delivered, "a black-holed peer must report a failed delivery");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the pull must be bounded by the client timeout, took {elapsed:?}"
+        );
+        let q = state.link_quality.quality(&addr).expect("the failure must be recorded");
+        assert_eq!(q.attempts, 1);
+        assert_eq!(q.successes, 0);
     }
 
     #[tokio::test]
