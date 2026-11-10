@@ -45,6 +45,22 @@ string form, the same convention every signed message in this crate already uses
   than a truncated destination. On Windows, `rename` does not replace an existing file, so the
   destination is removed first -- that window is not atomic, and is the platform's best effort.
   There is no fsync, so a power loss could still lose the rename; no write-ahead log.
+- **The seven stores commit as a set, via a marker written last.** Each file being individually
+  atomic is not enough: a crash between the individual saves leaves a *torn* set, with some stores
+  from the new snapshot and some from the old, and every file still parses -- nothing downstream
+  could tell they disagreed. `save_to_dir` now writes all seven files, hashes each one's exact
+  bytes, and then writes `commit.json` recording `{version, files: [{file, blake3}]}`. The marker
+  is written last, so its presence means the whole set is on disk. `load_from_dir` verifies it
+  first: every recorded file must exist and hash to its recorded value, or the load is refused
+  with `PersistenceError::TornSet` rather than acting on a set that disagrees with itself. A
+  marker that cannot be parsed is treated the same way -- it means the save was interrupted at
+  the last step and the set's consistency is unknown. See `OPEN_QUESTIONS.md`'s cross-store
+  consistency entry for the design and the one remaining gap.
+- **A directory with no marker still loads exactly as before.** This is deliberate backward
+  compatibility, not an oversight: an existing deployment upgrades, its directory has seven store
+  files and no `commit.json`, and refusing to load would strand every one of those nodes' state.
+  Absence of a marker means "written by an older version, or a first run" and is not an error.
+  Only a marker that is *present and contradicts the files* is refused.
 - **Not a database.** Each save uses a unique temp name (`<name>.<pid>.<counter>.tmp`), so two
   processes saving the same file never clobber each other's partial write, and the final rename
   is atomic -- but there is no cross-process locking beyond that, and no incremental writes:
@@ -57,10 +73,13 @@ string form, the same convention every signed message in this crate already uses
 
 ## Tests
 
-`crates/oag-mesh/src/persistence.rs` (4 unit tests): save then load round-trips a value exactly;
+`crates/oag-mesh/src/persistence.rs` (11 unit tests): save then load round-trips a value exactly;
 loading a file that doesn't exist returns `None`, not an error; loading malformed JSON returns a
 `PersistenceError::Parse`; and a save leaves no `.tmp` file behind (the rename consumed it),
-  using a unique per-save temp name. `crates/oag-mesh/src/membership.rs` adds 1 more:
+  using a unique per-save temp name; plus the commit marker's own paths -- a directory with no
+  marker is `Legacy` (not an error), a matching marker is `Consistent`, a deleted store file, a
+  modified store file, a corrupt marker, and an unsupported marker version are all refused, and
+  writing a marker twice is idempotent. `crates/oag-mesh/src/membership.rs` adds 1 more:
 `MembershipRegistry::snapshot` round-trips through `from_snapshot` directly.
 `crates/oag-mesh/src/responder.rs` adds 1 more: `ResponderAcknowledgmentLog::snapshot`
 round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs` adds 3 more:
@@ -68,4 +87,6 @@ round-trips through `from_snapshot` directly. `crates/oag-mesh/src/transport.rs`
 stores (a `BridgeDeclaration`, a `ClaimReport`, an `AnonymousEvent`, a `MembershipAttestation`,
 and a `ResponderAcknowledgment`); the same round-trip covers the dispatch subscription registry
 and inbox (`spec/14`); `load_from_dir` against a directory that doesn't exist yet starts with all
-seven stores empty rather than erroring.
+seven stores empty rather than erroring; a fresh `save_to_dir` writes a marker that still verifies;
+`load_from_dir` refuses a torn set rather than acting on it; and it still accepts a directory
+written before markers existed.

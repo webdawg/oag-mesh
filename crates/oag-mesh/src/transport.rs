@@ -268,25 +268,52 @@ impl MeshState {
     /// automatically on any write; a caller decides when to save (periodically, on a clean
     /// shutdown, after every N writes -- whatever fits its own deployment).
     pub fn save_to_dir(&self, dir: &std::path::Path) -> Result<(), crate::persistence::PersistenceError> {
-        crate::persistence::save_json(&dir.join("bridge_tree.json"), &self.tree.read().unwrap().snapshot())?;
-        crate::persistence::save_json(
-            &dir.join("claim_corroboration.json"),
-            &self.claim_corroboration.read().unwrap().snapshot(),
-        )?;
-        crate::persistence::save_json(&dir.join("anonymous_events.json"), &*self.event_log.read().unwrap())?;
-        crate::persistence::save_json(
-            &dir.join("membership_registry.json"),
-            &self.membership_registry.read().unwrap().snapshot(),
-        )?;
-        crate::persistence::save_json(
-            &dir.join("responder_acknowledgments.json"),
-            &self.responder_acknowledgments.read().unwrap().snapshot(),
-        )?;
-        crate::persistence::save_json(
-            &dir.join("responder_subscriptions.json"),
-            self.responder_subscriptions.read().unwrap().subscriptions(),
-        )?;
-        crate::persistence::save_json(&dir.join("responder_inbox.json"), self.responder_inbox.read().unwrap().inbox())?;
+        // Write all seven stores, recording each one's name, then write a commit marker
+        // describing the set. Each file is individually atomic (temp + rename), so a crash
+        // mid-save leaves the previous file intact and an orphaned temp -- but it can leave the
+        // *set* torn, with some stores from the new snapshot and some from the old. The marker
+        // closes that window: it is written last, and a reader trusts the set only when every
+        // file matches what the marker recorded. See `persistence`'s own doc comment.
+        let mut entries = Vec::with_capacity(crate::persistence::STORE_FILES.len());
+        // One save plus its recorded hash, so the marker describes the bytes actually on disk.
+        macro_rules! save_store {
+            ($name:expr, $value:expr) => {{
+                crate::persistence::save_json(&dir.join($name), &$value)?;
+                entries.push(crate::persistence::CommitEntry {
+                    file: $name.to_string(),
+                    blake3: crate::persistence::hash_file(&dir.join($name))?,
+                });
+            }};
+        }
+        save_store!(
+            crate::persistence::STORE_FILES[0],
+            self.tree.read().unwrap().snapshot()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[1],
+            self.claim_corroboration.read().unwrap().snapshot()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[2],
+            &*self.event_log.read().unwrap()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[3],
+            self.membership_registry.read().unwrap().snapshot()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[4],
+            self.responder_acknowledgments.read().unwrap().snapshot()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[5],
+            self.responder_subscriptions.read().unwrap().subscriptions()
+        );
+        save_store!(
+            crate::persistence::STORE_FILES[6],
+            self.responder_inbox.read().unwrap().inbox()
+        );
+        crate::persistence::write_commit_marker(dir, entries)?;
         Ok(())
     }
 
@@ -298,6 +325,13 @@ impl MeshState {
         peers: Vec<String>,
         dir: &std::path::Path,
     ) -> Result<Self, crate::persistence::PersistenceError> {
+        // Refuse a torn set rather than loading it. If there is no marker this is either a first
+        // run or a directory written before markers existed, and the old behaviour (load whatever
+        // is there) is deliberately preserved -- refusing here would break every existing
+        // deployment on upgrade. If a marker *is* present and the files do not match it, the save
+        // was interrupted and some stores are from a different snapshot; acting on that would be
+        // worse than starting empty, because nothing would reveal the disagreement.
+        crate::persistence::verify_commit_marker(dir)?;
         let tree = crate::persistence::load_json(&dir.join("bridge_tree.json"))?
             .map(MeshTree::from_snapshot)
             .unwrap_or_default();
@@ -2336,6 +2370,72 @@ mod tests {
         assert_eq!(loaded.event_log.read().unwrap().corroboration_for("anything"), 0);
         assert!(!loaded.membership_registry.read().unwrap().is_attested_member("anything", &PeerIdentity::generate().peer_id(), 1));
         assert!(loaded.responder_acknowledgments.read().unwrap().active_responders_for("anything").is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_to_dir_writes_a_commit_marker_that_still_verifies() {
+        let (_addr_a, state_a) = spawn(vec![]).await;
+        let dir = std::env::temp_dir().join(format!("oag-mesh-transport-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        state_a.save_to_dir(&dir).unwrap();
+        assert_eq!(
+            crate::persistence::verify_commit_marker(&dir).unwrap(),
+            crate::persistence::CommitState::Consistent,
+            "a fresh save must describe a consistent set"
+        );
+        // Every recorded file is really on disk.
+        for name in crate::persistence::STORE_FILES {
+            assert!(dir.join(name).exists(), "{name} should have been written");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn load_from_dir_refuses_a_torn_set_instead_of_acting_on_it() {
+        // The crash window the marker closes: some stores from one snapshot, some from another.
+        // Loading that would silently accept stores that disagree with each other, and nothing
+        // downstream could tell.
+        let (_addr_a, state_a) = spawn(vec![]).await;
+        let dir = std::env::temp_dir().join(format!("oag-mesh-transport-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        state_a.save_to_dir(&dir).unwrap();
+        std::fs::remove_file(dir.join(crate::persistence::STORE_FILES[2])).unwrap();
+
+        let err = match MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir) {
+            Ok(_) => panic!("a torn set must be refused, not loaded"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::persistence::PersistenceError::TornSet { .. }),
+            "expected TornSet, got {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn load_from_dir_still_accepts_a_directory_written_before_markers() {
+        // Backward compatibility: an existing deployment upgrades, and its directory has seven
+        // store files but no marker. That must load exactly as it did before -- refusing would
+        // strand every existing node's state on upgrade.
+        let (_addr_a, state_a) = spawn(vec![]).await;
+        let dir = std::env::temp_dir().join(format!("oag-mesh-transport-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        state_a.save_to_dir(&dir).unwrap();
+        std::fs::remove_file(dir.join(crate::persistence::COMMIT_MARKER_FILE)).unwrap();
+
+        let loaded = MeshState::load_from_dir(PeerIdentity::generate(), vec![], &dir)
+            .expect("a pre-marker directory must still load");
+        assert!(loaded.tree.read().unwrap().members_of("global", 1).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

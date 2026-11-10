@@ -63,11 +63,21 @@ Format: question, assumption being run with, status.
 - **Pull-based anti-entropy does not re-verify signatures.** Assumption: trusting the configured
   peer list, stated plainly in `spec/10`. A pulled snapshot has already collapsed past the
   signed messages; there is nothing left to re-check. Status: open (accepted trade-off).
-- **Persistence is manual and not crash-safe.** Assumption: caller decides when to save; a crash
-  mid-write can lose or corrupt a file. Status: open.
+- **Persistence is manual and per-file crash-safe; cross-file consistency is now enforced by a
+  commit marker.** Assumption: caller decides when to save -- that part is unchanged. A crash
+  mid-write can no longer *corrupt* a file (temp + rename, per `spec/08`), and it can no longer
+  leave a silently-torn *set*: `save_to_dir` writes the seven files and then a `commit.json`
+  recording each file's BLAKE3, and `load_from_dir` refuses the set with `TornSet` if any recorded
+  file is missing or differs. A directory with no marker still loads as before, so upgrading
+  never strands existing state. What remains: a power loss can still lose the rename itself
+  (there is no fsync), and a caller that saves rarely can still lose up to a whole save's worth of
+  in-memory state. Status: resolved for torn-set detection; open for fsync/durability.
 
 ## Cross-store consistency
 
-- **No atomic multi-store operations.** Assumption: best-effort per store. A failed store pull
-  leaves its last-known heads unrecorded so the next pull retries it, but there is no
-  transaction across the five stores. Status: open.
+- **No atomic multi-store *writes*.** Assumption: the commit marker (`spec/08`) makes a saved set
+  atomic *to a reader* -- either the whole set is on disk and verified, or the load is refused --
+  but there is still no multi-store transaction on the write side, and no atomicity across a pull
+  that updates several stores. A failed store pull leaves its last-known heads unrecorded so the
+  next pull retries it. Status: open (the marker closed the read-side gap; the write-side pull gap
+  is unchanged and is the smaller of the two).
