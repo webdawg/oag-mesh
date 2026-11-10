@@ -232,6 +232,65 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_path_and_a_mismatched_key_list_are_rejected() {
+        let identities = [PeerIdentity::generate(), PeerIdentity::generate()];
+        let one_key = vec![x25519_public_key(&identities[0])];
+        let two_keys = vec![x25519_public_key(&identities[0]), x25519_public_key(&identities[1])];
+
+        assert!(matches!(
+            build_onion(&[], "http://target", &event("empty"), ProofOfWork { nonce: 1 }, &one_key),
+            Err(OnionError::EmptyPath)
+        ));
+        // Two keys for a one-hop path is a caller bug, not something to silently truncate.
+        assert!(matches!(
+            build_onion(
+                &["http://relay-1".to_string()],
+                "http://target",
+                &event("mismatch"),
+                ProofOfWork { nonce: 1 },
+                &two_keys,
+            ),
+            Err(OnionError::BadLength { expected: 1, actual: 2 })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_layer_is_rejected_at_every_field() {
+        let identities = [PeerIdentity::generate()];
+        let relay_keys = vec![x25519_public_key(&identities[0])];
+        let layer = build_onion(
+            &["http://relay-1".to_string()],
+            "http://target",
+            &event("malformed"),
+            ProofOfWork { nonce: 1 },
+            &relay_keys,
+        )
+        .unwrap();
+
+        // Bad hex in the ephemeral key.
+        let mut bad_hex = layer.clone();
+        bad_hex.ephemeral_public_key = "zz".to_string();
+        assert!(matches!(peel_layer(&bad_hex, &identities[0]), Err(OnionError::Hex(_))));
+
+        // A nonce of the wrong length is a length error, not a panic.
+        let mut bad_nonce = layer.clone();
+        bad_nonce.nonce = hex::encode([0u8; 8]);
+        assert!(matches!(
+            peel_layer(&bad_nonce, &identities[0]),
+            Err(OnionError::BadLength { expected: ONION_NONCE_BYTES, actual: 8 })
+        ));
+
+        // A truncated ciphertext fails authentication, not deserialization -- the AEAD tag
+        // is checked before the inner payload is ever parsed.
+        let mut bad_ciphertext = layer.clone();
+        bad_ciphertext.ciphertext = hex::encode(&[0u8; 8]);
+        assert!(matches!(
+            peel_layer(&bad_ciphertext, &identities[0]),
+            Err(OnionError::Decrypt)
+        ));
+    }
+
+    #[test]
     fn a_wrong_identity_cannot_peel_the_layer() {
         let identities = [PeerIdentity::generate(), PeerIdentity::generate()];
         let relay_keys = vec![x25519_public_key(&identities[0])];
