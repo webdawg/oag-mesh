@@ -127,6 +127,16 @@ Format: question, assumption being run with, status.
 - **No atomic multi-store *writes*.** Assumption: the commit marker (`spec/08`) makes a saved set
   atomic *to a reader* -- either the whole set is on disk and verified, or the load is refused --
   but there is still no multi-store transaction on the write side, and no atomicity across a pull
-  that updates several stores. A failed store pull leaves its last-known heads unrecorded so the
-  next pull retries it. Status: open (the marker closed the read-side gap; the write-side pull gap
-  is unchanged and is the smaller of the two).
+  that updates several stores. Status: open (the marker closed the read-side gap; the write-side
+  pull gap is unchanged and is the smaller of the two).
+
+  **Corrected while re-reading this entry.** It used to say "a failed store pull leaves its
+  last-known heads unrecorded so the next pull retries it", which understates it: heads were
+  recorded only when *every* attempted store succeeded, so one persistently failing store left
+  *nothing* recorded and all five stores were re-pulled in full on every tick. Heads are now
+  recorded per store (`spec/10`). The remaining gap is the one this entry actually describes: the
+  in-memory merges across a pull are still not atomic, and `save_to_dir` is still the caller's
+  call rather than this crate's. Also worth recording plainly: **nothing in either repository
+  calls `save_to_dir` or `load_from_dir`** -- `spec/08` says the embedding caller decides when to
+  save, and no such caller exists yet (`open-agent-graph` does not depend on this crate). The
+  persistence layer is correct and tested, but currently unreachable in production.

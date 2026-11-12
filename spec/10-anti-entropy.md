@@ -30,6 +30,21 @@ per-process `instance_id` plus one monotonic sequence per store, bumped whenever
 state actually changes. `pull_and_merge` fetches heads first and pulls only the stores whose
 sequence changed since its last pull from that peer, instead of all five every time.
 
+**Heads are recorded per store, not for the pull as a whole.** Each store's head is recorded
+independently when its own pull succeeds; a failed store keeps its previous version, or
+`UNKNOWN_VERSION` if there is none, so `heads_changed` always sees it as different and retries it.
+
+The earlier behaviour recorded the peer's heads only when *every* attempted store succeeded. With
+one persistently failing store -- a broken endpoint, a store the peer's version does not serve --
+that condition never became true, so no heads were ever recorded and all five stores were re-pulled
+in full on every tick, forever, to learn nothing new about the four healthy ones. Asserted by
+`a_failing_store_is_retried_without_re_pulling_the_healthy_ones`: the failing store is fetched on
+both ticks, the healthy one on the first only.
+
+`link_quality` still records the pull as a whole -- a peer serving four of five stores is asked
+later than one serving all five, which is a defensible liveness signal even though the healthy
+stores are no longer re-fetched.
+
 `pull_and_merge(state, address)` merges each store into `state`'s
 own store via a new `merge_snapshot`/`merge` method on each: `MeshTree::merge_snapshot` **unions**
 each edge's declaring-peer set, `ClaimCorroboration::merge_snapshot` appends any `(peer_id,

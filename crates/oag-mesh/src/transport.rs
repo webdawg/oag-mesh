@@ -1529,20 +1529,70 @@ pub async fn pull_and_merge(state: &MeshState, address: &str) -> bool {
         Ok(heads) => heads,
         Err(e) => {
             tracing::warn!(address, error = %e, "failed to pull sync heads from peer; falling back to a full pull");
-            let delivered = pull_changed_stores(state, address, [true; 5]).await;
+            let store_ok = pull_changed_stores(state, address, [true; 5]).await;
+            let delivered = store_ok.iter().all(|ok| *ok);
             state.link_quality.record(address, delivered, crate::link_quality::now_unix());
+            // The heads themselves could not be read, so nothing is recorded: the next pull
+            // falls back to a full pull again rather than trusting a partial view.
             return delivered;
         }
     };
 
     let last_heads = state.sync_heads.read().unwrap().get(address).copied();
     let changed = heads_changed(last_heads, remote_heads);
-    let all_ok = pull_changed_stores(state, address, changed).await;
+    let store_ok = pull_changed_stores(state, address, changed).await;
+    let all_ok = store_ok.iter().all(|ok| *ok);
     state.link_quality.record(address, all_ok, crate::link_quality::now_unix());
-    if all_ok {
-        state.sync_heads.write().unwrap().insert(address.to_string(), remote_heads);
-    }
+    // Record each store's head independently. Recording only when *every* store succeeded meant
+    // one persistently failing store suppressed all five heads, so the healthy four were
+    // re-pulled on every tick forever -- a full snapshot fetch per store per tick to learn
+    // nothing new. See `a_failing_store_is_retried_without_re_pulling_the_healthy_ones`.
+    let merged = merge_heads(last_heads, remote_heads, changed, store_ok);
+    state.sync_heads.write().unwrap().insert(address.to_string(), merged);
     all_ok
+}
+
+/// The version recorded for a store whose pull failed and whose previous version is unknown.
+/// Store versions are monotonic sequences, so no peer reports this value and `heads_changed`
+/// always sees it as different -- the store is retried rather than silently marked current.
+const UNKNOWN_VERSION: u64 = u64::MAX;
+
+/// The heads to record after a pull: the remote's version for each store that was attempted and
+/// succeeded, and the previous version otherwise.
+///
+/// `attempted` matters as well as `ok`: a store skipped because its version was unchanged keeps
+/// its old head, which already equals the remote's. `instance_id` always comes from the remote --
+/// it names the peer's process lifetime, and the per-store versions are what force the retries
+/// for any store that failed.
+fn merge_heads(
+    last: Option<StoreHeads>,
+    remote: StoreHeads,
+    attempted: [bool; 5],
+    ok: [bool; 5],
+) -> StoreHeads {
+    let old = last.unwrap_or(StoreHeads {
+        instance_id: remote.instance_id,
+        bridge_tree: UNKNOWN_VERSION,
+        claim_corroboration: UNKNOWN_VERSION,
+        membership_registry: UNKNOWN_VERSION,
+        anonymous_events: UNKNOWN_VERSION,
+        responder_acknowledgments: UNKNOWN_VERSION,
+    });
+    let pick = |i: usize, remote_version: u64, old_version: u64| {
+        if attempted[i] && ok[i] {
+            remote_version
+        } else {
+            old_version
+        }
+    };
+    StoreHeads {
+        instance_id: remote.instance_id,
+        bridge_tree: pick(0, remote.bridge_tree, old.bridge_tree),
+        claim_corroboration: pick(1, remote.claim_corroboration, old.claim_corroboration),
+        membership_registry: pick(2, remote.membership_registry, old.membership_registry),
+        anonymous_events: pick(3, remote.anonymous_events, old.anonymous_events),
+        responder_acknowledgments: pick(4, remote.responder_acknowledgments, old.responder_acknowledgments),
+    }
 }
 
 /// Which of the five stores differ between the last heads this node pulled from a peer and
@@ -1564,21 +1614,21 @@ fn heads_changed(last: Option<StoreHeads>, remote: StoreHeads) -> [bool; 5] {
     }
 }
 
-/// Pulls and merges only the stores marked `true` in `changed`, returning whether every pull
-/// that was attempted succeeded. A failed store is left at its old state and, because the
-/// caller only records the remote heads when this returns `true`, retried on the next pull.
-async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5]) -> bool {
+/// Pulls and merges only the stores marked `true` in `changed`, returning which of the five
+/// succeeded. A failed store is left at its old state and retried on the next pull, because the
+/// caller records a failed store's head as unchanged.
+async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5]) -> [bool; 5] {
     let [bridge, claims, membership, events, acks] = changed;
-    let mut all_ok = true;
+    let mut ok = [false; 5];
 
     if bridge {
         match pull_bridge_tree(&state.http, address).await {
             Ok(snapshot) => {
                 state.tree.write().unwrap().merge_snapshot(snapshot);
+                ok[0] = true;
             }
             Err(e) => {
                 tracing::warn!(address, error = %e, "failed to pull bridge tree from peer");
-                all_ok = false;
             }
         }
     }
@@ -1586,10 +1636,10 @@ async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5
         match pull_claim_corroboration(&state.http, address).await {
             Ok(snapshot) => {
                 state.claim_corroboration.write().unwrap().merge_snapshot(snapshot);
+                ok[1] = true;
             }
             Err(e) => {
                 tracing::warn!(address, error = %e, "failed to pull claim corroboration from peer");
-                all_ok = false;
             }
         }
     }
@@ -1597,10 +1647,10 @@ async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5
         match pull_membership_registry(&state.http, address).await {
             Ok(snapshot) => {
                 state.membership_registry.write().unwrap().merge_snapshot(snapshot);
+                ok[2] = true;
             }
             Err(e) => {
                 tracing::warn!(address, error = %e, "failed to pull membership registry from peer");
-                all_ok = false;
             }
         }
     }
@@ -1608,10 +1658,10 @@ async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5
         match pull_anonymous_events(&state.http, address).await {
             Ok(log) => {
                 state.event_log.write().unwrap().merge(log);
+                ok[3] = true;
             }
             Err(e) => {
                 tracing::warn!(address, error = %e, "failed to pull anonymous events from peer");
-                all_ok = false;
             }
         }
     }
@@ -1619,15 +1669,15 @@ async fn pull_changed_stores(state: &MeshState, address: &str, changed: [bool; 5
         match pull_responder_acknowledgments(&state.http, address).await {
             Ok(snapshot) => {
                 state.responder_acknowledgments.write().unwrap().merge_snapshot(snapshot);
+                ok[4] = true;
             }
             Err(e) => {
                 tracing::warn!(address, error = %e, "failed to pull responder acknowledgments from peer");
-                all_ok = false;
             }
         }
     }
 
-    all_ok
+    ok
 }
 
 /// Same best-effort pull-and-merge as `pull_and_merge`, against every peer on `state.peers` in
@@ -1785,6 +1835,7 @@ pub async fn pull_responder_acknowledgments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::Extension;
     use crate::anonymous_event::{CoarseLocation, EventKind, Severity};
     use crate::bridge::MeshMember;
     use oag_crypto::PeerIdentity;
@@ -2983,6 +3034,136 @@ mod tests {
         // Port 0 on loopback is never a live listener -- a real connection failure.
         pull_and_merge(&state_catcher, "http://127.0.0.1:0").await;
         assert!(state_catcher.tree.read().unwrap().members_of("global", 1).is_empty());
+    }
+
+    /// Counters for the two endpoints the failing-store test watches. One extension type, so a
+    /// single `.layer(Extension(..))` can carry both.
+    #[derive(Clone)]
+    struct StoreCallCounters {
+        membership: Arc<std::sync::atomic::AtomicUsize>,
+        bridge: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A peer whose `membership-registry` endpoint always fails and whose `bridge-tree` endpoint
+    /// succeeds, counting how many times each is asked. Every other store is a normal handler.
+    async fn spawn_with_a_failing_store() -> (String, StoreCallCounters) {
+        use std::sync::atomic::Ordering;
+
+        let counters = StoreCallCounters {
+            membership: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bridge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        async fn failing_membership(
+            State(_state): State<MeshState>,
+            Extension(counters): Extension<StoreCallCounters>,
+        ) -> Response {
+            counters.membership.fetch_add(1, Ordering::Relaxed);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+
+        async fn counting_bridge(
+            State(_state): State<MeshState>,
+            Extension(counters): Extension<StoreCallCounters>,
+        ) -> Response {
+            counters.bridge.fetch_add(1, Ordering::Relaxed);
+            Json(Vec::<crate::bridge::BridgeEdgeSnapshot>::new()).into_response()
+        }
+
+        let state = MeshState::new(PeerIdentity::generate(), vec![]);
+        let router = Router::new()
+            .route("/oag-mesh/v1/sync/heads", get(get_sync_heads))
+            .route("/oag-mesh/v1/sync/bridge-tree", get(counting_bridge))
+            .route("/oag-mesh/v1/sync/claim-corroboration", get(get_claim_corroboration_snapshot))
+            .route("/oag-mesh/v1/sync/membership-registry", get(failing_membership))
+            .route("/oag-mesh/v1/sync/anonymous-events", get(get_anonymous_event_log_snapshot))
+            .route(
+                "/oag-mesh/v1/sync/responder-acknowledgments",
+                get(get_responder_acknowledgment_snapshot),
+            )
+            .layer(Extension(counters.clone()))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), counters)
+    }
+
+    #[test]
+    fn merge_heads_records_each_store_independently() {
+        let remote = StoreHeads {
+            instance_id: 2,
+            bridge_tree: 10,
+            claim_corroboration: 20,
+            membership_registry: 30,
+            anonymous_events: 40,
+            responder_acknowledgments: 50,
+        };
+
+        // A first pull where one store fails: the successful four take the remote's versions and
+        // the failed one gets a version no peer can report, so it is retried.
+        let merged = merge_heads(None, remote, [true; 5], [true, true, false, true, true]);
+        assert_eq!(merged.bridge_tree, 10);
+        assert_eq!(merged.membership_registry, UNKNOWN_VERSION);
+        assert_eq!(merged.instance_id, remote.instance_id);
+
+        // A later pull where only the still-failing store is attempted: the healthy stores keep
+        // their recorded versions rather than being overwritten or re-pulled.
+        let recorded = StoreHeads {
+            instance_id: 2,
+            bridge_tree: 10,
+            claim_corroboration: 20,
+            membership_registry: UNKNOWN_VERSION,
+            anonymous_events: 40,
+            responder_acknowledgments: 50,
+        };
+        let merged = merge_heads(
+            Some(recorded),
+            remote,
+            [false, false, true, false, false],
+            [false, false, false, false, false],
+        );
+        assert_eq!(merged.bridge_tree, 10, "an unattempted store keeps its recorded head");
+        assert_eq!(merged.membership_registry, UNKNOWN_VERSION, "a failed store stays unknown");
+
+        // A store that succeeds after failing takes the remote's version, and `heads_changed`
+        // then sees it as current.
+        let merged = merge_heads(
+            Some(recorded),
+            remote,
+            [false, false, true, false, false],
+            [false, false, true, false, false],
+        );
+        assert_eq!(merged.membership_registry, 30);
+        assert!(!heads_changed(Some(merged), remote)[2], "a recovered store is not re-pulled");
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_is_retried_without_re_pulling_the_healthy_ones() {
+        // `pull_and_merge` only recorded a peer's heads when *every* attempted store succeeded,
+        // so one persistently failing store meant no heads were ever recorded and all five
+        // stores were re-pulled on every tick -- the healthy four included, forever.
+        use std::sync::atomic::Ordering;
+
+        let (addr, counters) = spawn_with_a_failing_store().await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr.clone()]).await;
+
+        pull_and_merge(&state_catcher, &addr).await;
+        pull_and_merge(&state_catcher, &addr).await;
+
+        assert_eq!(
+            counters.membership.load(Ordering::Relaxed),
+            2,
+            "a store that keeps failing must be retried on every tick"
+        );
+        assert_eq!(
+            counters.bridge.load(Ordering::Relaxed),
+            1,
+            "a healthy store must not be re-pulled once its head is recorded"
+        );
     }
 
     #[tokio::test]
