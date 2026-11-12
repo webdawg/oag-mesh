@@ -16,6 +16,10 @@ license = "AGPL-3.0-or-later"
 # once open-agent-graph starts cutting releases.
 oag-core = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
 oag-crypto = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
+# Read-only access to the layer below: the node's own identity (`identity.key`) and its peer list
+# (the `peers`/`peer_addresses` tables). Same posture as `oag-imagination`'s `NodeAdapter`, which
+# depends on this crate the same way. Nothing here writes to the base project's storage.
+oag-storage = { git = "https://github.com/webdawg/open-agent-graph.git", branch = "main" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

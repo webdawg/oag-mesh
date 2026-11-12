@@ -39,6 +39,20 @@ string form, the same convention every signed message in this crate already uses
   write, not on a timer, not on shutdown. A caller embedding this crate decides when to save;
   that decision depends on deployment specifics (how much state loss on an unclean restart is
   acceptable) this crate has no opinion on.
+
+  **There is now a caller-side adapter, though it is still not automatic.**
+  `node::MeshNodeAdapter` (`crates/oag-mesh/src/node.rs`) builds a `MeshState` from an existing
+  `oag` deployment -- identity from `<data-dir>/identity.key`, peers from the base peer's own peer
+  tables, mesh stores from `<data-dir>/mesh/` -- and saves it back. The caller still chooses when
+  to call `save`; what changed is that the persistence layer is now reachable from a real
+  deployment rather than only from tests. Before the adapter, no code in either repository called
+  `save_to_dir` or `load_from_dir`, so the commit marker and torn-set refusal had never run
+  outside a test.
+
+  The adapter shares the base peer's identity rather than minting a second one: a
+  `BridgeDeclaration` signed by this node is then attributable to a peer that already exists, and
+  the mesh's peer id matches the id the base project already uses for that node. It reads the base
+  project's files and never writes them; the mesh's own stores live under `mesh/`.
 - **Atomic on Unix, best-effort on Windows, but not crash-proof.** `persistence::save_json`
   writes a sibling temp file and renames it over the destination. On Unix, `rename(2)` is
   atomic: a crash mid-write leaves the previous file intact and the temp file orphaned, rather

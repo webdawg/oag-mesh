@@ -136,7 +136,12 @@ Format: question, assumption being run with, status.
   *nothing* recorded and all five stores were re-pulled in full on every tick. Heads are now
   recorded per store (`spec/10`). The remaining gap is the one this entry actually describes: the
   in-memory merges across a pull are still not atomic, and `save_to_dir` is still the caller's
-  call rather than this crate's. Also worth recording plainly: **nothing in either repository
-  calls `save_to_dir` or `load_from_dir`** -- `spec/08` says the embedding caller decides when to
-  save, and no such caller exists yet (`open-agent-graph` does not depend on this crate). The
-  persistence layer is correct and tested, but currently unreachable in production.
+  call rather than this crate's.
+
+  **The missing caller now exists.** This entry also recorded that nothing in either repository
+  called `save_to_dir`/`load_from_dir` -- `spec/08` said the embedding caller decides when to save,
+  and no such caller existed (`open-agent-graph` does not depend on this crate). That is closed by
+  `node::MeshNodeAdapter`, which builds a `MeshState` from an existing `oag` data directory and
+  saves it back. The caller still decides *when*; what changed is that the persistence layer now
+  runs outside a test. Status: resolved on the caller side; the write-atomicity gap above is
+  unchanged.
