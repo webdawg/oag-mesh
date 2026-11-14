@@ -3428,6 +3428,44 @@ mod tests {
         handle.abort();
     }
 
+    /// The budget variant of the scheduler. It is a thin wrapper over
+    /// [`sync_with_all_peers_bounded`], so the bound itself is tested above; this proves the
+    /// wrapper is still a *scheduler* -- the same periodic behaviour as [`spawn_periodic_sync`],
+    /// not a behaviour change hidden behind a new name.
+    #[tokio::test]
+    async fn spawn_periodic_sync_with_budget_still_syncs() {
+        let (addr_source, state_source) = spawn(vec![]).await;
+        let (_addr_catcher, state_catcher) = spawn(vec![addr_source.clone()]).await;
+
+        let handle = spawn_periodic_sync_with_budget(
+            state_catcher.clone(),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        );
+
+        let decl = crate::bridge::build_and_sign(
+            &PeerIdentity::generate(),
+            "global",
+            MeshMember::BaseCluster("budget-sync-test".into()),
+            now_unix(),
+        )
+        .unwrap();
+        let pow = solve_bridge_pow(&state_source, &decl);
+        state_source.tree.write().unwrap().add(&decl, pow, now_unix()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            state_catcher
+                .tree
+                .read()
+                .unwrap()
+                .corroboration_for("global", &MeshMember::BaseCluster("budget-sync-test".into())),
+            1
+        );
+
+        handle.abort();
+    }
+
     #[test]
     fn random_jitter_is_bounded_by_the_maximum() {
         let max = std::time::Duration::from_millis(500);
