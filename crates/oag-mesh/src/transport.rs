@@ -1701,6 +1701,29 @@ pub async fn sync_with_all_peers(state: &MeshState) {
     }
 }
 
+/// Like [`sync_with_all_peers`], but stops once `budget` has elapsed and leaves the remaining
+/// peers for the next tick.
+///
+/// Each pull is already bounded (`HTTP_CONNECT_TIMEOUT` + `HTTP_REQUEST_TIMEOUT`), so a tick is
+/// bounded by `peers * that` -- with several unreachable peers that is minutes, and the next tick
+/// cannot start until this one finishes. `link_quality` asks the live peers first, so their data
+/// arrives early, but the live peers' *next* refresh waits for the dead ones to be waited out. A
+/// tick budget caps that wait.
+///
+/// This bounds the tick; it does not drop anyone. The skipped peers are retried on the next tick,
+/// so `OPEN_QUESTIONS.md`'s "a peer that is down is asked last, never not asked" still holds --
+/// it is asked on the next tick rather than this one.
+pub async fn sync_with_all_peers_bounded(state: &MeshState, budget: std::time::Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    let ordered = state.link_quality.ordered(&state.peers.iter().cloned().collect::<Vec<_>>());
+    for peer in ordered {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        pull_and_merge(state, &peer).await;
+    }
+}
+
 /// Opts into a schedule for `sync_with_all_peers`: spawns a background task that calls it once
 /// immediately, then again every `interval`, forever, until the returned `JoinHandle` is aborted
 /// or dropped-and-the-runtime-shuts-down. This is the specific thing `spec/10-anti-entropy.md`'s
@@ -1738,6 +1761,25 @@ pub fn spawn_periodic_sync_with_jitter(
             sync_with_all_peers(&state).await;
             let jitter = random_jitter(max_jitter);
             tokio::time::sleep(interval + jitter).await;
+        }
+    })
+}
+
+/// Same as [`spawn_periodic_sync`], but each tick is capped at `tick_budget` -- see
+/// [`sync_with_all_peers_bounded`] for why a per-request timeout is not enough to bound a tick.
+///
+/// `spawn_periodic_sync` keeps the unbounded behaviour; this variant is for a caller that would
+/// rather have a predictable tick than wait out every unreachable peer. A `tick_budget` of zero
+/// or less is a no-op budget and behaves like the unbounded form.
+pub fn spawn_periodic_sync_with_budget(
+    state: MeshState,
+    interval: std::time::Duration,
+    tick_budget: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            sync_with_all_peers_bounded(&state, tick_budget).await;
+            tokio::time::sleep(interval).await;
         }
     })
 }
@@ -3547,6 +3589,46 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the request timeout should fire well before this, took {elapsed:?}"
+        );
+    }
+
+    /// The aggregate tick bound. Each pull is bounded, but a tick is a loop over every peer, so
+    /// three black-holed peers cost three timeouts and the next tick waits for all of them. The
+    /// bounded tick stops after the budget and leaves the rest for the next tick.
+    #[tokio::test]
+    async fn a_bounded_tick_stops_at_the_budget_instead_of_waiting_out_every_peer() {
+        let peers: Vec<String> = vec![
+            spawn_hanging_peer().await,
+            spawn_hanging_peer().await,
+            spawn_hanging_peer().await,
+        ];
+        let mut state = MeshState::new(PeerIdentity::generate(), peers);
+        state.http = Arc::new(build_http_client(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(300),
+        ));
+
+        let started = std::time::Instant::now();
+        sync_with_all_peers_bounded(&state, std::time::Duration::from_millis(100)).await;
+        let elapsed = started.elapsed();
+
+        // The budget is checked between pulls, not during one. A pull against a black-holed peer
+        // costs the heads request plus the five-store fallback (six timeouts), so one pull is
+        // already over the 100ms budget -- the tick does that one pull and then stops, rather
+        // than all three. Count the attempts through the ledger rather than the clock, so the
+        // assertion is not a timing race.
+        let attempted = state
+            .peers
+            .iter()
+            .filter(|peer| state.link_quality.quality(peer).is_some())
+            .count();
+        assert_eq!(
+            attempted, 1,
+            "a bounded tick must leave the remaining peers for the next tick"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "one pull against a black-holed peer should not take this long, took {elapsed:?}"
         );
     }
 

@@ -119,6 +119,17 @@ with -- this crate takes no position on that, beyond stating the trade-off exist
   `max_jitter = 0` is exactly that. The jitter is drawn from a per-process random seed, not a
   cryptographic RNG -- it only has to desynchronize independent nodes, not resist an adversary,
   and a restart re-randomizes the phase.
+
+  **A tick is bounded too.** Each pull is bounded (`HTTP_CONNECT_TIMEOUT` +
+  `HTTP_REQUEST_TIMEOUT`), but a tick is a loop over every peer, so three unreachable peers cost
+  three times the per-peer worst case -- and a pull against a black-holed peer costs the heads
+  request *plus* the five-store fallback, six timeouts in all. `link_quality` asks the live peers
+  first, so their data arrives early, but the live peers' next refresh waits for the dead ones to
+  be waited out. `sync_with_all_peers_bounded` (and `spawn_periodic_sync_with_budget`) caps the
+  tick: the budget is checked between pulls, so the pull in flight completes and the rest are
+  left for the next tick. This bounds the tick rather than dropping anyone -- the skipped peers
+  are retried, so "a peer that is down is asked last, never not asked" still holds. The
+  unbounded forms remain for a caller that would rather wait out every peer.
 - **Does not re-verify anything.** Stated above, the central caveat: a pull trusts the source
   peer's own verification, it does not re-derive it.
 - **Mostly no conflict resolution beyond union -- `ResponderAcknowledgmentLog` is the one
