@@ -1528,6 +1528,19 @@ pub async fn pull_and_merge(state: &MeshState, address: &str) -> bool {
     let remote_heads = match pull_heads(&state.http, address).await {
         Ok(heads) => heads,
         Err(e) => {
+            // The fallback exists for a peer whose heads endpoint is broken while its stores
+            // serve -- a rejected request (an HTTP status) is that case. A connect failure or a
+            // timeout means the peer is unreachable, and five more requests would only pay five
+            // more timeouts to learn what the heads request already said. Measured: a black-holed
+            // peer costs six timeouts (1.8s at the test client's 300ms, far more at the default
+            // 5s connect + 30s request); skipping the fallback on an unreachable peer makes it
+            // one.
+            let unreachable = matches!(&e, PullError::Request(_, error) if error.is_connect() || error.is_timeout());
+            if unreachable {
+                tracing::warn!(address, error = %e, "peer unreachable; skipping the full-pull fallback");
+                state.link_quality.record(address, false, crate::link_quality::now_unix());
+                return false;
+            }
             tracing::warn!(address, error = %e, "failed to pull sync heads from peer; falling back to a full pull");
             let store_ok = pull_changed_stores(state, address, [true; 5]).await;
             let delivered = store_ok.iter().all(|ok| *ok);
@@ -3629,6 +3642,45 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "one pull against a black-holed peer should not take this long, took {elapsed:?}"
+        );
+    }
+
+    /// The fallback classification. A heads request that fails with a connect error or a timeout
+    /// means the peer is unreachable, so the five-store fallback would only pay five more
+    /// timeouts to learn what the heads request already said. Count the connections: one, not six.
+    #[tokio::test]
+    async fn an_unreachable_peer_does_not_pay_the_five_store_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::mem::forget(stream);
+            }
+        });
+
+        let mut state = MeshState::new(PeerIdentity::generate(), vec![addr.clone()]);
+        state.http = Arc::new(build_http_client(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+        ));
+
+        let started = std::time::Instant::now();
+        let delivered = pull_and_merge(&state, &addr).await;
+        let elapsed = started.elapsed();
+
+        assert!(!delivered, "a black-holed peer must report a failed delivery");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an unreachable peer must cost one request, not the heads request plus five stores"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(700),
+            "one timeout, not six: {elapsed:?}"
         );
     }
 
