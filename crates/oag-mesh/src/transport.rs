@@ -3684,6 +3684,51 @@ mod tests {
         );
     }
 
+    /// The other half of the classification: a heads request that is *rejected* (an HTTP status,
+    /// not a transport failure) means the peer answered, so its heads endpoint may be broken while
+    /// its stores serve -- the case the fallback exists for. The fallback must still fire, and it
+    /// records no heads (which is how the test tells the two paths apart).
+    #[tokio::test]
+    async fn a_rejected_heads_request_still_pays_the_five_store_fallback() {
+        use axum::http::StatusCode;
+        use axum::routing::get;
+
+        async fn failing_heads() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let state = MeshState::new(PeerIdentity::generate(), vec![]);
+        let router = Router::new()
+            .route("/oag-mesh/v1/sync/heads", get(failing_heads))
+            .route("/oag-mesh/v1/sync/bridge-tree", get(get_bridge_tree_snapshot))
+            .route("/oag-mesh/v1/sync/claim-corroboration", get(get_claim_corroboration_snapshot))
+            .route("/oag-mesh/v1/sync/membership-registry", get(get_membership_registry_snapshot))
+            .route("/oag-mesh/v1/sync/anonymous-events", get(get_anonymous_event_log_snapshot))
+            .route(
+                "/oag-mesh/v1/sync/responder-acknowledgments",
+                get(get_responder_acknowledgment_snapshot),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let state = MeshState::new(PeerIdentity::generate(), vec![addr.clone()]);
+        let delivered = pull_and_merge(&state, &addr).await;
+
+        assert!(
+            delivered,
+            "a reachable peer whose heads endpoint is broken must still be fallen back on"
+        );
+        assert!(
+            state.sync_heads.read().unwrap().get(&addr).is_none(),
+            "the fallback records no heads -- that is how this path is identified"
+        );
+    }
+
     /// End to end through the mesh's own pull path: a black-holed peer costs one timeout and the
     /// pull reports a failed delivery, which is exactly what `link_quality` records. Before the
     /// client had a timeout this call had no bound at all.
